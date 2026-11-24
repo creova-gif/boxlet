@@ -257,7 +257,7 @@ EOF
       cmd="cd '$workspace_path' && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test"
       ;;
     api-docs)
-      cmd="cd '$workspace_path' && RUSTDOCFLAGS='-D warnings' cargo doc --no-deps && test -f '$scratch_path/target/doc/boxlet/index.html' && for sym in healthcheck Engine engine policy oci traits error; do grep -q \"\$sym\" '$scratch_path/target/doc/boxlet/index.html' || { echo \"missing symbol: \$sym\" >&2; exit 1; }; done && echo 'doc-verified: healthcheck, Engine, engine, policy, oci, traits, error present in index.html'"
+      cmd="cd '$workspace_path' && RUSTDOCFLAGS='-D warnings' cargo doc --no-deps && test -f '$scratch_path/target/doc/boxlet/index.html' && for sym in healthcheck Engine engine policy oci snapshot traits error; do grep -q \"\$sym\" '$scratch_path/target/doc/boxlet/index.html' || { echo \"missing symbol: \$sym\" >&2; exit 1; }; done && echo 'doc-verified: healthcheck, Engine, engine, policy, oci, snapshot, traits, error present in index.html'"
       ;;
     cli-surface)
       cmd="cd '$workspace_path' && cargo build --bin boxlet --example embed_run && BIN='$scratch_path/target/debug/boxlet' && \"\$BIN\" --help && \"\$BIN\" run --help && \"\$BIN\" create --help && (! \"\$BIN\" run --network bridge /nonexistent 2>&1 | grep -q 'unsupported network mode' && exit 1 || echo 'cli-verified: help subcommands + fail-closed network error')"
