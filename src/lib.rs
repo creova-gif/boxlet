@@ -1,5 +1,6 @@
 //! Boxlet: Minimal Linux OCI-compatible container runtime and programmable execution core.
 
+pub mod engine;
 pub mod error;
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
@@ -7,6 +8,7 @@ pub mod oci;
 pub mod policy;
 pub mod traits;
 
+pub use engine::Engine;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxBackend;
 
