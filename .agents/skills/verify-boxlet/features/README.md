@@ -1,6 +1,6 @@
 # Boxlet verification map
 
-This directory is the maintained source for verifying the user-facing behavior of Boxlet. Read this index before driving the crate, then follow the matching feature file as the literal recipe.
+This directory is the maintained source for verifying the user-facing behavior of Boxlet. Read this index before driving the crate or CLI, then follow the matching feature file as the literal recipe.
 
 ## Baseline preconditions
 
@@ -15,13 +15,14 @@ This directory is the maintained source for verifying the user-facing behavior o
 - Start every recipe from a launched and doctor-verified `RUN_ID`.
 - Treat every command as literal; keep feature names and flags unchanged.
 - Run all feature journeys through `.agents/skills/verify-boxlet/scripts/control-boxlet drive <feature> --run <RUN_ID>`.
+- On macOS/non-Linux hosts, `control-boxlet` automatically selects the `docker` Linux backend (`boxlet-verify-rust:1-slim`) so `src/linux/*` compiles and tests cleanly.
 - Always run `control-boxlet cleanup --run <RUN_ID>` after driving (including after failures). Cleanup removes `/tmp/boxlet-verify-<RUN_ID>` and preserves `/tmp/boxlet-verify-evidence/<RUN_ID>/`.
 
 ## Proof and skip reporting
 
 - Every feature drive writes `command.txt`, `stdout.txt`, `stderr.txt`, `exit_code.txt`, and `meta.json` under `/tmp/boxlet-verify-evidence/<RUN_ID>/<feature>/`.
 - Record the `RUN_ID`, backend (`native` or `docker`), and feature ID alongside any proof summary.
-- If a feature cannot run due to an unmet precondition (e.g. missing local `cargo` and stopped Docker daemon), report the exact failing command and unmet precondition; never weaken assertions to make a journey pass.
+- If a feature cannot run due to an unmet prerequisite (e.g. privileged Linux 5.15+ cgroup v2 host for live `boxlet run`), report the exact failing command and unmet precondition as `verified-unreachable`; never weaken assertions to make a journey pass.
 - Do not report a feature as verified through a different feature's output.
 
 ## Feature entry contract
@@ -36,5 +37,6 @@ Each feature file starts with an H1 title and one paragraph describing the user-
 ## Features
 
 - [Healthcheck API](./healthcheck-api.md) proves an external Rust consumer crate can depend on `boxlet`, compile against its public API, and receive `"ok"` from `boxlet::healthcheck()`.
-- [CI quality gates](./quality-gates.md) proves formatting, strict Clippy lints (`-D warnings`), and the Cargo test suite pass cleanly.
-- [Public API documentation](./api-docs.md) proves `cargo doc --no-deps` builds with `-D warnings` and documents the exported `healthcheck` symbol.
+- [CI quality gates](./quality-gates.md) proves formatting, strict Clippy lints across all targets (`--all-targets -- -D warnings`), and the Cargo lib + bin test suite pass cleanly on Linux.
+- [Public API documentation](./api-docs.md) proves `cargo doc --no-deps` builds with `-D warnings` and documents the exported crate surface (`healthcheck`, `Engine`, `engine`, `policy`, `oci`, `traits`, `error`).
+- [CLI surface & embedding example](./cli-surface.md) proves the `boxlet` CLI binary and `examples/embed_run.rs` build cleanly, expose the OCI and `run` subcommands, and fail closed on unsupported network modes.
