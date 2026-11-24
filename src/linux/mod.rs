@@ -9,9 +9,10 @@ pub(crate) mod rootfs;
 pub(crate) mod seccomp;
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -341,6 +342,9 @@ impl LinuxBackend {
         self.cgroup.create_cgroup(id, limits)?;
 
         let state_dir = self.state_store.container_dir(id)?;
+        // Restrict container state dir to owner-only (0700) so init.json / env secrets are not world-readable.
+        let _ = std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700));
+
         let start_fifo_path = if wait_for_start {
             let p = state_dir.join("start.fifo");
             mkfifo(&p, Mode::S_IRUSR | Mode::S_IWUSR).map_err(|err| BoxletError::Runtime {
@@ -385,12 +389,24 @@ impl LinuxBackend {
         };
 
         let init_cfg_path = state_dir.join("init.json");
-        fs::write(&init_cfg_path, serde_json::to_vec_pretty(&init_cfg)?).map_err(|err| {
-            BoxletError::Runtime {
+        let init_bytes = serde_json::to_vec_pretty(&init_cfg)?;
+        let mut init_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&init_cfg_path)
+            .map_err(|err| BoxletError::Runtime {
+                subsystem: "init",
+                message: format!("failed to create init.json: {err}"),
+            })?;
+        init_file
+            .write_all(&init_bytes)
+            .map_err(|err| BoxletError::Runtime {
                 subsystem: "init",
                 message: format!("failed to write init.json: {err}"),
-            }
-        })?;
+            })?;
+        drop(init_file);
 
         let current_exe = std::env::current_exe().map_err(|err| BoxletError::Runtime {
             subsystem: "init",

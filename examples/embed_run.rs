@@ -6,8 +6,22 @@ use std::time::Duration;
 use boxlet::policy::{ExecutionPolicy, NetworkMode};
 
 fn main() {
-    let bundle = std::env::args()
-        .nth(1)
+    let args: Vec<String> = std::env::args().collect();
+
+    // Hosts using the default LinuxBackend must forward self-re-exec `__init <config>`.
+    #[cfg(target_os = "linux")]
+    if args.get(1).map(String::as_str) == Some("__init") {
+        if let Some(cfg_path) = args.get(2) {
+            if let Err(err) = boxlet::run_internal_init(std::path::Path::new(cfg_path)) {
+                eprintln!("boxlet __init failed: {err}");
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
+
+    let bundle = args
+        .get(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("./bundle"));
 

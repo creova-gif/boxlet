@@ -108,17 +108,21 @@ fn container_pid1_main(
         namespaces::bring_up_loopback()?;
     }
 
-    // 3. Open start FIFO before pivot_root (it lives on the host state dir).
-    let start_fifo_file =
-        match &cfg.wait_for_start_fifo {
-            Some(fifo_path) => Some(OpenOptions::new().read(true).open(fifo_path).map_err(
-                |err| BoxletError::Runtime {
+    // 3. Open start FIFO O_RDWR before pivot_root: never blocks on open() and blocks on read()
+    // until `boxlet start` writes the trigger byte (preventing create/start deadlock).
+    let start_fifo_file = match &cfg.wait_for_start_fifo {
+        Some(fifo_path) => Some(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(fifo_path)
+                .map_err(|err| BoxletError::Runtime {
                     subsystem: "init",
                     message: format!("failed to open start FIFO '{}': {err}", fifo_path.display()),
-                },
-            )?),
-            None => None,
-        };
+                })?,
+        ),
+        None => None,
+    };
 
     // 4. Pivot root + mount /proc + minimal /dev + masked/readonly paths.
     rootfs::setup_and_pivot_root(&cfg.rootfs_path, &cfg.spec)?;

@@ -74,3 +74,16 @@ jobs:
           grep -q '"status": "clean"' /tmp/boxlet-ci-out.json
           test ! -d /sys/fs/cgroup/boxlet.slice/ci-smoke-1
           test ! -d /tmp/boxlet-ci-state/ci-smoke-1
+      - name: Run privileged OCI create -> state -> start -> delete lifecycle check
+        run: |
+          sudo ./target/debug/boxlet create \
+            --root /tmp/boxlet-ci-state \
+            --cgroup-parent /sys/fs/cgroup/boxlet.slice \
+            --bundle /tmp/boxlet-ci-bundle \
+            ci-oci-1
+          sudo ./target/debug/boxlet state --root /tmp/boxlet-ci-state ci-oci-1 | grep -q '"status": "created"'
+          sudo ./target/debug/boxlet start --root /tmp/boxlet-ci-state ci-oci-1
+          sleep 0.2
+          sudo ./target/debug/boxlet delete --root /tmp/boxlet-ci-state --cgroup-parent /sys/fs/cgroup/boxlet.slice --force ci-oci-1
+          test ! -d /sys/fs/cgroup/boxlet.slice/ci-oci-1
+          test ! -d /tmp/boxlet-ci-state/ci-oci-1
