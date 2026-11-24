@@ -17,7 +17,7 @@ Commands:
   launch  [--run <id>]                         Prepare an isolated run dir and build boxlet
   doctor  [--run <id>]                         Read-only check of repo, toolchain/backend, and run state
   drive   <feature> --run <id> [--evidence <dir>]
-                                               Drive a mapped feature (healthcheck | quality-gates | api-docs)
+                                               Drive a mapped feature (healthcheck | quality-gates | api-docs | cli-surface)
   cleanup --run <id>                           Remove scratch dir and run-labeled containers; preserve evidence
 
 Environment overrides:
@@ -32,7 +32,7 @@ resolve_backend() {
     echo "$BOXLET_VERIFY_BACKEND"
     return
   fi
-  if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
+  if [[ "$(uname -s)" == "Linux" ]] && command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
     echo "native"
   else
     echo "docker"
@@ -254,13 +254,16 @@ EOF
       cmd="cargo run --quiet --manifest-path '$scratch_path/consumer-healthcheck/Cargo.toml'"
       ;;
     quality-gates)
-      cmd="cd '$workspace_path' && cargo fmt --check && cargo clippy -- -D warnings && cargo test"
+      cmd="cd '$workspace_path' && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test"
       ;;
     api-docs)
-      cmd="cd '$workspace_path' && RUSTDOCFLAGS='-D warnings' cargo doc --no-deps && test -f '$scratch_path/target/doc/boxlet/index.html' && grep -q 'healthcheck' '$scratch_path/target/doc/boxlet/index.html' && echo 'doc-verified: boxlet::healthcheck present in index.html'"
+      cmd="cd '$workspace_path' && RUSTDOCFLAGS='-D warnings' cargo doc --no-deps && test -f '$scratch_path/target/doc/boxlet/index.html' && for sym in healthcheck Engine engine policy oci traits error; do grep -q \"\$sym\" '$scratch_path/target/doc/boxlet/index.html' || { echo \"missing symbol: \$sym\" >&2; exit 1; }; done && echo 'doc-verified: healthcheck, Engine, engine, policy, oci, traits, error present in index.html'"
+      ;;
+    cli-surface)
+      cmd="cd '$workspace_path' && cargo build --bin boxlet --example embed_run && BIN='$scratch_path/target/debug/boxlet' && \"\$BIN\" --help && \"\$BIN\" run --help && \"\$BIN\" create --help && (! \"\$BIN\" run --network bridge /nonexistent 2>&1 | grep -q 'unsupported network mode' && exit 1 || echo 'cli-verified: help subcommands + fail-closed network error')"
       ;;
     *)
-      echo "Unknown feature: $feature (expected: healthcheck | quality-gates | api-docs)" >&2
+      echo "Unknown feature: $feature (expected: healthcheck | quality-gates | api-docs | cli-surface)" >&2
       exit 2
       ;;
   esac
