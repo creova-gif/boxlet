@@ -45,7 +45,7 @@ pub struct EntryMetadata {
     pub size: u64,
     /// Lower 12 POSIX permission bits (`mode & 0o7777`).
     pub mode: u32,
-    /// 64-bit FNV-1a content digest for regular files (`None` for directories and symlinks).
+    /// 64-bit FNV-1a digest of file contents for regular files or link target path for symlinks (`None` for directories).
     pub fnv1a64: Option<u64>,
 }
 
@@ -163,12 +163,14 @@ impl WorkspaceSnapshot {
             });
         }
 
+        let snapshot_dir = snapshot_base.join(&id);
+        ensure_not_nested(source_rootfs, &snapshot_dir)?;
+
         fs::create_dir_all(snapshot_base).map_err(|source| BoxletError::StateStore {
             path: snapshot_base.to_path_buf(),
             source,
         })?;
 
-        let snapshot_dir = snapshot_base.join(&id);
         match fs::create_dir(&snapshot_dir) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -182,8 +184,15 @@ impl WorkspaceSnapshot {
             }
         }
 
-        copy_tree_recursive(source_rootfs, &snapshot_dir)?;
-        let manifest = TreeManifest::capture(&snapshot_dir)?;
+        let manifest = match copy_tree_recursive(source_rootfs, &snapshot_dir, true)
+            .and_then(|()| TreeManifest::capture(&snapshot_dir))
+        {
+            Ok(manifest) => manifest,
+            Err(err) => {
+                let _ = fs::remove_dir_all(&snapshot_dir);
+                return Err(err);
+            }
+        };
 
         Ok(Self {
             id,
@@ -197,12 +206,14 @@ impl WorkspaceSnapshot {
     pub fn branch(&self, branch_id: &str, branch_dest: &Path) -> Result<PathBuf> {
         validate_container_id(branch_id)?;
 
+        let branch_path = branch_dest.join(branch_id);
+        ensure_not_nested(&self.snapshot_dir, &branch_path)?;
+
         fs::create_dir_all(branch_dest).map_err(|source| BoxletError::StateStore {
             path: branch_dest.to_path_buf(),
             source,
         })?;
 
-        let branch_path = branch_dest.join(branch_id);
         match fs::create_dir(&branch_path) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -218,9 +229,60 @@ impl WorkspaceSnapshot {
             }
         }
 
-        copy_tree_recursive(&self.snapshot_dir, &branch_path)?;
+        if let Err(err) = copy_tree_recursive(&self.snapshot_dir, &branch_path, true) {
+            let _ = fs::remove_dir_all(&branch_path);
+            return Err(err);
+        }
         Ok(branch_path)
     }
+}
+
+fn resolve_existing_prefix(path: &Path) -> Result<PathBuf> {
+    let mut current = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| BoxletError::StateStore {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .join(path)
+    };
+    let mut tail = Vec::new();
+    while !current.exists() {
+        if let Some(name) = current.file_name() {
+            tail.push(name.to_os_string());
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    let mut resolved = fs::canonicalize(&current).map_err(|source| BoxletError::StateStore {
+        path: current,
+        source,
+    })?;
+    for part in tail.into_iter().rev() {
+        resolved.push(part);
+    }
+    Ok(resolved)
+}
+
+fn ensure_not_nested(src_root: &Path, dst_root: &Path) -> Result<()> {
+    let canon_src = fs::canonicalize(src_root).map_err(|source| BoxletError::StateStore {
+        path: src_root.to_path_buf(),
+        source,
+    })?;
+    let resolved_dst = resolve_existing_prefix(dst_root)?;
+    if resolved_dst.starts_with(&canon_src) {
+        return Err(BoxletError::StateStore {
+            path: dst_root.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "destination directory cannot be inside source rootfs directory",
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn capture_dir_recursive(
@@ -277,13 +339,14 @@ fn capture_dir_recursive(
                 path: path.clone(),
                 source,
             })?;
+            let target_bytes = target.as_os_str().as_encoded_bytes();
             entries.insert(
                 rel_path,
                 EntryMetadata {
                     kind: EntryKind::Symlink,
-                    size: target.as_os_str().len() as u64,
+                    size: target_bytes.len() as u64,
                     mode,
-                    fnv1a64: None,
+                    fnv1a64: Some(hash_bytes_fnv1a64(target_bytes)),
                 },
             );
         } else if file_type.is_file() {
@@ -303,7 +366,7 @@ fn capture_dir_recursive(
     Ok(())
 }
 
-fn copy_tree_recursive(src_dir: &Path, dst_dir: &Path) -> Result<()> {
+fn copy_tree_recursive(src_dir: &Path, dst_dir: &Path, is_root: bool) -> Result<()> {
     let read_dir = fs::read_dir(src_dir).map_err(|source| BoxletError::StateStore {
         path: src_dir.to_path_buf(),
         source,
@@ -321,7 +384,7 @@ fn copy_tree_recursive(src_dir: &Path, dst_dir: &Path) -> Result<()> {
 
     for entry in dir_entries {
         let file_name = entry.file_name();
-        if file_name == OLD_ROOT_DIR_NAME {
+        if is_root && file_name == OLD_ROOT_DIR_NAME {
             continue;
         }
 
@@ -338,13 +401,13 @@ fn copy_tree_recursive(src_dir: &Path, dst_dir: &Path) -> Result<()> {
                 path: dst_path.clone(),
                 source,
             })?;
+            copy_tree_recursive(&src_path, &dst_path, false)?;
             fs::set_permissions(&dst_path, meta.permissions()).map_err(|source| {
                 BoxletError::StateStore {
                     path: dst_path.clone(),
                     source,
                 }
             })?;
-            copy_tree_recursive(&src_path, &dst_path)?;
         } else if file_type.is_symlink() {
             let target = fs::read_link(&src_path).map_err(|source| BoxletError::StateStore {
                 path: src_path.clone(),
@@ -400,6 +463,15 @@ fn create_symlink(_target: &Path, link_path: &Path) -> Result<()> {
             "symlinks require a Unix host filesystem",
         ),
     })
+}
+
+fn hash_bytes_fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = FNV1A_64_OFFSET_BASIS;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV1A_64_PRIME);
+    }
+    hash
 }
 
 fn hash_file_fnv1a64(path: &Path) -> Result<u64> {
@@ -561,6 +633,95 @@ mod tests {
             snap.branch("branch-1", &branches_base),
             Err(BoxletError::ContainerAlreadyExists { .. })
         ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn nested_destinations_are_rejected_and_nested_pivot_dir_is_preserved() -> Result<()> {
+        let tmp = make_tempdir()?;
+        let source_rootfs = tmp.path().join("rootfs");
+        write_file(&source_rootfs.join("app/main.rs"), b"fn main() {}")?;
+        write_file(
+            &source_rootfs.join("nested/.boxlet_old_root/keep.txt"),
+            b"keep",
+        )?;
+
+        // Destination inside source_rootfs must be rejected before creating directories
+        let nested_snap_base = source_rootfs.join("snapshots");
+        assert!(WorkspaceSnapshot::create("nested-1", &source_rootfs, &nested_snap_base).is_err());
+        assert!(!nested_snap_base.exists());
+
+        let snapshot_base = tmp.path().join("snapshots");
+        let snap = WorkspaceSnapshot::create("snap-ok", &source_rootfs, &snapshot_base)?;
+        assert!(snap
+            .manifest
+            .entries
+            .contains_key(Path::new("nested/.boxlet_old_root/keep.txt")));
+
+        // Branch destination inside snapshot_dir must also be rejected
+        let nested_branch_dest = snap.snapshot_dir.join("branches");
+        assert!(snap.branch("branch-nested", &nested_branch_dest).is_err());
+        assert!(!nested_branch_dest.exists());
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_length_symlink_retarget_and_readonly_dir_copy_work() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = make_tempdir()?;
+        let source_rootfs = tmp.path().join("rootfs");
+        let snapshot_base = tmp.path().join("snapshots");
+        let branches_base = tmp.path().join("branches");
+
+        write_file(&source_rootfs.join("ro_dir/file.txt"), b"readonly child")?;
+        let ro_dir = source_rootfs.join("ro_dir");
+        fs::set_permissions(&ro_dir, fs::Permissions::from_mode(0o555)).map_err(|source| {
+            BoxletError::StateStore {
+                path: ro_dir.clone(),
+                source,
+            }
+        })?;
+        create_symlink(Path::new("target-a"), &source_rootfs.join("current_link"))?;
+
+        let snap = WorkspaceSnapshot::create("snap-sym", &source_rootfs, &snapshot_base)?;
+        let branch = snap.branch("branch-sym", &branches_base)?;
+
+        // Replace symlink with a same-length target ("target-a" -> "target-b")
+        let branch_link = branch.join("current_link");
+        fs::remove_file(&branch_link).map_err(|source| BoxletError::StateStore {
+            path: branch_link.clone(),
+            source,
+        })?;
+        create_symlink(Path::new("target-b"), &branch_link)?;
+
+        let diff = snap.manifest.diff(&TreeManifest::capture(&branch)?);
+        assert_eq!(diff.modified, vec![PathBuf::from("current_link")]);
+
+        // Restore write permissions on temp dirs before TempDir drop cleanup
+        fs::set_permissions(&ro_dir, fs::Permissions::from_mode(0o755)).map_err(|source| {
+            BoxletError::StateStore {
+                path: ro_dir,
+                source,
+            }
+        })?;
+        fs::set_permissions(
+            snap.snapshot_dir.join("ro_dir"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .map_err(|source| BoxletError::StateStore {
+            path: snap.snapshot_dir.join("ro_dir"),
+            source,
+        })?;
+        fs::set_permissions(branch.join("ro_dir"), fs::Permissions::from_mode(0o755)).map_err(
+            |source| BoxletError::StateStore {
+                path: branch.join("ro_dir"),
+                source,
+            },
+        )?;
 
         Ok(())
     }

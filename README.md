@@ -16,7 +16,7 @@ While general-purpose runtimes (`runc`, `youki`) optimize for full container eco
 - **Single Shared Core:** Both the OCI CLI (`create`, `start`, `state`, `kill`, `delete`, `run`) and downstream Rust applications drive the exact same `Engine`, `ExecutionPolicy`, and `ExecutionResult` primitives.
 - **Zero-C-Dependency Static Builds:** Compiles OCI `linux.seccomp` profiles directly to Linux cBPF bytecode using pure-Rust [`syscalls`](https://crates.io/crates/syscalls) + AWS Firecracker's [`seccompiler`](https://crates.io/crates/seccompiler) — no `libseccomp-dev` C headers required, enabling clean static `musl` binaries on `x86_64` and `aarch64`.
 - **Structured Observability & Bounded Output:** Every `boxlet run` returns a machine-readable `ExecutionResult` containing bounded `stdout`/`stderr` buffers (preventing host OOM on log floods), truncation flags, peak memory, CPU usage (`cpu.stat`), violation telemetry (`oom_killed`, `timed_out`, `termination_signal`), and deterministic cleanup verification.
-- **Deterministic 7-Step Teardown:** Unconditionally terminates lingering background grandchildren via Linux 5.15+ `cgroup.kill` after `waitpid` so stdout/stderr pipes never hang and zero orphaned processes or cgroups survive teardown.
+- **Deterministic 7-Step Teardown:** While the `boxlet run` host process is alive, it unconditionally terminates lingering background grandchildren via Linux 5.15+ `cgroup.kill` after `waitpid` so stdout/stderr pipes never hang and zero orphaned processes or cgroups survive teardown.
 
 ---
 
@@ -80,6 +80,7 @@ cargo build --release
 For a completely static Linux `musl` binary:
 
 ```bash
+rustup target add x86_64-unknown-linux-musl
 RUSTFLAGS="-C target-feature=+crt-static" \
   cargo build --release --target x86_64-unknown-linux-musl
 ```
@@ -113,10 +114,10 @@ sudo ./target/release/boxlet delete --force demo-1
 
 ### Run the End-to-End V1 Demo Script
 
-On a Linux 5.15+ host, run the self-contained verification demo covering normal execution, `memory.max` OOM-kill telemetry (`oom_killed: true`), fail-closed seccomp enforcement, and zero-leak cleanup:
+On a Linux 5.15+ host with `busybox` (`busybox-static`) and `python3` installed, run the self-contained verification demo covering normal execution, `memory.max` OOM-kill telemetry (`oom_killed: true`), fail-closed seccomp/capability enforcement, and zero-leak cleanup:
 
 ```bash
-sudo ./scripts/demo-v1.sh
+sudo ./scripts/demo-v1.sh ./target/release/boxlet
 ```
 
 ---
@@ -183,8 +184,8 @@ fn main() {
 Boxlet V1 enforces defense-in-depth Linux kernel isolation:
 1. **Namespaces:** Dedicated PID (`CLONE_NEWPID` with double-fork PID 1), Mount (`CLONE_NEWNS` with `MS_PRIVATE`), UTS, IPC, and Network (`CLONE_NEWNET` loopback-only by default for `boxlet run`).
 2. **Filesystem Isolation:** `pivot_root` into the bundle rootfs, unmounting the old root, mounting isolated `/proc` and minimal `/dev`, and masking sensitive `/proc` and `/sys` paths.
-3. **Privilege Reduction:** Drops Linux capabilities (`Effective`, `Permitted`, `Inheritable`, `Bounding`, `Ambient`) to an explicit allowlist via `caps` and sets `PR_SET_NO_NEW_PRIVS`.
-4. **Fail-Closed Pure-Rust Seccomp BPF:** Translates OCI `linux.seccomp` rules via `syscalls` + `seccompiler` and loads the cBPF program as the final step before `execve`. Any unknown syscall name, unsupported operator, or unsupported flag aborts container creation with `BoxletError::UnsupportedSeccompRule`.
+3. **Privilege Reduction:** Drops Linux capabilities (`Effective`, `Permitted`, `Inheritable`, `Bounding`, `Ambient`) to an explicit allowlist via `caps` and sets `PR_SET_NO_NEW_PRIVS` (enabled by default in `boxlet run`; `boxlet create` honors `process.noNewPrivileges` in `config.json`).
+4. **Fail-Closed Pure-Rust Seccomp BPF:** When `linux.seccomp` is configured in `config.json`, translates OCI seccomp rules via `syscalls` + `seccompiler` and loads the cBPF program as the final step before `execve`. Any unknown syscall name, unsupported operator, or unsupported flag aborts container creation with `BoxletError::UnsupportedSeccompRule`.
 5. **Unified Cgroup v2 Budgets:** Enforces `memory.max`, `cpu.max`, and `pids.max` under `/sys/fs/cgroup/boxlet.slice/<id>` and guarantees teardown via `cgroup.kill`.
 
 > **Shared-Kernel Boundary Warning:** Like `runc` and `youki`, Boxlet V1 containers share the host Linux kernel and require `root` on a dedicated Linux 5.15+ host or VM. Boxlet V1 is **not** designed for executing arbitrary hostile multi-tenant workloads in production without an outer hardware virtualization boundary. Future milestones plug microVM backends (such as Firecracker or `libkrun`) into the `RuntimeBackend` trait seam.

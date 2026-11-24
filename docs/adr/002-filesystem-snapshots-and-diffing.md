@@ -21,7 +21,7 @@ Boxlet separates the **logical snapshot/diff data model** (`src/snapshot.rs`) fr
 
 - **Tier 1: Portable Deterministic Tree Manifest & Diff Engine (`src/snapshot.rs`):**
   - `TreeManifest` walks a root directory deterministically using a sorted `BTreeMap<PathBuf, EntryMetadata>`, skipping internal runtime pivot mount points (`.boxlet_old_root`).
-  - Each `EntryMetadata` records `kind` (`EntryKind::File`, `Directory`, `Symlink`), byte `size`, POSIX permission `mode` (`0o7777` mask), and a 64-bit FNV-1a content digest (`fnv1a64: Option<u64>`) for regular files.
+  - Each `EntryMetadata` records `kind` (`EntryKind::File`, `Directory`, `Symlink`), byte `size`, POSIX permission `mode` (`0o7777` mask), and a 64-bit FNV-1a digest (`fnv1a64: Option<u64>`) over file contents for regular files and over the symlink target path for symlinks (`None` for directories).
   - `TreeManifest::diff(&self, after: &TreeManifest) -> FsDiff` performs an ordered single-pass comparison over both `BTreeMap` keys, classifying every relative path into `added`, `modified` (when `EntryMetadata` differs in kind, size, mode, or content hash), or `deleted`.
   - `WorkspaceSnapshot::create` captures an immutable copy and `TreeManifest` of a source rootfs, while `WorkspaceSnapshot::branch` materializes isolated writable branch directories (`<branch_dest>/<branch_id>`) so `N` parallel sandboxes can execute concurrently and compare their resulting `FsDiff`s against the base snapshot manifest.
 

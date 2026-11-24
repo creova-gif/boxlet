@@ -4,8 +4,6 @@
 set -euo pipefail
 
 BOXLET_BIN="${1:-./target/debug/boxlet}"
-BUNDLE_DIR="${BOXLET_BUNDLE_DIR:-/tmp/boxlet-ci-bundle}"
-STATE_ROOT="${BOXLET_STATE_ROOT:-/tmp/boxlet-ci-state}"
 CGROUP_PARENT="${BOXLET_CGROUP_PARENT:-/sys/fs/cgroup/boxlet.slice}"
 
 if [[ ! -x "$BOXLET_BIN" ]]; then
@@ -25,8 +23,22 @@ if [[ -z "$BUSYBOX_SRC" ]]; then
   exit 1
 fi
 
+WORK_DIR="$(mktemp -d /tmp/boxlet-demo.XXXXXX)"
+BUNDLE_DIR="$WORK_DIR/bundle"
+STATE_ROOT="$WORK_DIR/state"
+
+cleanup() {
+  for id in ci-check-1 ci-check-2 ci-check-3 ci-check-4 ci-check-5 ci-check-6 ci-oci-lifecycle-1; do
+    if [[ -d "$CGROUP_PARENT/$id" ]]; then
+      echo 1 | sudo tee "$CGROUP_PARENT/$id/cgroup.kill" >/dev/null 2>&1 || true
+      sudo rmdir "$CGROUP_PARENT/$id" >/dev/null 2>&1 || true
+    fi
+  done
+  sudo rm -rf "$WORK_DIR" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
 echo "==> [Setup] Provisioning BusyBox OCI bundle at $BUNDLE_DIR and cgroup slice at $CGROUP_PARENT"
-sudo rm -rf "$BUNDLE_DIR" "$STATE_ROOT"
 mkdir -p "$BUNDLE_DIR/rootfs/bin" "$BUNDLE_DIR/rootfs/proc" "$BUNDLE_DIR/rootfs/dev" "$BUNDLE_DIR/rootfs/tmp"
 cp "$BUSYBOX_SRC" "$BUNDLE_DIR/rootfs/bin/busybox"
 for cmd in sh echo sleep true false cat dd head grep mount chroot wc; do
@@ -81,7 +93,7 @@ assert_zero_leaks() {
 # ------------------------------------------------------------------------------
 echo "==> [Check 1] Smoke + NoNewPrivs: 1 + CapEff: 0000000000000000"
 write_bundle_config "echo boxlet-ci-ok && grep -E '^(NoNewPrivs|CapEff):' /proc/self/status"
-OUT_JSON="/tmp/boxlet-check1.json"
+OUT_JSON="$WORK_DIR/check1.json"
 RC=0
 sudo "$BOXLET_BIN" run \
   --root "$STATE_ROOT" \
@@ -113,7 +125,7 @@ assert_zero_leaks "ci-check-1"
 # ------------------------------------------------------------------------------
 echo "==> [Check 2] Prohibited syscall / capability denial (mount -t tmpfs none /tmp)"
 write_bundle_config "mount -t tmpfs none /tmp"
-OUT_JSON="/tmp/boxlet-check2.json"
+OUT_JSON="$WORK_DIR/check2.json"
 RC=0
 sudo "$BOXLET_BIN" run \
   --root "$STATE_ROOT" \
@@ -144,7 +156,7 @@ assert_zero_leaks "ci-check-2"
 # ------------------------------------------------------------------------------
 echo "==> [Check 3] Bounded stdout truncation cap (--max-output-bytes 1024)"
 write_bundle_config "dd if=/dev/zero bs=1024 count=4 2>/dev/null"
-OUT_JSON="/tmp/boxlet-check3.json"
+OUT_JSON="$WORK_DIR/check3.json"
 RC=0
 sudo "$BOXLET_BIN" run \
   --root "$STATE_ROOT" \
@@ -171,7 +183,7 @@ assert_zero_leaks "ci-check-3"
 # ------------------------------------------------------------------------------
 echo "==> [Check 4] Grandchild pipe-hang immunity ((sleep 30 &) && echo grandchild-test-ok)"
 write_bundle_config "(sleep 30 &) && echo grandchild-test-ok"
-OUT_JSON="/tmp/boxlet-check4.json"
+OUT_JSON="$WORK_DIR/check4.json"
 START_TS=$(date +%s)
 RC=0
 sudo "$BOXLET_BIN" run \
@@ -201,7 +213,7 @@ assert_zero_leaks "ci-check-4"
 # ------------------------------------------------------------------------------
 echo "==> [Check 5] Timeout enforcement (sleep 10 with --timeout 1)"
 write_bundle_config "sleep 10"
-OUT_JSON="/tmp/boxlet-check5.json"
+OUT_JSON="$WORK_DIR/check5.json"
 RC=0
 sudo "$BOXLET_BIN" run \
   --root "$STATE_ROOT" \
@@ -227,7 +239,7 @@ assert_zero_leaks "ci-check-5"
 # ------------------------------------------------------------------------------
 echo "==> [Check 6] Memory limit OOM enforcement (--memory 4m)"
 write_bundle_config 'x="0123456789abcdef0123456789abcdef"; while true; do x="$x$x"; done'
-OUT_JSON="/tmp/boxlet-check6.json"
+OUT_JSON="$WORK_DIR/check6.json"
 RC=0
 sudo "$BOXLET_BIN" run \
   --root "$STATE_ROOT" \
@@ -246,11 +258,11 @@ with open(sys.argv[1]) as f:
 oom = data["violations"]["oom_killed"]
 exit_code = data["exit_code"]
 sig = data["violations"]["termination_signal"]
-peak = data["usage"].get("memory_peak_bytes") or 0
-assert oom is True or (exit_code not in (None, 0) or sig is not None), (
-    f"expected OOM kill or non-zero failure, got violations={data['violations']}, exit_code={exit_code}"
+peak = data["usage"].get("memory_peak_bytes")
+assert oom is True or sig == 9 or exit_code == 137, (
+    f"expected OOM kill or SIGKILL (9/137), got violations={data['violations']}, exit_code={exit_code}"
 )
-assert peak > 0, f"expected memory_peak_bytes > 0, got {peak}"
+assert peak is None or peak > 0, f"expected memory_peak_bytes > 0 when available, got {peak}"
 assert data["cleanup"]["status"] == "clean", f"expected clean status, got {data['cleanup']}"
 print(f"    oom_killed={oom}, exit_code={exit_code}, signal={sig}, memory_peak_bytes={peak}")
 PY
