@@ -1,0 +1,9 @@
+/target/
+.DS_Store
+.env
+.env.*
+.gstack/tmp/
+
+# Keep project-local verify-boxlet tracked; ignore bulk workspace-installed third-party skills
+/.agents/skills/*
+!/.agents/skills/verify-boxlet/

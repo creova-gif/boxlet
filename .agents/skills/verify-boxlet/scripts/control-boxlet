@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+REPO_ROOT="${BOXLET_REPO_ROOT:-$DEFAULT_REPO_ROOT}"
+BASE_RUST_IMAGE="${BOXLET_BASE_RUST_IMAGE:-rust:1-slim}"
+RUST_IMAGE="${BOXLET_RUST_IMAGE:-boxlet-verify-rust:1-slim}"
+EVIDENCE_BASE="${BOXLET_EVIDENCE_BASE:-/tmp/boxlet-verify-evidence}"
+SCRATCH_BASE="${BOXLET_SCRATCH_BASE:-/tmp}"
+
+usage() {
+  cat <<'EOF'
+Usage: control-boxlet <command> [options]
+
+Commands:
+  launch  [--run <id>]                         Prepare an isolated run dir and build boxlet
+  doctor  [--run <id>]                         Read-only check of repo, toolchain/backend, and run state
+  drive   <feature> --run <id> [--evidence <dir>]
+                                               Drive a mapped feature (healthcheck | quality-gates | api-docs)
+  cleanup --run <id>                           Remove scratch dir and run-labeled containers; preserve evidence
+
+Environment overrides:
+  BOXLET_VERIFY_BACKEND=native|docker          Force backend (default: native if cargo on PATH, else docker)
+  BOXLET_RUST_IMAGE=<image>                    Docker image for docker backend (default: rust:1-slim)
+  BOXLET_EVIDENCE_BASE=<dir>                   Base directory for evidence (default: /tmp/boxlet-verify-evidence)
+EOF
+}
+
+resolve_backend() {
+  if [[ -n "${BOXLET_VERIFY_BACKEND:-}" ]]; then
+    echo "$BOXLET_VERIFY_BACKEND"
+    return
+  fi
+  if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
+    echo "native"
+  else
+    echo "docker"
+  fi
+}
+
+run_in_backend() {
+  local backend="$1"
+  local run_id="$2"
+  local scratch_dir="$3"
+  local cmd="$4"
+
+  if [[ "$backend" == "native" ]]; then
+    (
+      cd "$scratch_dir/workspace"
+      CARGO_TARGET_DIR="$scratch_dir/target" bash -c "$cmd"
+    )
+  elif [[ "$backend" == "docker" ]]; then
+    docker run --rm \
+      --label "boxlet-verify-run=$run_id" \
+      -v "$scratch_dir:/scratch" \
+      -w /scratch/workspace \
+      -e CARGO_TARGET_DIR=/scratch/target \
+      -e CARGO_HOME=/scratch/cargo-home \
+      "$RUST_IMAGE" \
+      bash -c "$cmd"
+  else
+    echo "Unsupported backend: $backend (expected native or docker)" >&2
+    return 1
+  fi
+}
+
+cmd_launch() {
+  local run_id="run-$(date +%Y%m%d-%H%M%S)-$$"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --run) run_id="$2"; shift 2 ;;
+      *) echo "Unknown option for launch: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  if [[ ! -f "$REPO_ROOT/Cargo.toml" ]]; then
+    echo "Cargo.toml not found in $REPO_ROOT" >&2
+    exit 1
+  fi
+
+  local backend
+  backend="$(resolve_backend)"
+  local scratch_dir="$SCRATCH_BASE/boxlet-verify-$run_id"
+  local evidence_dir="$EVIDENCE_BASE/$run_id"
+
+  mkdir -p "$scratch_dir/target" "$scratch_dir/cargo-home" "$scratch_dir/workspace" "$evidence_dir"
+
+  # Snapshot crate files into scratch workspace so Cargo.lock never mutates the repo
+  cp "$REPO_ROOT/Cargo.toml" "$scratch_dir/workspace/"
+  for item in Cargo.lock src tests benches examples build.rs rustfmt.toml .rustfmt.toml; do
+    if [[ -e "$REPO_ROOT/$item" ]]; then
+      cp -R "$REPO_ROOT/$item" "$scratch_dir/workspace/"
+    fi
+  done
+
+  if [[ "$backend" == "docker" ]]; then
+    if ! docker info >/dev/null 2>&1; then
+      echo "Docker daemon is not running and local cargo is not installed." >&2
+      exit 1
+    fi
+    if ! docker image inspect "$RUST_IMAGE" >/dev/null 2>&1; then
+      echo "Building verification image $RUST_IMAGE from $BASE_RUST_IMAGE (adding rustfmt + clippy)..." >&2
+      docker build -q -t "$RUST_IMAGE" - <<DOCKERFILE >/dev/null
+FROM $BASE_RUST_IMAGE
+RUN rustup component add rustfmt clippy
+DOCKERFILE
+    fi
+  fi
+
+  # Pre-build boxlet into isolated target dir
+  local manifest_path="$scratch_dir/workspace/Cargo.toml"
+  if [[ "$backend" == "docker" ]]; then
+    manifest_path="/scratch/workspace/Cargo.toml"
+  fi
+  run_in_backend "$backend" "$run_id" "$scratch_dir" \
+    "cargo build --manifest-path '$manifest_path'" >/dev/null
+
+  cat >"$scratch_dir/run.env" <<EOF
+RUN_ID=$run_id
+BACKEND=$backend
+REPO_ROOT=$REPO_ROOT
+SCRATCH_DIR=$scratch_dir
+EVIDENCE_DIR=$evidence_dir
+RUST_IMAGE=$RUST_IMAGE
+EOF
+
+  echo "RUN_ID=$run_id"
+  echo "BACKEND=$backend"
+  echo "SCRATCH_DIR=$scratch_dir"
+  echo "EVIDENCE_DIR=$evidence_dir"
+  echo "READY=true"
+}
+
+cmd_doctor() {
+  local run_id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --run) run_id="$2"; shift 2 ;;
+      *) echo "Unknown option for doctor: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  if [[ ! -f "$REPO_ROOT/Cargo.toml" ]] || ! grep -q 'name = "boxlet"' "$REPO_ROOT/Cargo.toml"; then
+    echo "FAIL: $REPO_ROOT/Cargo.toml does not define package 'boxlet'" >&2
+    exit 1
+  fi
+
+  local backend
+  backend="$(resolve_backend)"
+  local scratch_dir=""
+  if [[ -n "$run_id" ]]; then
+    scratch_dir="$SCRATCH_BASE/boxlet-verify-$run_id"
+    if [[ ! -f "$scratch_dir/run.env" ]]; then
+      echo "FAIL: run manifest missing at $scratch_dir/run.env (run 'control-boxlet launch' first)" >&2
+      exit 1
+    fi
+    # shellcheck disable=SC1090
+    source "$scratch_dir/run.env"
+    backend="$BACKEND"
+  fi
+
+  echo "repo: $REPO_ROOT (package: boxlet)"
+  echo "backend: $backend"
+
+  if [[ "$backend" == "native" ]]; then
+    echo "rustc: $(rustc --version)"
+    echo "cargo: $(cargo --version)"
+    echo "rustfmt: $(cargo fmt --version)"
+    echo "clippy: $(cargo clippy --version)"
+  else
+    if ! docker info >/dev/null 2>&1; then
+      echo "FAIL: docker daemon not reachable" >&2
+      exit 1
+    fi
+    if ! docker image inspect "$RUST_IMAGE" >/dev/null 2>&1; then
+      echo "FAIL: docker image $RUST_IMAGE not present locally" >&2
+      exit 1
+    fi
+    echo "image: $RUST_IMAGE"
+    docker run --rm "$RUST_IMAGE" sh -c 'echo "rustc: $(rustc --version)"; echo "cargo: $(cargo --version)"; echo "rustfmt: $(cargo fmt --version)"; echo "clippy: $(cargo clippy --version)"'
+  fi
+
+  if [[ -n "$run_id" ]]; then
+    echo "run_id: $run_id"
+    echo "scratch_dir: $scratch_dir (exists)"
+    echo "evidence_dir: $EVIDENCE_DIR"
+  fi
+  echo "doctor: OK"
+}
+
+cmd_drive() {
+  if [[ $# -lt 1 ]]; then
+    echo "Missing feature name (healthcheck | quality-gates | api-docs)" >&2
+    exit 2
+  fi
+  local feature="$1"; shift
+  local run_id=""
+  local evidence_override=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --run) run_id="$2"; shift 2 ;;
+      --evidence) evidence_override="$2"; shift 2 ;;
+      *) echo "Unknown option for drive: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  if [[ -z "$run_id" ]]; then
+    echo "FAIL: --run <id> is required" >&2
+    exit 2
+  fi
+
+  local scratch_dir="$SCRATCH_BASE/boxlet-verify-$run_id"
+  if [[ ! -f "$scratch_dir/run.env" ]]; then
+    echo "FAIL: run $run_id not initialized (missing $scratch_dir/run.env)" >&2
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  source "$scratch_dir/run.env"
+
+  local out_dir="${evidence_override:-$EVIDENCE_DIR/$feature}"
+  mkdir -p "$out_dir"
+
+  local workspace_path="$scratch_dir/workspace"
+  local scratch_path="$scratch_dir"
+  if [[ "$BACKEND" == "docker" ]]; then
+    workspace_path="/scratch/workspace"
+    scratch_path="/scratch"
+  fi
+
+  local cmd=""
+  case "$feature" in
+    healthcheck)
+      local consumer_host="$scratch_dir/consumer-healthcheck"
+      mkdir -p "$consumer_host/src"
+      cat >"$consumer_host/Cargo.toml" <<EOF
+[package]
+name = "boxlet-consumer-healthcheck"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+boxlet = { path = "$workspace_path" }
+EOF
+      cat >"$consumer_host/src/main.rs" <<'EOF'
+fn main() {
+    let status = boxlet::healthcheck();
+    println!("{status}");
+    if status != "ok" {
+        std::process::exit(1);
+    }
+}
+EOF
+      cmd="cargo run --quiet --manifest-path '$scratch_path/consumer-healthcheck/Cargo.toml'"
+      ;;
+    quality-gates)
+      cmd="cd '$workspace_path' && cargo fmt --check && cargo clippy -- -D warnings && cargo test"
+      ;;
+    api-docs)
+      cmd="cd '$workspace_path' && RUSTDOCFLAGS='-D warnings' cargo doc --no-deps && test -f '$scratch_path/target/doc/boxlet/index.html' && grep -q 'healthcheck' '$scratch_path/target/doc/boxlet/index.html' && echo 'doc-verified: boxlet::healthcheck present in index.html'"
+      ;;
+    *)
+      echo "Unknown feature: $feature (expected: healthcheck | quality-gates | api-docs)" >&2
+      exit 2
+      ;;
+  esac
+
+  printf '%s\n' "$cmd" >"$out_dir/command.txt"
+
+  set +e
+  run_in_backend "$BACKEND" "$run_id" "$scratch_dir" "$cmd" >"$out_dir/stdout.txt" 2>"$out_dir/stderr.txt"
+  local rc=$?
+  set -e
+
+  printf '%s\n' "$rc" >"$out_dir/exit_code.txt"
+  cat >"$out_dir/meta.json" <<EOF
+{
+  "run_id": "$run_id",
+  "feature": "$feature",
+  "backend": "$BACKEND",
+  "exit_code": $rc,
+  "timestamp_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "evidence_dir": "$out_dir"
+}
+EOF
+
+  echo "feature=$feature exit_code=$rc evidence=$out_dir"
+  cat "$out_dir/stdout.txt"
+  if [[ "$rc" -ne 0 ]]; then
+    cat "$out_dir/stderr.txt" >&2
+    exit "$rc"
+  fi
+}
+
+cmd_cleanup() {
+  local run_id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --run) run_id="$2"; shift 2 ;;
+      *) echo "Unknown option for cleanup: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  if [[ -z "$run_id" ]]; then
+    echo "FAIL: --run <id> is required" >&2
+    exit 2
+  fi
+
+  # Stop/remove only containers labeled with this run_id
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    local cids
+    cids="$(docker ps -aq --filter "label=boxlet-verify-run=$run_id" || true)"
+    if [[ -n "$cids" ]]; then
+      docker rm -f $cids >/dev/null
+    fi
+  fi
+
+  local scratch_dir="$SCRATCH_BASE/boxlet-verify-$run_id"
+  if [[ -d "$scratch_dir" ]]; then
+    rm -rf "$scratch_dir"
+  fi
+
+  echo "Cleaned scratch dir: $scratch_dir"
+  echo "Preserved evidence dir: $EVIDENCE_BASE/$run_id"
+}
+
+if [[ $# -lt 1 ]]; then
+  usage
+  exit 2
+fi
+
+subcmd="$1"; shift
+case "$subcmd" in
+  launch) cmd_launch "$@" ;;
+  doctor) cmd_doctor "$@" ;;
+  drive) cmd_drive "$@" ;;
+  cleanup) cmd_cleanup "$@" ;;
+  -h|--help) usage ;;
+  *) echo "Unknown command: $subcmd" >&2; usage; exit 2 ;;
+esac
