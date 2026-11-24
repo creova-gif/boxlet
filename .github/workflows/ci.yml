@@ -8,4 +8,82 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - run: cargo fmt --check && cargo clippy -- -D warnings && cargo test
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+      - run: cargo audit
+
+  linux-integration:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build boxlet binary
+        run: cargo build --bin boxlet
+      - name: Provision BusyBox OCI bundle and cgroup v2 slice
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq busybox-static
+          mkdir -p /tmp/boxlet-ci-bundle/rootfs/bin /tmp/boxlet-ci-bundle/rootfs/proc /tmp/boxlet-ci-bundle/rootfs/dev
+          cp /bin/busybox /tmp/boxlet-ci-bundle/rootfs/bin/busybox
+          for cmd in sh echo sleep true false cat dd head grep; do
+            ln -sf /bin/busybox "/tmp/boxlet-ci-bundle/rootfs/bin/$cmd"
+          done
+          cat > /tmp/boxlet-ci-bundle/config.json <<'EOF'
+          {
+            "ociVersion": "1.0.2",
+            "process": {
+              "terminal": false,
+              "user": { "uid": 0, "gid": 0 },
+              "args": ["/bin/sh", "-c", "echo boxlet-ci-ok && cat /proc/self/status | grep NoNewPrivs"],
+              "env": ["PATH=/bin"],
+              "cwd": "/"
+            },
+            "root": { "path": "rootfs", "readonly": false },
+            "hostname": "boxlet-ci",
+            "linux": {
+              "namespaces": [
+                { "type": "pid" },
+                { "type": "mount" },
+                { "type": "uts" },
+                { "type": "ipc" },
+                { "type": "network" }
+              ]
+            }
+          }
+          EOF
+          sudo mkdir -p /sys/fs/cgroup/boxlet.slice
+          echo "+memory +cpu +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null || true
+          echo "+memory +cpu +pids" | sudo tee /sys/fs/cgroup/boxlet.slice/cgroup.subtree_control >/dev/null || true
+      - name: Run privileged boxlet run smoke, truncation, and zero-leak check
+        run: |
+          RC=0
+          sudo ./target/debug/boxlet run \
+            --root /tmp/boxlet-ci-state \
+            --cgroup-parent /sys/fs/cgroup/boxlet.slice \
+            --id ci-smoke-1 \
+            --memory 128m \
+            --cpus 0.5 \
+            --network none \
+            --json \
+            /tmp/boxlet-ci-bundle > /tmp/boxlet-ci-out.json || RC=$?
+          echo "boxlet exit code: $RC"
+          cat /tmp/boxlet-ci-out.json
+          test "$RC" -eq 0
+          grep -q '"exit_code": 0' /tmp/boxlet-ci-out.json
+          grep -q '"status": "clean"' /tmp/boxlet-ci-out.json
+          test ! -d /sys/fs/cgroup/boxlet.slice/ci-smoke-1
+          test ! -d /tmp/boxlet-ci-state/ci-smoke-1
+      - name: Run privileged OCI create -> state -> start -> delete lifecycle check
+        run: |
+          sudo ./target/debug/boxlet create \
+            --root /tmp/boxlet-ci-state \
+            --cgroup-parent /sys/fs/cgroup/boxlet.slice \
+            --bundle /tmp/boxlet-ci-bundle \
+            ci-oci-1
+          sudo ./target/debug/boxlet state --root /tmp/boxlet-ci-state ci-oci-1 | grep -q '"status": "created"'
+          sudo ./target/debug/boxlet start --root /tmp/boxlet-ci-state ci-oci-1
+          sleep 0.2
+          sudo ./target/debug/boxlet delete --root /tmp/boxlet-ci-state --cgroup-parent /sys/fs/cgroup/boxlet.slice --force ci-oci-1
+          test ! -d /sys/fs/cgroup/boxlet.slice/ci-oci-1
+          test ! -d /tmp/boxlet-ci-state/ci-oci-1
