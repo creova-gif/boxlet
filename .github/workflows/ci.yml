@@ -57,7 +57,7 @@ jobs:
           echo "+memory +cpu +pids" | sudo tee /sys/fs/cgroup/boxlet.slice/cgroup.subtree_control >/dev/null || true
       - name: Run privileged boxlet run smoke, truncation, and zero-leak check
         run: |
-          OUT=$(sudo ./target/debug/boxlet run \
+          sudo ./target/debug/boxlet run \
             --root /tmp/boxlet-ci-state \
             --cgroup-parent /sys/fs/cgroup/boxlet.slice \
             --id ci-smoke-1 \
@@ -65,9 +65,9 @@ jobs:
             --cpus 0.5 \
             --network none \
             --json \
-            /tmp/boxlet-ci-bundle)
-          echo "$OUT"
-          echo "$OUT" | grep -q '"exit_code": 0'
-          echo "$OUT" | grep -q '"status": "clean"'
+            /tmp/boxlet-ci-bundle > /tmp/boxlet-ci-out.json
+          cat /tmp/boxlet-ci-out.json
+          grep -q '"exit_code": 0' /tmp/boxlet-ci-out.json
+          grep -q '"status": "clean"' /tmp/boxlet-ci-out.json
           test ! -d /sys/fs/cgroup/boxlet.slice/ci-smoke-1
           test ! -d /tmp/boxlet-ci-state/ci-smoke-1

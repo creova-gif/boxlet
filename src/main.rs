@@ -1,14 +1,17 @@
 //! Thin `clap` CLI driving the shared `boxlet::Engine`.
 
+#[cfg(target_os = "linux")]
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
+#[cfg(target_os = "linux")]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 
 use boxlet::error::{BoxletError, Result};
 use boxlet::oci::state::DEFAULT_STATE_ROOT;
+#[cfg(target_os = "linux")]
 use boxlet::policy::{ExecutionPolicy, NetworkMode};
 
 const DEFAULT_CGROUP_PARENT: &str = "/sys/fs/cgroup/boxlet.slice";
@@ -206,6 +209,7 @@ fn dispatch(_cli: Cli) -> Result<ExitCode> {
 }
 
 /// Parses human-readable byte sizes (`128m`, `1g`, `512k`, or raw bytes).
+#[cfg(any(target_os = "linux", test))]
 fn parse_byte_size(input: &str) -> Result<u64> {
     let trimmed = input.trim().to_ascii_lowercase();
     if trimmed.is_empty() {
@@ -246,7 +250,7 @@ fn parse_byte_size(input: &str) -> Result<u64> {
 }
 
 /// Parses signal names (`SIGKILL`, `TERM`, `INT`) or positive integers.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(any(target_os = "linux", test))]
 fn parse_signal(input: &str) -> Result<i32> {
     let norm = input.trim().to_ascii_uppercase();
     if let Ok(num) = norm.parse::<i32>() {
@@ -269,7 +273,7 @@ fn parse_signal(input: &str) -> Result<i32> {
     }
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(target_os = "linux")]
 fn generate_container_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

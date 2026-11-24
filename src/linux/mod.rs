@@ -188,6 +188,10 @@ impl RuntimeBackend for LinuxBackend {
 
     fn run(&self, id: &str, bundle: &Path, resolved: &ResolvedRunSpec) -> Result<ExecutionResult> {
         let start_time = Instant::now();
+        // Become a child subreaper so when intermediate `boxlet __init` exits after forking
+        // container PID 1, the kernel reparents PID 1 to this process and `waitpid(pid1)` works.
+        set_child_subreaper()?;
+
         let (stdout_read, stdout_write) = pipe().map_err(|err| BoxletError::Runtime {
             subsystem: "io",
             message: format!("pipe() for stdout failed: {err}"),
@@ -201,7 +205,7 @@ impl RuntimeBackend for LinuxBackend {
         let stdout_handle = spawn_bounded_reader(stdout_read, max_bytes);
         let stderr_handle = spawn_bounded_reader(stderr_read, max_bytes);
 
-        let (state, _child_guard) = self.spawn_container(
+        let (state, _child_guard) = match self.spawn_container(
             id,
             bundle,
             &resolved.oci_spec,
@@ -213,7 +217,20 @@ impl RuntimeBackend for LinuxBackend {
             false,
             Stdio::from(stdout_write),
             Stdio::from(stderr_write),
-        )?;
+        ) {
+            Ok(pair) => pair,
+            Err(err) => {
+                let (init_stderr, _) = stderr_handle.join().unwrap_or_else(|_| (Vec::new(), false));
+                let detail = String::from_utf8_lossy(&init_stderr).trim().to_string();
+                if detail.is_empty() {
+                    return Err(err);
+                }
+                return Err(BoxletError::Runtime {
+                    subsystem: "init",
+                    message: format!("{err}; init stderr: {detail}"),
+                });
+            }
+        };
 
         let pid1 = state.pid.ok_or_else(|| BoxletError::Runtime {
             subsystem: "init",
@@ -427,6 +444,19 @@ impl LinuxBackend {
         rollback.disarm();
         Ok((created_state, ()))
     }
+}
+
+fn set_child_subreaper() -> Result<()> {
+    // SAFETY: `prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)` takes only integer arguments.
+    let rc = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(BoxletError::Runtime {
+            subsystem: "init",
+            message: format!("prctl(PR_SET_CHILD_SUBREAPER) failed: {err}"),
+        });
+    }
+    Ok(())
 }
 
 fn clear_cloexec(fd: &OwnedFd) -> Result<()> {
