@@ -39,7 +39,8 @@ pub(crate) fn apply_capabilities(
         CapsHashSet::new()
     };
 
-    // Drop bounding caps not in target_set.
+    // Clear ambient set first, then drop bounding caps not in target_set.
+    let _ = caps::clear(None, CapSet::Ambient);
     for cap in caps::all() {
         if !target_set.contains(&cap) && caps::has_cap(None, CapSet::Bounding, cap).unwrap_or(false)
         {
@@ -50,6 +51,12 @@ pub(crate) fn apply_capabilities(
         }
     }
 
+    // Linux capset(2) requires Effective <= Permitted at all times: narrow Effective
+    // and Inheritable BEFORE narrowing Permitted.
+    caps::set(None, CapSet::Effective, &target_set).map_err(|err| BoxletError::Runtime {
+        subsystem: "caps",
+        message: format!("failed to set effective caps: {err}"),
+    })?;
     caps::set(None, CapSet::Inheritable, &target_set).map_err(|err| BoxletError::Runtime {
         subsystem: "caps",
         message: format!("failed to set inheritable caps: {err}"),
@@ -58,12 +65,6 @@ pub(crate) fn apply_capabilities(
         subsystem: "caps",
         message: format!("failed to set permitted caps: {err}"),
     })?;
-    caps::set(None, CapSet::Effective, &target_set).map_err(|err| BoxletError::Runtime {
-        subsystem: "caps",
-        message: format!("failed to set effective caps: {err}"),
-    })?;
-
-    let _ = caps::clear(None, CapSet::Ambient);
     Ok(())
 }
 
