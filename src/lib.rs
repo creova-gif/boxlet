@@ -6,6 +6,7 @@ pub mod error;
 pub(crate) mod linux;
 pub mod oci;
 pub mod policy;
+pub mod snapshot;
 pub mod traits;
 
 pub use engine::Engine;

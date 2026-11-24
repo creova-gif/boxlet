@@ -5,7 +5,7 @@ Public API documentation verifies that Boxlet's exported crate modules, types, a
 ## Sub-features
 
 - `doc-build` compiles crate docs with `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`.
-- `doc-symbol-index` confirms `target/doc/boxlet/index.html` is generated and lists `healthcheck`, `Engine`, `engine`, `policy`, `oci`, `traits`, and `error`.
+- `doc-symbol-index` confirms `target/doc/boxlet/index.html` is generated and lists `healthcheck`, `Engine`, `engine`, `policy`, `oci`, `snapshot`, `traits`, and `error`.
 
 ## How to get to it (user POV)
 
