@@ -5,6 +5,7 @@ pub(crate) mod caps;
 pub(crate) mod cgroup_v2;
 pub(crate) mod init;
 pub(crate) mod namespaces;
+pub mod overlay;
 pub(crate) mod rootfs;
 pub(crate) mod seccomp;
 
@@ -18,12 +19,12 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::sys::signal::{kill as nix_kill, Signal};
 use nix::sys::stat::Mode;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{mkfifo, pipe, Pid};
+use nix::unistd::{mkfifo, pipe2, Pid};
 use oci_spec::runtime::Spec;
 
 use crate::error::{BoxletError, Result};
@@ -39,6 +40,11 @@ use crate::traits::{ResourceController, RootfsProvider, RuntimeBackend};
 
 /// Maximum time to wait for `boxlet __init` to report PID 1 and reach `Created` state.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Serializes the brief `clear_cloexec` -> `Command::spawn` -> `drop(child_fds)` window
+/// so concurrent `Engine::run_branches` threads never leak non-CLOEXEC pipe descriptors
+/// into sibling `boxlet __init` processes.
+static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Linux 5.15+ OCI container backend implementing [`RuntimeBackend`].
 #[derive(Debug, Clone)]
@@ -193,14 +199,8 @@ impl RuntimeBackend for LinuxBackend {
         // container PID 1, the kernel reparents PID 1 to this process and `waitpid(pid1)` works.
         set_child_subreaper()?;
 
-        let (stdout_read, stdout_write) = pipe().map_err(|err| BoxletError::Runtime {
-            subsystem: "io",
-            message: format!("pipe() for stdout failed: {err}"),
-        })?;
-        let (stderr_read, stderr_write) = pipe().map_err(|err| BoxletError::Runtime {
-            subsystem: "io",
-            message: format!("pipe() for stderr failed: {err}"),
-        })?;
+        let (stdout_read, stdout_write) = pipe_cloexec("io", "stdout")?;
+        let (stderr_read, stderr_write) = pipe_cloexec("io", "stderr")?;
 
         let max_bytes = resolved.max_output_bytes;
         let stdout_handle = spawn_bounded_reader(stdout_read, max_bytes);
@@ -356,23 +356,9 @@ impl LinuxBackend {
             None
         };
 
-        let (pid_r, pid_w) = pipe().map_err(|err| BoxletError::Runtime {
-            subsystem: "init",
-            message: format!("pipe(pid) failed: {err}"),
-        })?;
-        let (ack_r, ack_w) = pipe().map_err(|err| BoxletError::Runtime {
-            subsystem: "init",
-            message: format!("pipe(ack) failed: {err}"),
-        })?;
-        let (ready_r, ready_w) = pipe().map_err(|err| BoxletError::Runtime {
-            subsystem: "init",
-            message: format!("pipe(ready) failed: {err}"),
-        })?;
-
-        // Clear FD_CLOEXEC only on the three child ends so `boxlet __init` inherits them.
-        clear_cloexec(&pid_w)?;
-        clear_cloexec(&ack_r)?;
-        clear_cloexec(&ready_w)?;
+        let (pid_r, pid_w) = pipe_cloexec("init", "pid")?;
+        let (ack_r, ack_w) = pipe_cloexec("init", "ack")?;
+        let (ready_r, ready_w) = pipe_cloexec("init", "ready")?;
 
         let init_cfg = InitConfig {
             container_id: id.to_string(),
@@ -413,22 +399,34 @@ impl LinuxBackend {
             message: format!("failed to resolve current_exe for self-re-exec: {err}"),
         })?;
 
-        let mut child = Command::new(current_exe)
-            .arg("__init")
-            .arg(&init_cfg_path)
-            .stdin(Stdio::null())
-            .stdout(stdout_cfg)
-            .stderr(stderr_cfg)
-            .spawn()
-            .map_err(|err| BoxletError::Runtime {
-                subsystem: "init",
-                message: format!("failed to spawn boxlet __init: {err}"),
-            })?;
+        let mut child = {
+            let _spawn_guard = SPAWN_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Clear FD_CLOEXEC only on the three child ends while holding SPAWN_LOCK
+            // so only this `boxlet __init` child inherits them.
+            clear_cloexec(&pid_w)?;
+            clear_cloexec(&ack_r)?;
+            clear_cloexec(&ready_w)?;
 
-        // Close child pipe ends in parent so EOF is observed if child crashes.
-        drop(pid_w);
-        drop(ack_r);
-        drop(ready_w);
+            let spawned = Command::new(current_exe)
+                .arg("__init")
+                .arg(&init_cfg_path)
+                .stdin(Stdio::null())
+                .stdout(stdout_cfg)
+                .stderr(stderr_cfg)
+                .spawn()
+                .map_err(|err| BoxletError::Runtime {
+                    subsystem: "init",
+                    message: format!("failed to spawn boxlet __init: {err}"),
+                })?;
+
+            // Close child pipe ends in parent before releasing SPAWN_LOCK.
+            drop(pid_w);
+            drop(ack_r);
+            drop(ready_w);
+            spawned
+        };
 
         // Read real container PID 1 with bounded handshake timeout.
         let pid_bytes = read_exact_with_timeout(&pid_r, 4, HANDSHAKE_TIMEOUT)?;
@@ -473,6 +471,13 @@ fn set_child_subreaper() -> Result<()> {
         });
     }
     Ok(())
+}
+
+fn pipe_cloexec(subsystem: &'static str, label: &str) -> Result<(OwnedFd, OwnedFd)> {
+    pipe2(OFlag::O_CLOEXEC).map_err(|err| BoxletError::Runtime {
+        subsystem,
+        message: format!("pipe2({label}, O_CLOEXEC) failed: {err}"),
+    })
 }
 
 fn clear_cloexec(fd: &OwnedFd) -> Result<()> {

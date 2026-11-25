@@ -298,4 +298,82 @@ echo "$STATE_STOPPED" | grep -q '"status": "stopped"'
 sudo "$BOXLET_BIN" delete --root "$STATE_ROOT" --cgroup-parent "$CGROUP_PARENT" --force "$OCI_ID"
 assert_zero_leaks "$OCI_ID"
 
-echo "==> All 7 Boxlet V1 end-to-end checks passed with zero leaked cgroups or state directories!"
+# ------------------------------------------------------------------------------
+# Check 8: V2 Snapshot & Deterministic Filesystem Diff (boxlet snapshot + boxlet diff --json)
+# ------------------------------------------------------------------------------
+echo "==> [Check 8] V2 Snapshot & Deterministic Filesystem Diff (boxlet snapshot + boxlet diff --json)"
+"$BOXLET_BIN" snapshot \
+  --rootfs "$BUNDLE_DIR/rootfs" \
+  --out "$WORK_DIR/snapshots" \
+  --json \
+  snap-ci-1 > "$WORK_DIR/check8-snap.json"
+
+cp -a "$BUNDLE_DIR/rootfs" "$WORK_DIR/rootfs-after"
+echo "agent-artifact" > "$WORK_DIR/rootfs-after/tmp/agent_created.txt"
+ln -sf /bin/sh "$WORK_DIR/rootfs-after/bin/wc"
+
+"$BOXLET_BIN" diff \
+  --json \
+  "$WORK_DIR/snapshots/snap-ci-1" \
+  "$WORK_DIR/rootfs-after" > "$WORK_DIR/check8-diff.json"
+
+python3 - "$WORK_DIR/check8-snap.json" "$WORK_DIR/check8-diff.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    snap = json.load(f)
+with open(sys.argv[2]) as f:
+    diff = json.load(f)
+assert snap.get("id") == "snap-ci-1", f"expected snap id 'snap-ci-1', got {snap.get('id')!r}"
+assert "tmp/agent_created.txt" in diff.get("added", []), f"expected tmp/agent_created.txt in added, got {diff}"
+assert "bin/wc" in diff.get("modified", []), f"expected bin/wc in modified, got {diff}"
+print(f"    snapshot id={snap['id']}, diff added={diff['added']}, modified={diff['modified']}")
+PY
+
+# ------------------------------------------------------------------------------
+# Check 9: V2 Multi-Agent Parallel Branch Execution (boxlet branch-run --json)
+# ------------------------------------------------------------------------------
+echo "==> [Check 9] V2 Multi-Agent Parallel Branch Execution (boxlet branch-run --json)"
+sudo "$BOXLET_BIN" branch-run \
+  --root "$STATE_ROOT" \
+  --cgroup-parent "$CGROUP_PARENT" \
+  --memory 128m \
+  --network none \
+  --cmd "echo candidate-a > /tmp/candidate_a.txt && echo branch-a-ok" \
+  --cmd "echo candidate-b > /tmp/candidate_b.txt && rm -f /bin/wc && echo branch-b-ok" \
+  --json \
+  "$BUNDLE_DIR" > "$WORK_DIR/check9-branches.json"
+
+python3 - "$WORK_DIR/check9-branches.json" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+
+assert isinstance(data, list) and len(data) == 2, f"expected 2 branch results, got {len(data) if isinstance(data, list) else type(data)}"
+
+def get_exit_code(branch):
+    if "exit_code" in branch:
+        return branch["exit_code"]
+    for key in ("execution", "result"):
+        if isinstance(branch.get(key), dict) and "exit_code" in branch[key]:
+            return branch[key]["exit_code"]
+    return None
+
+b0, b1 = data[0], data[1]
+assert get_exit_code(b0) == 0, f"expected branch 0 exit_code 0, got {b0}"
+assert "tmp/candidate_a.txt" in b0["fs_diff"]["added"], f"expected tmp/candidate_a.txt in branch 0 added: {b0['fs_diff']}"
+assert "tmp/candidate_b.txt" not in b0["fs_diff"]["added"], f"unexpected tmp/candidate_b.txt in branch 0 added: {b0['fs_diff']}"
+
+assert get_exit_code(b1) == 0, f"expected branch 1 exit_code 0, got {b1}"
+assert "tmp/candidate_b.txt" in b1["fs_diff"]["added"], f"expected tmp/candidate_b.txt in branch 1 added: {b1['fs_diff']}"
+assert "bin/wc" in b1["fs_diff"]["deleted"], f"expected bin/wc in branch 1 deleted: {b1['fs_diff']}"
+print(
+    f"    branch[0] added={b0['fs_diff']['added']}, "
+    f"branch[1] added={b1['fs_diff']['added']} deleted={b1['fs_diff']['deleted']}"
+)
+PY
+
+test -e "$BUNDLE_DIR/rootfs/bin/wc"
+test ! -e "$BUNDLE_DIR/rootfs/tmp/candidate_a.txt"
+
+echo "==> All 9 Boxlet V1 & V2 end-to-end checks passed with zero leaked cgroups or state directories!"
