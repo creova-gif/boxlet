@@ -19,12 +19,12 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::sys::signal::{kill as nix_kill, Signal};
 use nix::sys::stat::Mode;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{mkfifo, pipe, Pid};
+use nix::unistd::{mkfifo, pipe2, Pid};
 use oci_spec::runtime::Spec;
 
 use crate::error::{BoxletError, Result};
@@ -474,23 +474,10 @@ fn set_child_subreaper() -> Result<()> {
 }
 
 fn pipe_cloexec(subsystem: &'static str, label: &str) -> Result<(OwnedFd, OwnedFd)> {
-    let (r, w) = pipe().map_err(|err| BoxletError::Runtime {
+    pipe2(OFlag::O_CLOEXEC).map_err(|err| BoxletError::Runtime {
         subsystem,
-        message: format!("pipe({label}) failed: {err}"),
-    })?;
-    set_cloexec(&r, subsystem)?;
-    set_cloexec(&w, subsystem)?;
-    Ok((r, w))
-}
-
-fn set_cloexec(fd: &OwnedFd, subsystem: &'static str) -> Result<()> {
-    fcntl(fd.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(|err| {
-        BoxletError::Runtime {
-            subsystem,
-            message: format!("failed to set FD_CLOEXEC: {err}"),
-        }
-    })?;
-    Ok(())
+        message: format!("pipe2({label}, O_CLOEXEC) failed: {err}"),
+    })
 }
 
 fn clear_cloexec(fd: &OwnedFd) -> Result<()> {

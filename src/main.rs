@@ -197,7 +197,14 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         } => {
             let effective_id = match (id.as_str(), trailing_id) {
                 ("create", Some(real_id)) => real_id,
-                _ => id,
+                (_, None) => id,
+                (other, Some(extra)) => {
+                    return Err(BoxletError::InvalidPolicy {
+                        reason: format!(
+                            "unexpected extra argument '{extra}' for snapshot '{other}'"
+                        ),
+                    });
+                }
             };
             let snapshot = WorkspaceSnapshot::create(&effective_id, &rootfs, &out)?;
             if json {

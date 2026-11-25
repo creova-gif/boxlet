@@ -24,9 +24,6 @@ use crate::traits::RootfsProvider;
 /// Internal pivot directory skipped during upperdir diff inspection.
 const OLD_ROOT_DIR_NAME: &str = ".boxlet_old_root";
 
-/// Optional OCI/overlay whiteout filename prefix supported alongside kernel `c 0:0` char devices.
-const WHITEOUT_PREFIX: &str = ".wh.";
-
 /// 64-bit FNV-1a offset basis (matches `crate::snapshot`).
 const FNV1A_64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 
@@ -328,31 +325,19 @@ fn walk_upper_recursive(
             source,
         })?;
 
-        // Check for kernel `c 0:0` whiteout device or `.wh.<name>` marker.
+        // Check for kernel `c 0:0` whiteout character device.
         if is_overlay_whiteout(&meta) {
             record_deleted_path(lower_manifest, &rel_path, deleted);
             continue;
-        }
-
-        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-            if let Some(stripped_name) = file_name.strip_prefix(WHITEOUT_PREFIX) {
-                if !stripped_name.is_empty() {
-                    let target_rel = match rel_path.parent() {
-                        Some(parent) if !parent.as_os_str().is_empty() => {
-                            parent.join(stripped_name)
-                        }
-                        _ => PathBuf::from(stripped_name),
-                    };
-                    record_deleted_path(lower_manifest, &target_rel, deleted);
-                    continue;
-                }
-            }
         }
 
         let file_type = meta.file_type();
         let mode = meta.mode() & 0o7777;
 
         if file_type.is_dir() {
+            if is_opaque_overlay_dir(&path) {
+                record_opaque_deleted_children(lower_manifest, &rel_path, &path, deleted);
+            }
             let upper_meta = EntryMetadata {
                 kind: EntryKind::Directory,
                 size: 0,
@@ -431,6 +416,46 @@ fn classify_upper_entry(
                     if candidate != rel_path && candidate.starts_with(rel_path) {
                         deleted.push(candidate.clone());
                     }
+                }
+            }
+        }
+    }
+}
+
+fn is_opaque_overlay_dir(path: &Path) -> bool {
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    for attr_name in [c"trusted.overlay.opaque", c"user.overlay.opaque"] {
+        let mut buf = [0u8; 4];
+        // SAFETY: `c_path` and `attr_name` are valid NUL-terminated CStrings and `buf` is valid writable memory.
+        let n = unsafe {
+            libc::lgetxattr(
+                c_path.as_ptr(),
+                attr_name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        if n == 1 && buf[0] == b'y' {
+            return true;
+        }
+    }
+    false
+}
+
+fn record_opaque_deleted_children(
+    lower_manifest: &TreeManifest,
+    dir_rel: &Path,
+    upper_dir_path: &Path,
+    deleted: &mut Vec<PathBuf>,
+) {
+    for candidate in lower_manifest.entries.keys() {
+        if candidate != dir_rel && candidate.starts_with(dir_rel) {
+            if let Ok(sub_rel) = candidate.strip_prefix(dir_rel) {
+                let recreated_in_upper = upper_dir_path.join(sub_rel);
+                if fs::symlink_metadata(&recreated_in_upper).is_err() {
+                    deleted.push(candidate.clone());
                 }
             }
         }
@@ -639,7 +664,7 @@ mod tests {
         // Regular file with rdev == 0 is NOT a whiteout.
         assert!(!is_whiteout_mode_and_rdev(libc::S_IFREG | 0o644, 0));
 
-        // Verify whiteout deletion handling in inspect_upper_diff (including directory subtree deletion).
+        // Verify whiteout deletion and directory replacement handling in inspect_upper_diff.
         let tmp = make_tempdir()?;
         let lower = tmp.path().join("lower");
         let upper = tmp.path().join("upper");
@@ -655,10 +680,15 @@ mod tests {
             source,
         })?;
 
-        // Try creating a real kernel `c 0:0` whiteout node for `obsolete.txt`;
-        // fall back to `.wh.obsolete.txt` if running in an environment where mknod(c 0:0) is restricted.
+        // Replace `legacy` directory in lowerdir with a regular file in upperdir;
+        // `classify_upper_entry` must mark `legacy` as modified and all its lower descendants as deleted.
+        write_file(&upper.join("legacy"), b"replaced dir with file\n")?;
+
+        // Also test kernel `c 0:0` whiteout node if permitted in this test environment.
         let char_whiteout_path = upper.join("obsolete.txt");
-        if mknod(&char_whiteout_path, SFlag::S_IFCHR, Mode::empty(), 0).is_ok() {
+        let created_char_whiteout =
+            mknod(&char_whiteout_path, SFlag::S_IFCHR, Mode::empty(), 0).is_ok();
+        if created_char_whiteout {
             let meta = fs::symlink_metadata(&char_whiteout_path).map_err(|source| {
                 BoxletError::StateStore {
                     path: char_whiteout_path,
@@ -666,26 +696,20 @@ mod tests {
                 }
             })?;
             assert!(is_overlay_whiteout(&meta));
-        } else {
-            write_file(&upper.join(".wh.obsolete.txt"), b"")?;
         }
-
-        // Simulate whiteout of the `legacy` directory to verify all descendants in lower_manifest are marked deleted.
-        write_file(&upper.join(".wh.legacy"), b"")?;
 
         let diff = inspect_upper_diff(&lower_manifest, &upper)?;
         assert!(diff.added.is_empty());
-        assert!(diff.modified.is_empty());
-        assert_eq!(
-            diff.deleted,
-            vec![
-                PathBuf::from("legacy"),
-                PathBuf::from("legacy/mod.rs"),
-                PathBuf::from("legacy/sub"),
-                PathBuf::from("legacy/sub/helper.rs"),
-                PathBuf::from("obsolete.txt"),
-            ]
-        );
+        assert_eq!(diff.modified, vec![PathBuf::from("legacy")]);
+        let mut expected_deleted = vec![
+            PathBuf::from("legacy/mod.rs"),
+            PathBuf::from("legacy/sub"),
+            PathBuf::from("legacy/sub/helper.rs"),
+        ];
+        if created_char_whiteout {
+            expected_deleted.push(PathBuf::from("obsolete.txt"));
+        }
+        assert_eq!(diff.deleted, expected_deleted);
 
         Ok(())
     }

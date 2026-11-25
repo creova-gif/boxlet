@@ -80,8 +80,22 @@ struct TempWorkspaceGuard {
 }
 
 impl TempWorkspaceGuard {
-    fn create() -> Result<Self> {
-        let base = std::env::temp_dir();
+    fn create(bundle: &Path) -> Result<Self> {
+        let preferred_base = bundle
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty() && p.exists())
+            .map(Path::to_path_buf);
+        let fallback_base = std::env::temp_dir();
+
+        if let Some(ref base) = preferred_base {
+            if let Ok(guard) = Self::create_in_base(base) {
+                return Ok(guard);
+            }
+        }
+        Self::create_in_base(&fallback_base)
+    }
+
+    fn create_in_base(base: &Path) -> Result<Self> {
         let pid = std::process::id();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -90,8 +104,8 @@ impl TempWorkspaceGuard {
 
         for _ in 0..256 {
             let seq = WORKSPACE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let candidate = base.join(format!("boxlet-branches-{pid}-{nanos}-{seq}"));
-            match fs::create_dir(&candidate) {
+            let candidate = base.join(format!(".boxlet-branches-{pid}-{nanos}-{seq}"));
+            match create_private_dir(&candidate) {
                 Ok(()) => return Ok(Self { path: candidate }),
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(source) => {
@@ -113,6 +127,17 @@ impl TempWorkspaceGuard {
     fn path(&self) -> &Path {
         &self.path
     }
+}
+
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    fs::create_dir(path)
 }
 
 impl Drop for TempWorkspaceGuard {
@@ -223,7 +248,7 @@ impl<B: RuntimeBackend> Engine<B> {
             bundle.join(configured_rootfs)
         };
 
-        let workspace = TempWorkspaceGuard::create()?;
+        let workspace = TempWorkspaceGuard::create(bundle)?;
         let snapshot_base = workspace.path().join("snapshots");
         let bundles_base = workspace.path().join("bundles");
 
@@ -269,12 +294,27 @@ impl<B: RuntimeBackend> Engine<B> {
             }
 
             let mut out = Vec::with_capacity(handles.len());
+            let mut first_err: Option<BoxletError> = None;
             for handle in handles {
-                let branch_res = handle.join().map_err(|_| BoxletError::Runtime {
-                    subsystem: "engine",
-                    message: "branch execution worker thread panicked".to_string(),
-                })??;
-                out.push(branch_res);
+                match handle.join() {
+                    Ok(Ok(branch_res)) => out.push(branch_res),
+                    Ok(Err(err)) => {
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                        }
+                    }
+                    Err(_) => {
+                        if first_err.is_none() {
+                            first_err = Some(BoxletError::Runtime {
+                                subsystem: "engine",
+                                message: "branch execution worker thread panicked".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            if let Some(err) = first_err {
+                return Err(err);
             }
             Ok(out)
         })?;
@@ -288,6 +328,7 @@ fn apply_branch_overrides(base_spec: &Spec, branch: &BranchSpec) -> Spec {
 
     let mut root = spec.root().clone().unwrap_or_default();
     root.set_path(PathBuf::from("rootfs"));
+    root.set_readonly(Some(false));
     spec.set_root(Some(root));
 
     if branch.args.is_some() || branch.env.is_some() || branch.cwd.is_some() {
