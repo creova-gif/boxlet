@@ -1,12 +1,133 @@
 //! Shared execution engine used by both the `boxlet` CLI and downstream Rust SDK callers.
 
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::error::Result;
+use oci_spec::runtime::Spec;
+use serde::{Deserialize, Serialize};
+
+use crate::error::{BoxletError, Result};
 use crate::oci::state::ContainerState;
 use crate::oci::{load_bundle_spec, validate_container_id};
-use crate::policy::{merge_policy_with_spec, ExecutionPolicy, ExecutionResult};
+use crate::policy::{merge_policy_with_spec, ExecutionPolicy, ExecutionResult, ResolvedRunSpec};
+use crate::snapshot::{FsDiff, TreeManifest, WorkspaceSnapshot};
 use crate::traits::RuntimeBackend;
+
+/// Monotonic counter used to disambiguate concurrent temporary branch workspaces.
+static WORKSPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Per-branch workload overrides for [`Engine::run_branches`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchSpec {
+    /// Unique identifier for this branch (validated via `validate_container_id`).
+    pub id: String,
+    /// Optional command argv override (`process.args`).
+    pub args: Option<Vec<String>>,
+    /// Optional environment entries (`KEY=VALUE`) appended to or overriding `process.env`.
+    pub env: Option<Vec<String>>,
+    /// Optional working directory override (`process.cwd`).
+    pub cwd: Option<String>,
+}
+
+impl BranchSpec {
+    /// Constructs a new [`BranchSpec`] with the given branch `id` and no process overrides.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            args: None,
+            env: None,
+            cwd: None,
+        }
+    }
+
+    /// Overrides the container command arguments (`process.args`) for this branch.
+    pub fn with_args(mut self, args: Vec<String>) -> Self {
+        self.args = Some(args);
+        self
+    }
+
+    /// Overrides or appends environment variables (`KEY=VALUE`) in `process.env` for this branch.
+    pub fn with_env(mut self, env: Vec<String>) -> Self {
+        self.env = Some(env);
+        self
+    }
+
+    /// Overrides the working directory (`process.cwd`) inside the container for this branch.
+    pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+}
+
+/// Combined execution telemetry and filesystem diff for a single sandbox branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchExecutionResult {
+    /// Branch identifier matching [`BranchSpec::id`].
+    pub branch_id: String,
+    /// Container execution telemetry (`stdout`, `stderr`, `exit_code`, `usage`, `violations`, `cleanup`).
+    pub execution: ExecutionResult,
+    /// Deterministic filesystem diff relative to the base bundle rootfs snapshot.
+    pub fs_diff: FsDiff,
+}
+
+/// RAII guard that removes the temporary workspace directory created by [`Engine::run_branches`].
+struct TempWorkspaceGuard {
+    path: PathBuf,
+}
+
+impl TempWorkspaceGuard {
+    fn create() -> Result<Self> {
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+
+        for _ in 0..256 {
+            let seq = WORKSPACE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let candidate = base.join(format!("boxlet-branches-{pid}-{nanos}-{seq}"));
+            match fs::create_dir(&candidate) {
+                Ok(()) => return Ok(Self { path: candidate }),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(source) => {
+                    return Err(BoxletError::StateStore {
+                        path: candidate,
+                        source,
+                    });
+                }
+            }
+        }
+
+        Err(BoxletError::Runtime {
+            subsystem: "engine",
+            message: "failed to allocate unique temporary workspace directory for branches"
+                .to_string(),
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempWorkspaceGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Pre-materialized per-branch bundle and resolved run configuration.
+struct PreparedBranch {
+    branch_id: String,
+    bundle_dir: PathBuf,
+    rootfs_dir: PathBuf,
+    resolved: ResolvedRunSpec,
+}
 
 /// Shared Boxlet execution engine parameterized over a single deep [`RuntimeBackend`].
 #[derive(Debug, Clone)]
@@ -64,6 +185,137 @@ impl<B: RuntimeBackend> Engine<B> {
         let resolved = merge_policy_with_spec(&base_spec, policy)?;
         self.backend.run(id, bundle, &resolved)
     }
+
+    /// Snapshots `<bundle>` once, fans out `branches` concurrently in isolated workspace
+    /// root filesystems, and returns per-branch execution telemetry plus deterministic
+    /// [`FsDiff`]s in the exact input order without mutating `<bundle>`.
+    pub fn run_branches(
+        &self,
+        bundle: &Path,
+        branches: &[BranchSpec],
+        policy: &ExecutionPolicy,
+    ) -> Result<Vec<BranchExecutionResult>> {
+        policy.validate()?;
+
+        let mut seen_ids = BTreeSet::new();
+        for branch in branches {
+            validate_container_id(&branch.id)?;
+            if !seen_ids.insert(branch.id.as_str()) {
+                return Err(BoxletError::ContainerAlreadyExists {
+                    id: branch.id.clone(),
+                });
+            }
+        }
+
+        let base_spec = load_bundle_spec(bundle)?;
+        if branches.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let configured_rootfs = base_spec
+            .root()
+            .as_ref()
+            .map(|r| r.path().clone())
+            .unwrap_or_else(|| PathBuf::from("rootfs"));
+        let source_rootfs = if configured_rootfs.is_absolute() {
+            configured_rootfs
+        } else {
+            bundle.join(configured_rootfs)
+        };
+
+        let workspace = TempWorkspaceGuard::create()?;
+        let snapshot_base = workspace.path().join("snapshots");
+        let bundles_base = workspace.path().join("bundles");
+
+        let snapshot = WorkspaceSnapshot::create("base", &source_rootfs, &snapshot_base)?;
+
+        let mut prepared = Vec::with_capacity(branches.len());
+        for branch in branches {
+            let branch_bundle_dir = bundles_base.join(&branch.id);
+            let branch_rootfs_dir = snapshot.branch("rootfs", &branch_bundle_dir)?;
+            let branch_spec = apply_branch_overrides(&base_spec, branch);
+            let config_path = branch_bundle_dir.join("config.json");
+            branch_spec
+                .save(&config_path)
+                .map_err(|source| BoxletError::OciSpec {
+                    path: config_path,
+                    source,
+                })?;
+            let resolved = merge_policy_with_spec(&branch_spec, policy)?;
+            prepared.push(PreparedBranch {
+                branch_id: branch.id.clone(),
+                bundle_dir: branch_bundle_dir,
+                rootfs_dir: branch_rootfs_dir,
+                resolved,
+            });
+        }
+
+        let results = thread::scope(|scope| -> Result<Vec<BranchExecutionResult>> {
+            let mut handles = Vec::with_capacity(prepared.len());
+            for item in &prepared {
+                let backend = &self.backend;
+                let base_manifest = &snapshot.manifest;
+                handles.push(scope.spawn(move || -> Result<BranchExecutionResult> {
+                    let execution =
+                        backend.run(&item.branch_id, &item.bundle_dir, &item.resolved)?;
+                    let after_manifest = TreeManifest::capture(&item.rootfs_dir)?;
+                    let fs_diff = base_manifest.diff(&after_manifest);
+                    Ok(BranchExecutionResult {
+                        branch_id: item.branch_id.clone(),
+                        execution,
+                        fs_diff,
+                    })
+                }));
+            }
+
+            let mut out = Vec::with_capacity(handles.len());
+            for handle in handles {
+                let branch_res = handle.join().map_err(|_| BoxletError::Runtime {
+                    subsystem: "engine",
+                    message: "branch execution worker thread panicked".to_string(),
+                })??;
+                out.push(branch_res);
+            }
+            Ok(out)
+        })?;
+
+        Ok(results)
+    }
+}
+
+fn apply_branch_overrides(base_spec: &Spec, branch: &BranchSpec) -> Spec {
+    let mut spec = base_spec.clone();
+
+    let mut root = spec.root().clone().unwrap_or_default();
+    root.set_path(PathBuf::from("rootfs"));
+    spec.set_root(Some(root));
+
+    if branch.args.is_some() || branch.env.is_some() || branch.cwd.is_some() {
+        let mut process = spec.process().clone().unwrap_or_default();
+        if let Some(args) = &branch.args {
+            process.set_args(Some(args.clone()));
+        }
+        if let Some(env_overrides) = &branch.env {
+            let mut merged_env = process.env().clone().unwrap_or_default();
+            for entry in env_overrides {
+                if let Some((key, _)) = entry.split_once('=') {
+                    let prefix = format!("{key}=");
+                    if let Some(existing) = merged_env.iter_mut().find(|e| e.starts_with(&prefix)) {
+                        *existing = entry.clone();
+                        continue;
+                    }
+                }
+                merged_env.push(entry.clone());
+            }
+            process.set_env(Some(merged_env));
+        }
+        if let Some(cwd) = &branch.cwd {
+            process.set_cwd(PathBuf::from(cwd));
+        }
+        spec.set_process(Some(process));
+    }
+
+    spec
 }
 
 #[cfg(test)]
@@ -138,16 +390,63 @@ mod tests {
         fn run(
             &self,
             id: &str,
-            _bundle: &Path,
+            bundle: &Path,
             resolved: &ResolvedRunSpec,
         ) -> Result<ExecutionResult> {
             if let Ok(mut guard) = self.last_run_spec.lock() {
                 *guard = Some(resolved.clone());
             }
+
+            let rootfs = bundle.join("rootfs");
+            let args = resolved
+                .oci_spec
+                .process()
+                .as_ref()
+                .and_then(|p| p.args().clone())
+                .unwrap_or_default();
+
+            if let Some(action) = args.first().map(String::as_str) {
+                match action {
+                    "branch-a-action" => {
+                        let new_file = rootfs.join("src/candidate_a.rs");
+                        fs::write(&new_file, b"pub fn a() {}\n").map_err(|source| {
+                            BoxletError::StateStore {
+                                path: new_file,
+                                source,
+                            }
+                        })?;
+                        let main_rs = rootfs.join("src/main.rs");
+                        fs::write(&main_rs, b"fn main() { /* a */ }\n").map_err(|source| {
+                            BoxletError::StateStore {
+                                path: main_rs,
+                                source,
+                            }
+                        })?;
+                    }
+                    "branch-b-action" => {
+                        let readme = rootfs.join("README.md");
+                        fs::remove_file(&readme).map_err(|source| BoxletError::StateStore {
+                            path: readme,
+                            source,
+                        })?;
+                    }
+                    "branch-c-action" => {
+                        let notes = rootfs.join("notes.txt");
+                        fs::write(&notes, b"candidate c\n").map_err(|source| {
+                            BoxletError::StateStore {
+                                path: notes,
+                                source,
+                            }
+                        })?;
+                    }
+                    _ => {}
+                }
+            }
+
             Ok(ExecutionResult {
                 container_id: id.to_string(),
                 exit_code: Some(0),
-                stdout: b"hello\n".to_vec(),
+                stdout: format!("ran {id}\n").into_bytes(),
                 stderr: Vec::new(),
                 stdout_truncated: false,
                 stderr_truncated: false,
@@ -167,6 +466,24 @@ mod tests {
             path: PathBuf::from("tempdir"),
             source,
         })?;
+        let rootfs = dir.path().join("rootfs");
+        fs::create_dir_all(rootfs.join("src")).map_err(|source| BoxletError::StateStore {
+            path: rootfs.join("src"),
+            source,
+        })?;
+        fs::write(rootfs.join("src/main.rs"), b"fn main() {}\n").map_err(|source| {
+            BoxletError::StateStore {
+                path: rootfs.join("src/main.rs"),
+                source,
+            }
+        })?;
+        fs::write(rootfs.join("README.md"), b"# Base\n").map_err(|source| {
+            BoxletError::StateStore {
+                path: rootfs.join("README.md"),
+                source,
+            }
+        })?;
+
         let spec = Spec::default();
         spec.save(dir.path().join("config.json"))
             .map_err(|source| BoxletError::OciSpec {
@@ -229,6 +546,79 @@ mod tests {
         let engine = Engine::new(MockBackend::default());
         let err = engine.create("../bad", bundle.path()).unwrap_err();
         assert!(matches!(err, BoxletError::InvalidContainerId { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn engine_run_branches_executes_parallel_specs_and_captures_diffs() -> Result<()> {
+        let bundle = make_bundle()?;
+        let before_base = TreeManifest::capture(&bundle.path().join("rootfs"))?;
+
+        let engine = Engine::new(MockBackend::default());
+        let branches = vec![
+            BranchSpec::new("branch-a")
+                .with_args(vec!["branch-a-action".to_string()])
+                .with_env(vec!["CANDIDATE=a".to_string()])
+                .with_cwd("/"),
+            BranchSpec::new("branch-b").with_args(vec!["branch-b-action".to_string()]),
+            BranchSpec::new("branch-c").with_args(vec!["branch-c-action".to_string()]),
+        ];
+        let policy = ExecutionPolicy {
+            memory_bytes: Some(64 * 1024 * 1024),
+            ..ExecutionPolicy::default()
+        };
+
+        let results = engine.run_branches(bundle.path(), &branches, &policy)?;
+        assert_eq!(results.len(), 3);
+
+        assert_eq!(results[0].branch_id, "branch-a");
+        assert_eq!(results[0].execution.exit_code, Some(0));
+        assert_eq!(
+            results[0].fs_diff.added,
+            vec![PathBuf::from("src/candidate_a.rs")]
+        );
+        assert_eq!(
+            results[0].fs_diff.modified,
+            vec![PathBuf::from("src/main.rs")]
+        );
+        assert!(results[0].fs_diff.deleted.is_empty());
+
+        assert_eq!(results[1].branch_id, "branch-b");
+        assert!(results[1].fs_diff.added.is_empty());
+        assert!(results[1].fs_diff.modified.is_empty());
+        assert_eq!(results[1].fs_diff.deleted, vec![PathBuf::from("README.md")]);
+
+        assert_eq!(results[2].branch_id, "branch-c");
+        assert_eq!(results[2].fs_diff.added, vec![PathBuf::from("notes.txt")]);
+        assert!(results[2].fs_diff.modified.is_empty());
+        assert!(results[2].fs_diff.deleted.is_empty());
+
+        // Original bundle rootfs must remain untouched
+        let after_base = TreeManifest::capture(&bundle.path().join("rootfs"))?;
+        assert_eq!(before_base, after_base);
+        Ok(())
+    }
+
+    #[test]
+    fn engine_run_branches_rejects_duplicate_or_invalid_branch_ids() -> Result<()> {
+        let bundle = make_bundle()?;
+        let engine = Engine::new(MockBackend::default());
+        let policy = ExecutionPolicy::default();
+
+        let dup_specs = vec![BranchSpec::new("dup-1"), BranchSpec::new("dup-1")];
+        let dup_err = engine
+            .run_branches(bundle.path(), &dup_specs, &policy)
+            .unwrap_err();
+        assert!(matches!(
+            dup_err,
+            BoxletError::ContainerAlreadyExists { id } if id == "dup-1"
+        ));
+
+        let bad_specs = vec![BranchSpec::new("../escape")];
+        let bad_err = engine
+            .run_branches(bundle.path(), &bad_specs, &policy)
+            .unwrap_err();
+        assert!(matches!(bad_err, BoxletError::InvalidContainerId { .. }));
         Ok(())
     }
 }

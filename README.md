@@ -1,7 +1,9 @@
 # Boxlet: Minimal OCI-Compatible Container Runtime & Programmable Execution Engine
 
 - **Spec Doc:** [Boxlet: Minimal OCI-Compatible Container Runtime](https://docs.google.com/document/d/1XDaWCxQUGEH9LMqC95nJ4WZy_ut_YOQJ5_yChSJrlvA/edit?usp=drivesdk&ouid=110227624285917376281)
-- **Architecture Decision Record:** [docs/adr/001-v1-architecture-and-seams.md](docs/adr/001-v1-architecture-and-seams.md)
+- **ADR-001 (V1 Architecture & Isolation Seams):** [docs/adr/001-v1-architecture-and-seams.md](docs/adr/001-v1-architecture-and-seams.md)
+- **ADR-002 (Filesystem Snapshots & Deterministic Diffing):** [docs/adr/002-filesystem-snapshots-and-diffing.md](docs/adr/002-filesystem-snapshots-and-diffing.md)
+- **ADR-003 (Parallel Multi-Agent Branch Execution):** [docs/adr/003-parallel-branch-execution.md](docs/adr/003-parallel-branch-execution.md)
 - **Threat Model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)
 - **Design Doc:** [docs/designs/boxlet-v1-oci-runtime.md](docs/designs/boxlet-v1-oci-runtime.md)
 - **Engineering Standards:** [AGENTS.md](AGENTS.md)
@@ -112,12 +114,108 @@ sudo ./target/release/boxlet kill demo-1 SIGTERM
 sudo ./target/release/boxlet delete --force demo-1
 ```
 
-### Run the End-to-End V1 Demo Script
+### Run the End-to-End V1 & V2 Demo Script
 
-On a Linux 5.15+ host with `busybox` (`busybox-static`) and `python3` installed, run the self-contained verification demo covering normal execution, `memory.max` OOM-kill telemetry (`oom_killed: true`), fail-closed seccomp/capability enforcement, and zero-leak cleanup:
+On a Linux 5.15+ host with `busybox` (`busybox-static`) and `python3` installed, run the self-contained verification demo covering normal execution, `memory.max` OOM-kill telemetry (`oom_killed: true`), fail-closed seccomp/capability enforcement, zero-leak cleanup, V2 workspace snapshots/diffs, and parallel multi-agent branch execution:
 
 ```bash
 sudo ./scripts/demo-v1.sh ./target/release/boxlet
+```
+
+---
+
+## V2 Workspace Snapshots, Diffs & Parallel Branching
+
+Boxlet V2 adds deterministic rootfs snapshots, `O(N)` single-pass tree diffing (`added`, `modified`, `deleted`), and parallel multi-agent sandbox branching (`boxlet branch-run` / `Engine::run_branches`).
+
+### CLI Usage (`snapshot`, `diff`, `branch-run`)
+
+Checkpoint a base rootfs directory and compute a structured JSON diff against a modified directory (portable across Linux and macOS):
+
+```bash
+# 1. Capture a deterministic workspace snapshot
+./target/release/boxlet snapshot \
+  --rootfs ./bundle/rootfs \
+  --out ./snapshots \
+  --json \
+  snap-base-1
+
+# 2. Compute a structured JSON diff between two rootfs trees
+./target/release/boxlet diff \
+  --json \
+  ./snapshots/snap-base-1 \
+  ./bundle-modified/rootfs
+```
+
+Fan out multiple candidate shell commands in parallel from a single OCI bundle without mutating the base `rootfs`, returning each branch's `ExecutionResult` and `FsDiff`:
+
+```bash
+sudo ./target/release/boxlet branch-run \
+  --memory 128m \
+  --cpus 0.5 \
+  --network none \
+  --timeout 30 \
+  --cmd "echo candidate-a > /tmp/candidate_a.txt && echo branch-a-ok" \
+  --cmd "echo candidate-b > /tmp/candidate_b.txt && rm -f /bin/wc && echo branch-b-ok" \
+  --json \
+  ./bundle
+```
+
+### Rust SDK Usage (`WorkspaceSnapshot`, `TreeManifest::diff`, `Engine::run_branches`)
+
+```rust
+use std::path::Path;
+use boxlet::engine::BranchSpec;
+use boxlet::policy::{ExecutionPolicy, NetworkMode};
+use boxlet::snapshot::{TreeManifest, WorkspaceSnapshot};
+
+fn inspect_and_branch() -> boxlet::error::Result<()> {
+    // Portable workspace snapshot + deterministic diff:
+    let snap = WorkspaceSnapshot::create(
+        "base-v1",
+        Path::new("./bundle/rootfs"),
+        Path::new("./snapshots"),
+    )?;
+    let branch_dir = snap.branch("candidate-1", Path::new("./branches"))?;
+    let diff = snap.manifest.diff(&TreeManifest::capture(&branch_dir)?);
+    println!("changes={} (empty={})", diff.total_changes(), diff.is_empty());
+
+    // Parallel multi-agent branch execution on Linux:
+    #[cfg(target_os = "linux")]
+    {
+        let engine = boxlet::Engine::new(boxlet::LinuxBackend::with_defaults());
+        let branches = vec![
+            BranchSpec::new("branch-a").with_args(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo patch-a > /tmp/a.txt".into(),
+            ]),
+            BranchSpec::new("branch-b").with_args(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo patch-b > /tmp/b.txt".into(),
+            ]),
+        ];
+        let policy = ExecutionPolicy {
+            memory_bytes: Some(128 * 1024 * 1024),
+            network: Some(NetworkMode::None),
+            ..ExecutionPolicy::default()
+        };
+
+        let results = engine.run_branches(Path::new("./bundle"), &branches, &policy)?;
+        for item in results {
+            println!(
+                "branch={} exit={:?} added={:?} modified={:?} deleted={:?}",
+                item.branch_id,
+                item.execution.exit_code,
+                item.fs_diff.added,
+                item.fs_diff.modified,
+                item.fs_diff.deleted,
+            );
+        }
+    }
+    Ok(())
+}
 ```
 
 ---

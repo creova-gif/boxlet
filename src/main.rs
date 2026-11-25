@@ -1,4 +1,4 @@
-//! Thin `clap` CLI driving the shared `boxlet::Engine`.
+//! Thin `clap` CLI driving the shared `boxlet::Engine` and workspace snapshot/diff tools.
 
 #[cfg(target_os = "linux")]
 use std::io::Write;
@@ -9,10 +9,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 
+#[cfg(target_os = "linux")]
+use boxlet::engine::BranchSpec;
 use boxlet::error::{BoxletError, Result};
 use boxlet::oci::state::DEFAULT_STATE_ROOT;
 #[cfg(target_os = "linux")]
 use boxlet::policy::{ExecutionPolicy, NetworkMode};
+use boxlet::snapshot::{TreeManifest, WorkspaceSnapshot};
 
 const DEFAULT_CGROUP_PARENT: &str = "/sys/fs/cgroup/boxlet.slice";
 
@@ -100,6 +103,70 @@ enum Commands {
         /// Path to the OCI bundle directory containing `config.json`.
         bundle: PathBuf,
     },
+    /// Create an immutable workspace snapshot and capture its deterministic `TreeManifest`.
+    Snapshot {
+        /// Path to the source rootfs directory to checkpoint.
+        #[arg(long)]
+        rootfs: PathBuf,
+        /// Base output directory where `<out>/<id>` will be created.
+        #[arg(long)]
+        out: PathBuf,
+        /// Emit the full `WorkspaceSnapshot` metadata and manifest as JSON to stdout.
+        #[arg(long)]
+        json: bool,
+        /// Unique snapshot identifier (or `create` followed by `<ID>`).
+        id: String,
+        /// Optional snapshot identifier when invoked as `boxlet snapshot create ... <ID>`.
+        #[arg(hide = true)]
+        trailing_id: Option<String>,
+    },
+    /// Compute the deterministic filesystem diff (`added`, `modified`, `deleted`) between two directories.
+    Diff {
+        /// Emit the structured `FsDiff` as JSON to stdout.
+        #[arg(long)]
+        json: bool,
+        /// Base ("before") rootfs directory (flag form of `<BEFORE>`).
+        #[arg(long = "before", value_name = "DIR", conflicts_with = "before")]
+        before_flag: Option<PathBuf>,
+        /// Target ("after") rootfs directory (flag form of `<AFTER>`).
+        #[arg(long = "after", value_name = "DIR", conflicts_with = "after")]
+        after_flag: Option<PathBuf>,
+        /// Base ("before") rootfs directory.
+        #[arg(value_name = "BEFORE", required_unless_present = "before_flag")]
+        before: Option<PathBuf>,
+        /// Target ("after") rootfs directory.
+        #[arg(value_name = "AFTER", required_unless_present = "after_flag")]
+        after: Option<PathBuf>,
+    },
+    /// Fan out N isolated sandbox branches in parallel from a base OCI bundle and collect diffs.
+    BranchRun {
+        /// Shell command (`sh -c <CMD>`) to execute in each parallel branch (repeatable).
+        #[arg(long = "cmd", required = true)]
+        cmds: Vec<String>,
+        /// Hard cgroup v2 memory limit per branch (e.g. 128m, 1g, 65536).
+        #[arg(long)]
+        memory: Option<String>,
+        /// CPU limit in cores per branch (e.g. 0.5, 2.0).
+        #[arg(long)]
+        cpus: Option<f64>,
+        /// Maximum number of processes/threads (`pids.max`) per branch.
+        #[arg(long)]
+        pids: Option<i64>,
+        /// Network isolation mode (`none` or `host`).
+        #[arg(long)]
+        network: Option<String>,
+        /// Maximum execution timeout in seconds per branch.
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Maximum bytes captured per stream (`stdout` and `stderr`) per branch.
+        #[arg(long)]
+        max_output_bytes: Option<usize>,
+        /// Emit the full `Vec<BranchExecutionResult>` as JSON to stdout.
+        #[arg(long)]
+        json: bool,
+        /// Path to the base OCI bundle directory containing `config.json`.
+        bundle: PathBuf,
+    },
     /// Hidden internal self-re-exec container init stage.
     #[command(name = "__init", hide = true)]
     InternalInit {
@@ -119,17 +186,85 @@ fn main() -> ExitCode {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn dispatch(cli: Cli) -> Result<ExitCode> {
-    if let Commands::InternalInit { config } = cli.command {
+    match cli.command {
+        Commands::Snapshot {
+            rootfs,
+            out,
+            json,
+            id,
+            trailing_id,
+        } => {
+            let effective_id = match (id.as_str(), trailing_id) {
+                ("create", Some(real_id)) => real_id,
+                _ => id,
+            };
+            let snapshot = WorkspaceSnapshot::create(&effective_id, &rootfs, &out)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            } else {
+                println!(
+                    "snapshot={} path={} entries={}",
+                    snapshot.id,
+                    snapshot.snapshot_dir.display(),
+                    snapshot.manifest.entries.len()
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Diff {
+            json,
+            before_flag,
+            after_flag,
+            before,
+            after,
+        } => {
+            let before_dir = before_flag
+                .or(before)
+                .ok_or_else(|| BoxletError::InvalidPolicy {
+                    reason: "missing 'before' directory for diff".to_string(),
+                })?;
+            let after_dir = after_flag
+                .or(after)
+                .ok_or_else(|| BoxletError::InvalidPolicy {
+                    reason: "missing 'after' directory for diff".to_string(),
+                })?;
+            let before_manifest = TreeManifest::capture(&before_dir)?;
+            let after_manifest = TreeManifest::capture(&after_dir)?;
+            let diff = before_manifest.diff(&after_manifest);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&diff)?);
+            } else {
+                for path in &diff.added {
+                    println!("+ {}", path.display());
+                }
+                for path in &diff.modified {
+                    println!("~ {}", path.display());
+                }
+                for path in &diff.deleted {
+                    println!("- {}", path.display());
+                }
+                if diff.is_empty() {
+                    println!("(no filesystem changes)");
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        other => dispatch_platform(cli.root, cli.cgroup_parent, other),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn dispatch_platform(root: PathBuf, cgroup_parent: PathBuf, command: Commands) -> Result<ExitCode> {
+    if let Commands::InternalInit { config } = command {
         boxlet::run_internal_init(&config)?;
         return Ok(ExitCode::SUCCESS);
     }
 
-    let backend = boxlet::LinuxBackend::new(cli.root, cli.cgroup_parent);
+    let backend = boxlet::LinuxBackend::new(root, cgroup_parent);
     let engine = boxlet::Engine::new(backend);
 
-    match cli.command {
+    match command {
         Commands::Create { bundle, id } => {
             engine.create(&id, &bundle)?;
             Ok(ExitCode::SUCCESS)
@@ -165,20 +300,14 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             bundle,
         } => {
             let container_id = id.unwrap_or_else(generate_container_id);
-            let memory_bytes = memory.as_deref().map(parse_byte_size).transpose()?;
-            let network_mode = network
-                .as_deref()
-                .map(|m| m.parse::<NetworkMode>())
-                .transpose()?;
-            let policy = ExecutionPolicy {
-                memory_bytes,
+            let policy = build_execution_policy(
+                memory.as_deref(),
                 cpus,
-                pids_limit: pids,
-                network: network_mode,
-                timeout: timeout.map(Duration::from_secs),
+                pids,
+                network.as_deref(),
+                timeout,
                 max_output_bytes,
-                ..ExecutionPolicy::default()
-            };
+            )?;
 
             let result = engine.run(&container_id, &bundle, &policy)?;
             if json {
@@ -197,14 +326,101 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 Ok(ExitCode::FAILURE)
             }
         }
-        Commands::InternalInit { .. } => Ok(ExitCode::SUCCESS),
+        Commands::BranchRun {
+            cmds,
+            memory,
+            cpus,
+            pids,
+            network,
+            timeout,
+            max_output_bytes,
+            json,
+            bundle,
+        } => {
+            let policy = build_execution_policy(
+                memory.as_deref(),
+                cpus,
+                pids,
+                network.as_deref(),
+                timeout,
+                max_output_bytes,
+            )?;
+            let prefix = generate_container_id();
+            let specs: Vec<BranchSpec> = cmds
+                .into_iter()
+                .enumerate()
+                .map(|(idx, cmd)| {
+                    BranchSpec::new(format!("{prefix}-branch-{}", idx + 1)).with_args(vec![
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        cmd,
+                    ])
+                })
+                .collect();
+
+            let results = engine.run_branches(&bundle, &specs, &policy)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            } else {
+                for item in &results {
+                    println!(
+                        "branch={} exit={:?} added={} modified={} deleted={}",
+                        item.branch_id,
+                        item.execution.exit_code,
+                        item.fs_diff.added.len(),
+                        item.fs_diff.modified.len(),
+                        item.fs_diff.deleted.len(),
+                    );
+                }
+            }
+
+            let all_ok = results.iter().all(|r| {
+                r.execution.exit_code == Some(0)
+                    && !r.execution.violations.timed_out
+                    && !r.execution.violations.oom_killed
+            });
+            if all_ok {
+                Ok(ExitCode::SUCCESS)
+            } else {
+                Ok(ExitCode::FAILURE)
+            }
+        }
+        Commands::Snapshot { .. } | Commands::Diff { .. } | Commands::InternalInit { .. } => {
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn dispatch(_cli: Cli) -> Result<ExitCode> {
+fn dispatch_platform(
+    _root: PathBuf,
+    _cgroup_parent: PathBuf,
+    _command: Commands,
+) -> Result<ExitCode> {
     Err(BoxletError::UnsupportedPlatform {
         feature: "Linux OCI container execution",
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn build_execution_policy(
+    memory: Option<&str>,
+    cpus: Option<f64>,
+    pids: Option<i64>,
+    network: Option<&str>,
+    timeout: Option<u64>,
+    max_output_bytes: Option<usize>,
+) -> Result<ExecutionPolicy> {
+    let memory_bytes = memory.map(parse_byte_size).transpose()?;
+    let network_mode = network.map(|m| m.parse::<NetworkMode>()).transpose()?;
+    Ok(ExecutionPolicy {
+        memory_bytes,
+        cpus,
+        pids_limit: pids,
+        network: network_mode,
+        timeout: timeout.map(Duration::from_secs),
+        max_output_bytes,
+        ..ExecutionPolicy::default()
     })
 }
 
@@ -303,6 +519,75 @@ mod tests {
         assert_eq!(parse_signal("kill")?, 9);
         assert_eq!(parse_signal("9")?, 9);
         assert!(parse_signal("NOTASIG").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cli_snapshot_and_diff_parse_and_execute_portably() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|source| BoxletError::StateStore {
+            path: PathBuf::from("tempdir"),
+            source,
+        })?;
+        let rootfs_a = tmp.path().join("rootfs-a");
+        let rootfs_b = tmp.path().join("rootfs-b");
+        let out_dir = tmp.path().join("snapshots");
+
+        std::fs::create_dir_all(&rootfs_a).map_err(|source| BoxletError::StateStore {
+            path: rootfs_a.clone(),
+            source,
+        })?;
+        std::fs::write(rootfs_a.join("file.txt"), b"v1\n").map_err(|source| {
+            BoxletError::StateStore {
+                path: rootfs_a.join("file.txt"),
+                source,
+            }
+        })?;
+
+        std::fs::create_dir_all(&rootfs_b).map_err(|source| BoxletError::StateStore {
+            path: rootfs_b.clone(),
+            source,
+        })?;
+        std::fs::write(rootfs_b.join("file.txt"), b"v2\n").map_err(|source| {
+            BoxletError::StateStore {
+                path: rootfs_b.join("file.txt"),
+                source,
+            }
+        })?;
+        std::fs::write(rootfs_b.join("added.txt"), b"new\n").map_err(|source| {
+            BoxletError::StateStore {
+                path: rootfs_b.join("added.txt"),
+                source,
+            }
+        })?;
+
+        let snap_cli = Cli::try_parse_from([
+            "boxlet",
+            "snapshot",
+            "--rootfs",
+            rootfs_a.to_str().unwrap_or_default(),
+            "--out",
+            out_dir.to_str().unwrap_or_default(),
+            "--json",
+            "snap-cli-1",
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+        assert_eq!(dispatch(snap_cli)?, ExitCode::SUCCESS);
+
+        let diff_cli = Cli::try_parse_from([
+            "boxlet",
+            "diff",
+            "--before",
+            rootfs_a.to_str().unwrap_or_default(),
+            "--after",
+            rootfs_b.to_str().unwrap_or_default(),
+            "--json",
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+        assert_eq!(dispatch(diff_cli)?, ExitCode::SUCCESS);
         Ok(())
     }
 }

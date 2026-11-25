@@ -9,7 +9,7 @@ pub mod policy;
 pub mod snapshot;
 pub mod traits;
 
-pub use engine::Engine;
+pub use engine::{BranchExecutionResult, BranchSpec, Engine};
 #[cfg(target_os = "linux")]
 pub use linux::LinuxBackend;
 
