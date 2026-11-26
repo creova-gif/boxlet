@@ -8,7 +8,7 @@ use nix::unistd::{chdir, pivot_root};
 use oci_spec::runtime::Spec;
 
 use crate::error::{BoxletError, Result};
-use crate::policy::BindMountSpec;
+use crate::policy::{BindMountSpec, TmpfsMountSpec};
 use crate::traits::RootfsProvider;
 
 /// V1 root filesystem provider using direct bind-mount + `pivot_root`.
@@ -44,6 +44,7 @@ pub(crate) fn setup_and_pivot_root(
     new_root: &Path,
     spec: &Spec,
     bind_mounts: &[BindMountSpec],
+    tmpfs_mounts: &[TmpfsMountSpec],
 ) -> Result<()> {
     // 1. Prevent mount events from propagating back to the host mount namespace.
     mount(
@@ -94,6 +95,9 @@ pub(crate) fn setup_and_pivot_root(
 
     // 4b. Apply declarative host-to-container bind mounts before pivot_root detaches the host root.
     apply_bind_mounts(new_root, bind_mounts)?;
+
+    // 4c. Apply ephemeral size-bounded tmpfs mounts inside the container rootfs.
+    apply_tmpfs_mounts(new_root, tmpfs_mounts)?;
 
     // 5. Pivot root and detach old host root.
     let put_old = new_root.join(".boxlet_old_root");
@@ -241,6 +245,62 @@ fn apply_bind_mounts(new_root: &Path, bind_mounts: &[BindMountSpec]) -> Result<(
             message: format!(
                 "remount bind mount '{}' failed: {err}",
                 bm.destination.display()
+            ),
+        })?;
+    }
+    Ok(())
+}
+
+fn apply_tmpfs_mounts(new_root: &Path, tmpfs_mounts: &[TmpfsMountSpec]) -> Result<()> {
+    for tm in tmpfs_mounts {
+        tm.validate()?;
+        let rel_dst = tm
+            .destination
+            .strip_prefix("/")
+            .unwrap_or(tm.destination.as_path());
+        let mut cursor = new_root.to_path_buf();
+        for comp in rel_dst.components() {
+            if let Component::Normal(seg) = comp {
+                cursor.push(seg);
+                if let Ok(meta) = fs::symlink_metadata(&cursor) {
+                    if meta.file_type().is_symlink() {
+                        return Err(BoxletError::Runtime {
+                            subsystem: "rootfs",
+                            message: format!(
+                                "tmpfs mount destination component '{}' must not be a symlink",
+                                cursor.display()
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        fs::create_dir_all(&cursor).map_err(|err| BoxletError::Runtime {
+            subsystem: "rootfs",
+            message: format!(
+                "failed to create tmpfs mount target '{}': {err}",
+                cursor.display()
+            ),
+        })?;
+
+        let mut flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_STRICTATIME;
+        if tm.noexec {
+            flags |= MsFlags::MS_NOEXEC;
+        }
+        let opts = tm.mount_options_string();
+        mount(
+            Some("tmpfs"),
+            &cursor,
+            Some("tmpfs"),
+            flags,
+            Some(opts.as_str()),
+        )
+        .map_err(|err| BoxletError::Runtime {
+            subsystem: "rootfs",
+            message: format!(
+                "mount tmpfs at '{}' failed: {err}",
+                tm.destination.display()
             ),
         })?;
     }

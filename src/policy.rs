@@ -18,6 +18,12 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 /// Default cgroup v2 CPU period in microseconds (100 ms).
 pub const DEFAULT_CPU_PERIOD_USEC: u64 = 100_000;
 
+/// Default ephemeral `tmpfs` size limit (64 MiB).
+pub const DEFAULT_TMPFS_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Default ephemeral `tmpfs` directory permission mode (`0o1777`).
+pub const DEFAULT_TMPFS_MODE: u32 = 0o1777;
+
 /// Supported V1 network isolation modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -341,6 +347,188 @@ impl FromStr for BindMountSpec {
     }
 }
 
+fn default_tmpfs_size_bytes() -> u64 {
+    DEFAULT_TMPFS_SIZE_BYTES
+}
+
+fn default_tmpfs_mode() -> u32 {
+    DEFAULT_TMPFS_MODE
+}
+
+fn default_tmpfs_noexec() -> bool {
+    true
+}
+
+/// Ephemeral size-bounded `tmpfs` mount specification (`--tmpfs <dst>[:size=<bytes>,mode=<octal>,exec|noexec]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TmpfsMountSpec {
+    /// Absolute destination path inside the container rootfs (must start with `/`).
+    pub destination: PathBuf,
+    /// Maximum `tmpfs` capacity in bytes (`size=<bytes>`, default `64 MiB`).
+    #[serde(default = "default_tmpfs_size_bytes")]
+    pub size_bytes: u64,
+    /// Permission mode bits (`mode=<octal>`, default `0o1777`).
+    #[serde(default = "default_tmpfs_mode")]
+    pub mode: u32,
+    /// Whether `MS_NOEXEC` is enforced on the `tmpfs` mount (default `true`).
+    #[serde(default = "default_tmpfs_noexec")]
+    pub noexec: bool,
+}
+
+impl TmpfsMountSpec {
+    /// Validates `destination`, `size_bytes > 0`, and `0 < mode <= 0o7777`.
+    pub fn validate(&self) -> Result<()> {
+        if self.size_bytes == 0 {
+            return Err(BoxletError::InvalidPolicy {
+                reason: "tmpfs size_bytes must be greater than 0".to_string(),
+            });
+        }
+        if self.mode == 0 || self.mode > 0o7777 {
+            return Err(BoxletError::InvalidPolicy {
+                reason: format!(
+                    "tmpfs mode {:o} must be in range 0o0001..=0o7777",
+                    self.mode
+                ),
+            });
+        }
+        let dst_str = self.destination.to_string_lossy();
+        if dst_str.is_empty() || !dst_str.starts_with('/') {
+            return Err(BoxletError::InvalidPolicy {
+                reason: format!(
+                    "tmpfs mount destination '{}' must be an absolute path starting with '/'",
+                    self.destination.display()
+                ),
+            });
+        }
+        if self
+            .destination
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        {
+            return Err(BoxletError::InvalidPolicy {
+                reason: "tmpfs mount destination must not contain '.' or '..' components"
+                    .to_string(),
+            });
+        }
+        let trimmed = dst_str.trim_end_matches('/');
+        if trimmed.is_empty()
+            || trimmed == "/proc"
+            || trimmed.starts_with("/proc/")
+            || trimmed == "/dev"
+            || trimmed.starts_with("/dev/")
+            || trimmed == "/.boxlet_old_root"
+            || trimmed.starts_with("/.boxlet_old_root/")
+        {
+            return Err(BoxletError::InvalidPolicy {
+                reason: format!(
+                    "tmpfs mount destination '{}' targets a reserved container filesystem path",
+                    self.destination.display()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Formats the kernel `mount(2)` `data` options string (`size=<bytes>,mode=<octal>`).
+    pub fn mount_options_string(&self) -> String {
+        format!("size={},mode={:04o}", self.size_bytes, self.mode & 0o7777)
+    }
+}
+
+fn parse_tmpfs_size_bytes(raw: &str) -> Result<u64> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let (num_str, multiplier) = if let Some(v) = lower.strip_suffix("gb") {
+        (v, 1024 * 1024 * 1024)
+    } else if let Some(v) = lower.strip_suffix('g') {
+        (v, 1024 * 1024 * 1024)
+    } else if let Some(v) = lower.strip_suffix("mb") {
+        (v, 1024 * 1024)
+    } else if let Some(v) = lower.strip_suffix('m') {
+        (v, 1024 * 1024)
+    } else if let Some(v) = lower.strip_suffix("kb") {
+        (v, 1024)
+    } else if let Some(v) = lower.strip_suffix('k') {
+        (v, 1024)
+    } else if let Some(v) = lower.strip_suffix('b') {
+        (v, 1)
+    } else {
+        (lower.as_str(), 1)
+    };
+    let n = num_str
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| BoxletError::InvalidPolicy {
+            reason: format!("invalid tmpfs size value '{raw}'"),
+        })?;
+    n.checked_mul(multiplier)
+        .ok_or_else(|| BoxletError::InvalidPolicy {
+            reason: format!("tmpfs size value '{raw}' overflows u64"),
+        })
+}
+
+impl FromStr for TmpfsMountSpec {
+    type Err = BoxletError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let mut size_bytes = DEFAULT_TMPFS_SIZE_BYTES;
+        let mut mode = DEFAULT_TMPFS_MODE;
+        let mut noexec = true;
+
+        let destination = if let Some((dst_str, opts_str)) = s.split_once(':') {
+            if opts_str.trim().is_empty() {
+                return Err(BoxletError::InvalidPolicy {
+                    reason: format!("empty tmpfs options in '{s}'"),
+                });
+            }
+            for token in opts_str.split(',') {
+                let tok = token.trim();
+                if tok.is_empty() {
+                    return Err(BoxletError::InvalidPolicy {
+                        reason: format!("empty tmpfs option token in '{s}'"),
+                    });
+                }
+                if let Some(size_val) = tok.strip_prefix("size=") {
+                    size_bytes = parse_tmpfs_size_bytes(size_val)?;
+                } else if let Some(mode_val) = tok.strip_prefix("mode=") {
+                    let cleaned = mode_val
+                        .trim()
+                        .trim_start_matches("0o")
+                        .trim_start_matches("0O");
+                    mode = u32::from_str_radix(cleaned, 8).map_err(|_| {
+                        BoxletError::InvalidPolicy {
+                            reason: format!(
+                                "invalid octal tmpfs mode '{mode_val}' in '{s}' (expected octal e.g. 1777 or 0700)"
+                            ),
+                        }
+                    })?;
+                } else if tok.eq_ignore_ascii_case("exec") {
+                    noexec = false;
+                } else if tok.eq_ignore_ascii_case("noexec") {
+                    noexec = true;
+                } else {
+                    return Err(BoxletError::InvalidPolicy {
+                        reason: format!(
+                            "unknown tmpfs option '{tok}' in '{s}' (expected size=<bytes>, mode=<octal>, exec, or noexec)"
+                        ),
+                    });
+                }
+            }
+            PathBuf::from(dst_str.trim())
+        } else {
+            PathBuf::from(s.trim())
+        };
+
+        let spec = Self {
+            destination,
+            size_bytes,
+            mode,
+            noexec,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+}
+
 /// Builds Boxlet's portable baseline default-deny OCI [`LinuxSeccomp`] profile (`SCMP_ACT_ERRNO(EPERM)`).
 pub fn build_default_seccomp_profile() -> Result<LinuxSeccomp> {
     let syscalls: Vec<String> = [
@@ -587,6 +775,18 @@ pub struct ExecutionPolicy {
     /// Optional declarative host-to-container bind mounts (`--mount <src>:<dst>[:ro|rw]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_mounts: Option<Vec<BindMountSpec>>,
+    /// Optional ephemeral size-bounded tmpfs mounts (`--tmpfs <dst>[:size=...,mode=...,exec|noexec]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmpfs_mounts: Option<Vec<TmpfsMountSpec>>,
+    /// Optional process command argv override (`process.args`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args_override: Option<Vec<String>>,
+    /// Optional process environment overrides (`KEY=VALUE`) merged onto `process.env`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_overrides: Option<Vec<String>>,
+    /// Optional process working directory override (`process.cwd`, must be absolute).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd_override: Option<String>,
 }
 
 impl ExecutionPolicy {
@@ -636,6 +836,48 @@ impl ExecutionPolicy {
                 mount_spec.validate()?;
             }
         }
+        if let Some(ref tmpfs_list) = self.tmpfs_mounts {
+            for tmpfs_spec in tmpfs_list {
+                tmpfs_spec.validate()?;
+            }
+        }
+        if let Some(ref args) = self.args_override {
+            if args.is_empty() {
+                return Err(BoxletError::InvalidPolicy {
+                    reason: "args_override must not be empty".to_string(),
+                });
+            }
+            if args.iter().any(|a| a.contains('\0')) {
+                return Err(BoxletError::InvalidPolicy {
+                    reason: "args_override entries must not contain NUL bytes".to_string(),
+                });
+            }
+        }
+        if let Some(ref envs) = self.env_overrides {
+            for entry in envs {
+                if entry.contains('\0') {
+                    return Err(BoxletError::InvalidPolicy {
+                        reason: "env_overrides entries must not contain NUL bytes".to_string(),
+                    });
+                }
+                if !entry.split_once('=').is_some_and(|(k, _)| !k.is_empty()) {
+                    return Err(BoxletError::InvalidPolicy {
+                        reason: format!(
+                            "invalid env_overrides entry '{entry}' (expected 'KEY=VALUE' with non-empty KEY)"
+                        ),
+                    });
+                }
+            }
+        }
+        if let Some(ref cwd) = self.cwd_override {
+            if cwd.trim().is_empty() || !cwd.starts_with('/') || cwd.contains('\0') {
+                return Err(BoxletError::InvalidPolicy {
+                    reason: format!(
+                        "cwd_override '{cwd}' must be a non-empty absolute path starting with '/'"
+                    ),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -679,6 +921,8 @@ pub struct ResolvedRunSpec {
     pub nofile_limit: Option<u64>,
     /// Effective declarative host-to-container bind mounts.
     pub bind_mounts: Vec<BindMountSpec>,
+    /// Effective ephemeral size-bounded tmpfs mounts.
+    pub tmpfs_mounts: Vec<TmpfsMountSpec>,
 }
 
 /// Merges an OCI `Spec` with an [`ExecutionPolicy`] using Boxlet V1 precedence rules:
@@ -691,6 +935,35 @@ pub struct ResolvedRunSpec {
 /// Note: `boxlet create` never calls this function; it consumes `config.json` verbatim.
 pub fn merge_policy_with_spec(base: &Spec, policy: &ExecutionPolicy) -> Result<ResolvedRunSpec> {
     policy.validate()?;
+
+    let mut effective_spec = base.clone();
+    if policy.args_override.is_some()
+        || policy.env_overrides.is_some()
+        || policy.cwd_override.is_some()
+    {
+        let mut process = effective_spec.process().clone().unwrap_or_default();
+        if let Some(ref args) = policy.args_override {
+            process.set_args(Some(args.clone()));
+        }
+        if let Some(ref env_overrides) = policy.env_overrides {
+            let mut merged_env = process.env().clone().unwrap_or_default();
+            for entry in env_overrides {
+                if let Some((key, _)) = entry.split_once('=') {
+                    let prefix = format!("{key}=");
+                    if let Some(existing) = merged_env.iter_mut().find(|e| e.starts_with(&prefix)) {
+                        *existing = entry.clone();
+                    } else {
+                        merged_env.push(entry.clone());
+                    }
+                }
+            }
+            process.set_env(Some(merged_env));
+        }
+        if let Some(ref cwd) = policy.cwd_override {
+            process.set_cwd(PathBuf::from(cwd));
+        }
+        effective_spec.set_process(Some(process));
+    }
 
     let oci_resources = base.linux().as_ref().and_then(|l| l.resources().as_ref());
 
@@ -744,9 +1017,10 @@ pub fn merge_policy_with_spec(base: &Spec, policy: &ExecutionPolicy) -> Result<R
     let max_output_bytes = policy.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES);
     let io_max = policy.io_max.clone().unwrap_or_default();
     let bind_mounts = policy.bind_mounts.clone().unwrap_or_default();
+    let tmpfs_mounts = policy.tmpfs_mounts.clone().unwrap_or_default();
 
     Ok(ResolvedRunSpec {
-        oci_spec: base.clone(),
+        oci_spec: effective_spec,
         resources: ResourceLimits {
             memory_bytes,
             cpu_quota_usec,
@@ -762,6 +1036,7 @@ pub fn merge_policy_with_spec(base: &Spec, policy: &ExecutionPolicy) -> Result<R
         max_output_bytes,
         nofile_limit: policy.nofile_limit,
         bind_mounts,
+        tmpfs_mounts,
     })
 }
 
@@ -1020,6 +1295,14 @@ mod tests {
             max_concurrency: Some(4),
             nofile_limit: Some(1024),
             bind_mounts: Some(vec!["/host/models:/mnt/models:ro".parse()?]),
+            tmpfs_mounts: Some(vec!["/tmp:size=16m,mode=1777".parse()?]),
+            args_override: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo ok".to_string(),
+            ]),
+            env_overrides: Some(vec!["FOO=bar".to_string()]),
+            cwd_override: Some("/workspace".to_string()),
         };
 
         let resolved = merge_policy_with_spec(&spec, &policy)?;
@@ -1034,11 +1317,114 @@ mod tests {
         assert_eq!(resolved.nofile_limit, Some(1024));
         assert_eq!(resolved.bind_mounts.len(), 1);
         assert!(resolved.bind_mounts[0].readonly);
+        assert_eq!(resolved.tmpfs_mounts.len(), 1);
+        assert_eq!(resolved.tmpfs_mounts[0].size_bytes, 16 * 1024 * 1024);
+        assert!(resolved.tmpfs_mounts[0].noexec);
+        let proc = resolved
+            .oci_spec
+            .process()
+            .as_ref()
+            .expect("process present");
+        assert_eq!(
+            proc.args().as_ref(),
+            Some(&vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo ok".to_string()
+            ])
+        );
+        assert!(proc
+            .env()
+            .as_ref()
+            .is_some_and(|e| e.contains(&"FOO=bar".to_string())));
+        assert_eq!(proc.cwd(), &PathBuf::from("/workspace"));
         assert!("/host/data:/proc/kcore:ro"
             .parse::<BindMountSpec>()
             .is_err());
         let default_seccomp = build_default_seccomp_profile()?;
         assert!(default_seccomp.syscalls().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn tmpfs_mount_spec_parses_options_and_validates_destinations() -> Result<()> {
+        let default_spec: TmpfsMountSpec = "/tmp".parse()?;
+        assert_eq!(default_spec.destination, PathBuf::from("/tmp"));
+        assert_eq!(default_spec.size_bytes, DEFAULT_TMPFS_SIZE_BYTES);
+        assert_eq!(default_spec.mode, DEFAULT_TMPFS_MODE);
+        assert!(default_spec.noexec);
+        assert_eq!(
+            default_spec.mount_options_string(),
+            format!("size={},mode=1777", DEFAULT_TMPFS_SIZE_BYTES)
+        );
+
+        let custom: TmpfsMountSpec = "/run/scratch:size=32m,mode=0700,exec".parse()?;
+        assert_eq!(custom.destination, PathBuf::from("/run/scratch"));
+        assert_eq!(custom.size_bytes, 32 * 1024 * 1024);
+        assert_eq!(custom.mode, 0o700);
+        assert!(!custom.noexec);
+        assert_eq!(custom.mount_options_string(), "size=33554432,mode=0700");
+
+        assert!("relative/path".parse::<TmpfsMountSpec>().is_err());
+        assert!("/tmp/../etc".parse::<TmpfsMountSpec>().is_err());
+        assert!("/proc".parse::<TmpfsMountSpec>().is_err());
+        assert!("/dev/shm".parse::<TmpfsMountSpec>().is_err());
+        assert!("/tmp:size=0".parse::<TmpfsMountSpec>().is_err());
+        assert!("/tmp:mode=0".parse::<TmpfsMountSpec>().is_err());
+        assert!("/tmp:mode=10000".parse::<TmpfsMountSpec>().is_err());
+        assert!("/tmp:unknown=1".parse::<TmpfsMountSpec>().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn merge_policy_merges_env_overrides_and_validates_process_overrides() -> Result<()> {
+        let mut base = Spec::default();
+        let mut base_proc = oci_spec::runtime::Process::default();
+        base_proc.set_args(Some(vec!["/bin/echo".to_string(), "old".to_string()]));
+        base_proc.set_env(Some(vec!["PATH=/bin".to_string(), "KEEP=1".to_string()]));
+        base_proc.set_cwd(PathBuf::from("/"));
+        base.set_process(Some(base_proc));
+
+        let policy = ExecutionPolicy {
+            args_override: Some(vec!["/bin/env".to_string()]),
+            env_overrides: Some(vec![
+                "PATH=/usr/bin:/bin".to_string(),
+                "ADDED=yes".to_string(),
+            ]),
+            cwd_override: Some("/tmp".to_string()),
+            ..ExecutionPolicy::default()
+        };
+        let resolved = merge_policy_with_spec(&base, &policy)?;
+        let proc = resolved.oci_spec.process().as_ref().expect("process");
+        assert_eq!(proc.args().as_ref(), Some(&vec!["/bin/env".to_string()]));
+        assert_eq!(
+            proc.env().as_ref(),
+            Some(&vec![
+                "PATH=/usr/bin:/bin".to_string(),
+                "KEEP=1".to_string(),
+                "ADDED=yes".to_string(),
+            ])
+        );
+        assert_eq!(proc.cwd(), &PathBuf::from("/tmp"));
+
+        let bad_args = ExecutionPolicy {
+            args_override: Some(Vec::new()),
+            ..ExecutionPolicy::default()
+        };
+        assert!(bad_args.validate().is_err());
+
+        let bad_env = ExecutionPolicy {
+            env_overrides: Some(vec!["NO_EQUALS".to_string()]),
+            ..ExecutionPolicy::default()
+        };
+        assert!(bad_env.validate().is_err());
+
+        let bad_cwd = ExecutionPolicy {
+            cwd_override: Some("relative/dir".to_string()),
+            ..ExecutionPolicy::default()
+        };
+        assert!(bad_cwd.validate().is_err());
+
         Ok(())
     }
 

@@ -43,6 +43,8 @@ pub(crate) struct InitConfig {
     pub nofile_limit: Option<u64>,
     #[serde(default)]
     pub bind_mounts: Vec<crate::policy::BindMountSpec>,
+    #[serde(default)]
+    pub tmpfs_mounts: Vec<crate::policy::TmpfsMountSpec>,
     pub wait_for_start_fifo: Option<PathBuf>,
     pub pid_pipe_write_fd: RawFd,
     pub ack_pipe_read_fd: RawFd,
@@ -136,8 +138,13 @@ fn container_pid1_main(
         None => None,
     };
 
-    // 4. Pivot root + mount /proc + minimal /dev + bind mounts + masked/readonly paths.
-    rootfs::setup_and_pivot_root(&cfg.rootfs_path, &cfg.spec, &cfg.bind_mounts)?;
+    // 4. Pivot root + mount /proc + minimal /dev + bind mounts + tmpfs mounts + masked/readonly paths.
+    rootfs::setup_and_pivot_root(
+        &cfg.rootfs_path,
+        &cfg.spec,
+        &cfg.bind_mounts,
+        &cfg.tmpfs_mounts,
+    )?;
 
     // 5. Set working directory inside the pivoted rootfs.
     if let Some(process) = cfg.spec.process() {
