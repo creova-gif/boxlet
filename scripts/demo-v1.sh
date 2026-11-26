@@ -545,7 +545,12 @@ PY
 
 sudo "$BOXLET_BIN" start --root "$STATE_ROOT" --cgroup-parent "$CGROUP_PARENT" ci-list-1
 sudo "$BOXLET_BIN" kill --root "$STATE_ROOT" --cgroup-parent "$CGROUP_PARENT" ci-list-1 SIGKILL
-sleep 0.2
+for _ in {1..20}; do
+  if sudo "$BOXLET_BIN" state --root "$STATE_ROOT" --cgroup-parent "$CGROUP_PARENT" ci-list-1 | grep -q '"status": "stopped"'; then
+    break
+  fi
+  sleep 0.1
+done
 
 sudo "$BOXLET_BIN" --audit-log "$WORK_DIR/audit.jsonl" prune --root "$STATE_ROOT" --cgroup-parent "$CGROUP_PARENT" --json > "$WORK_DIR/check13-prune1.json"
 python3 - "$WORK_DIR/check13-prune1.json" <<'PY'

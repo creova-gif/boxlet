@@ -119,7 +119,7 @@ impl StateStore {
             }
         }
 
-        let _lock = self.acquire_lock(&dir)?;
+        let _lock = self.acquire_lock(&dir, id)?;
         let state = ContainerState {
             oci_version: OCI_RUNTIME_VERSION.to_string(),
             id: id.to_string(),
@@ -138,8 +138,35 @@ impl StateStore {
         if !dir.exists() {
             return Err(BoxletError::ContainerNotFound { id: id.to_string() });
         }
-        let _lock = self.acquire_lock(&dir)?;
+        let _lock = self.acquire_lock(&dir, id)?;
         read_state(&dir, id)
+    }
+
+    /// Atomically checks container `id` under `flock` and transitions `Created` or `Running`
+    /// to `Stopped` if its recorded PID is no longer alive according to `is_pid_alive`.
+    pub fn refresh_if_dead<F>(&self, id: &str, is_pid_alive: F) -> Result<ContainerState>
+    where
+        F: FnOnce(u32) -> bool,
+    {
+        let dir = self.container_dir(id)?;
+        if !dir.exists() {
+            return Err(BoxletError::ContainerNotFound { id: id.to_string() });
+        }
+        let _lock = self.acquire_lock(&dir, id)?;
+        let mut current = read_state(&dir, id)?;
+        if matches!(
+            current.status,
+            ContainerStatus::Created | ContainerStatus::Running
+        ) {
+            if let Some(pid) = current.pid {
+                if !is_pid_alive(pid) {
+                    current.status = ContainerStatus::Stopped;
+                    current.pid = None;
+                    write_state_atomic(&dir, &current)?;
+                }
+            }
+        }
+        Ok(current)
     }
 
     /// Transitions container `id` to `next_status` (optionally updating `pid`) atomically.
@@ -153,7 +180,7 @@ impl StateStore {
         if !dir.exists() {
             return Err(BoxletError::ContainerNotFound { id: id.to_string() });
         }
-        let _lock = self.acquire_lock(&dir)?;
+        let _lock = self.acquire_lock(&dir, id)?;
         let mut current = read_state(&dir, id)?;
 
         if !current.status.can_transition_to(next_status) {
@@ -183,7 +210,7 @@ impl StateStore {
             return Err(BoxletError::ContainerNotFound { id: id.to_string() });
         }
 
-        let lock = self.acquire_lock(&dir)?;
+        let lock = self.acquire_lock(&dir, id)?;
         let current = read_state(&dir, id)?;
         if !force && current.status != ContainerStatus::Stopped {
             return Err(BoxletError::ContainerNotStopped {
@@ -252,7 +279,7 @@ impl StateStore {
         Ok(states)
     }
 
-    fn acquire_lock(&self, dir: &Path) -> Result<File> {
+    fn acquire_lock(&self, dir: &Path, id: &str) -> Result<File> {
         let lock_path = dir.join(".lock");
         let file = OpenOptions::new()
             .create(true)
@@ -260,9 +287,15 @@ impl StateStore {
             .write(true)
             .truncate(false)
             .open(&lock_path)
-            .map_err(|source| BoxletError::StateStore {
-                path: lock_path.clone(),
-                source,
+            .map_err(|source| {
+                if source.kind() == std::io::ErrorKind::NotFound {
+                    BoxletError::ContainerNotFound { id: id.to_string() }
+                } else {
+                    BoxletError::StateStore {
+                        path: lock_path.clone(),
+                        source,
+                    }
+                }
             })?;
         file.lock().map_err(|source| BoxletError::StateStore {
             path: lock_path,

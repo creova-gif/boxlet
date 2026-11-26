@@ -153,18 +153,8 @@ impl RuntimeBackend for LinuxBackend {
     }
 
     fn state(&self, id: &str) -> Result<ContainerState> {
-        let mut st = self.state_store.load(id)?;
-        if st.status == ContainerStatus::Running {
-            if let Some(pid) = st.pid {
-                let alive = nix_kill(Pid::from_raw(pid as i32), None).is_ok();
-                if !alive {
-                    st = self
-                        .state_store
-                        .transition(id, ContainerStatus::Stopped, None)?;
-                }
-            }
-        }
-        Ok(st)
+        self.state_store
+            .refresh_if_dead(id, |pid| nix_kill(Pid::from_raw(pid as i32), None).is_ok())
     }
 
     fn kill(&self, id: &str, signal: i32) -> Result<()> {
@@ -186,11 +176,16 @@ impl RuntimeBackend for LinuxBackend {
     }
 
     fn delete(&self, id: &str, force: bool) -> Result<()> {
-        if force {
-            let _ = self.cgroup.kill_all(id);
+        let current = self.state(id)?;
+        if !force && current.status != ContainerStatus::Stopped {
+            return Err(BoxletError::ContainerNotStopped {
+                id: id.to_string(),
+                status: current.status,
+            });
         }
+        let _ = self.cgroup.kill_all(id);
         let _ = self.cgroup.remove_cgroup(id);
-        self.state_store.delete(id, force)
+        self.state_store.delete(id, true)
     }
 
     fn list(&self) -> Result<Vec<ContainerState>> {

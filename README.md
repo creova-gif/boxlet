@@ -155,7 +155,7 @@ sudo ./target/release/boxlet --audit-log /var/log/boxlet-audit.jsonl prune --jso
 sudo ./target/release/boxlet --audit-log /var/log/boxlet-audit.jsonl prune --force --json
 
 # Parse and summarize a JSONL audit trail (portable across Linux and macOS)
-./target/release/boxlet audit --file /var/log/boxlet-audit.jsonl --json
+sudo ./target/release/boxlet audit --file /var/log/boxlet-audit.jsonl --json
 ```
 
 ### Run the End-to-End 14-Check V1, V2 & V3 Demo Script
@@ -308,23 +308,23 @@ fn inspect_and_branch() -> boxlet::error::Result<()> {
         let inventory = engine.list()?;
         let prune_report: PruneReport = engine.prune(false)?;
         println!(
-            "active={} pruned={:?} skipped={:?}",
+            "tracked={} pruned={:?} skipped={:?}",
             inventory.len(),
             prune_report.removed_containers,
             prune_report.skipped_active_containers,
         );
-    }
 
-    // Aggregate telemetry & chronological integrity verification from JSONL audit logs:
-    let summary: AuditSummary = audit_logger.summarize()?;
-    println!(
-        "records={} runs={}/{} branches={} valid={}",
-        summary.total_records,
-        summary.runs_succeeded,
-        summary.runs_completed,
-        summary.total_branches_evaluated,
-        summary.chronological_valid,
-    );
+        // Aggregate telemetry & chronological integrity verification from JSONL audit logs:
+        let summary: AuditSummary = JsonlAuditLogger::new("/var/log/boxlet/audit.jsonl").summarize()?;
+        println!(
+            "records={} runs={}/{} branches={} valid={}",
+            summary.total_records,
+            summary.runs_succeeded,
+            summary.runs_completed,
+            summary.total_branches_evaluated,
+            summary.chronological_valid,
+        );
+    }
     Ok(())
 }
 ```

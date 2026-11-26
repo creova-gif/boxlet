@@ -285,21 +285,33 @@ impl<B: RuntimeBackend> Engine<B> {
         let mut removed_containers = Vec::new();
         let mut skipped_active_containers = Vec::new();
 
+        let mut delete_err: Option<BoxletError> = None;
         for st in states {
             if force || st.status == ContainerStatus::Stopped {
-                self.backend.delete(&st.id, force)?;
-                removed_containers.push(st.id);
+                match self.backend.delete(&st.id, force) {
+                    Ok(()) => removed_containers.push(st.id),
+                    Err(err) => {
+                        delete_err = Some(err);
+                        break;
+                    }
+                }
             } else {
                 skipped_active_containers.push(st.id);
             }
         }
 
         if let Some(ref logger) = self.audit_logger {
-            logger.record(AuditEvent::ContainersPruned {
-                removed_count: removed_containers.len(),
-                skipped_active_count: skipped_active_containers.len(),
-                force,
-            })?;
+            if !removed_containers.is_empty() || delete_err.is_none() {
+                let _ = logger.record(AuditEvent::ContainersPruned {
+                    removed_count: removed_containers.len(),
+                    skipped_active_count: skipped_active_containers.len(),
+                    force,
+                });
+            }
+        }
+
+        if let Some(err) = delete_err {
+            return Err(err);
         }
 
         Ok(PruneReport {
