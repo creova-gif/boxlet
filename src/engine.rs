@@ -343,11 +343,89 @@ impl<B: RuntimeBackend> Engine<B> {
                 duration_ms: u64::try_from(result.usage.duration.as_millis()).unwrap_or(u64::MAX),
                 memory_peak_bytes: result.usage.memory_peak_bytes,
                 cpu_usage_usec: result.usage.cpu_usage_usec,
+                psi: result.usage.psi.clone(),
                 violations: result.violations.clone(),
                 cleanup: result.cleanup.clone(),
             })?;
         }
         Ok(result)
+    }
+
+    /// Executes a deterministic benchmark suite measuring single-sandbox cold-start latency,
+    /// `TreeManifest` snapshot/diff latency, and parallel multi-branch batch latency.
+    pub fn run_benchmark(
+        &self,
+        bundle: &Path,
+        config: &crate::bench::BenchmarkConfig,
+    ) -> Result<crate::bench::BenchmarkReport> {
+        config.validate()?;
+        let base_spec = load_bundle_spec(bundle)?;
+        let configured_rootfs = base_spec
+            .root()
+            .as_ref()
+            .map(|r| r.path().clone())
+            .unwrap_or_else(|| PathBuf::from("rootfs"));
+        let source_rootfs = if configured_rootfs.is_absolute() {
+            configured_rootfs
+        } else {
+            bundle.join(configured_rootfs)
+        };
+
+        for idx in 0..config.warmup {
+            let warmup_id = format!("bench-warmup-{}", idx + 1);
+            let _ = self.run(&warmup_id, bundle, &config.policy)?;
+        }
+
+        let mut run_samples_us = Vec::with_capacity(config.iterations);
+        let mut peak_memory_bytes: Option<u64> = None;
+        for idx in 0..config.iterations {
+            let run_id = format!("bench-run-{}", idx + 1);
+            let start = std::time::Instant::now();
+            let res = self.run(&run_id, bundle, &config.policy)?;
+            let elapsed_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+            run_samples_us.push(elapsed_us);
+            if let Some(mem) = res.usage.memory_peak_bytes {
+                peak_memory_bytes = Some(peak_memory_bytes.map_or(mem, |cur| cur.max(mem)));
+            }
+        }
+
+        let mut snap_samples_us = Vec::with_capacity(config.iterations);
+        for _ in 0..config.iterations {
+            let start = std::time::Instant::now();
+            let manifest = TreeManifest::capture(&source_rootfs)?;
+            let _diff = manifest.diff(&manifest);
+            let elapsed_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+            snap_samples_us.push(elapsed_us);
+        }
+
+        let branch_specs: Vec<BranchSpec> = (0..config.branches_per_iter)
+            .map(|b| BranchSpec::new(format!("bench-branch-{}", b + 1)))
+            .collect();
+        let mut branch_samples_us = Vec::with_capacity(config.iterations);
+        for _ in 0..config.iterations {
+            let start = std::time::Instant::now();
+            let _ = self.run_branches(bundle, &branch_specs, &config.policy)?;
+            let elapsed_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+            branch_samples_us.push(elapsed_us);
+        }
+
+        let total_run_us: u128 = run_samples_us.iter().map(|&v| u128::from(v)).sum();
+        let throughput_runs_per_sec = if total_run_us > 0 {
+            (config.iterations as f64) / ((total_run_us as f64) / 1_000_000.0)
+        } else {
+            0.0
+        };
+
+        Ok(crate::bench::BenchmarkReport {
+            iterations: config.iterations,
+            warmup: config.warmup,
+            branches_per_iter: config.branches_per_iter,
+            run_latency_us: crate::bench::LatencySummary::from_samples(&run_samples_us),
+            branch_batch_latency_us: crate::bench::LatencySummary::from_samples(&branch_samples_us),
+            snapshot_diff_latency_us: crate::bench::LatencySummary::from_samples(&snap_samples_us),
+            throughput_runs_per_sec,
+            peak_memory_bytes,
+        })
     }
 
     /// Snapshots `<bundle>` once, fans out `branches` concurrently in isolated workspace
@@ -980,6 +1058,7 @@ mod tests {
                     duration: Duration::from_millis(12),
                     memory_peak_bytes: Some(4096),
                     cpu_usage_usec: Some(500),
+                    psi: None,
                 },
                 violations: PolicyViolations::default(),
                 cleanup: CleanupStatus::Clean,
@@ -1393,6 +1472,33 @@ mod tests {
             .run_branches(bundle.path(), &branches, &zero_policy)
             .unwrap_err();
         assert!(matches!(err, BoxletError::InvalidPolicy { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn engine_run_benchmark_computes_latency_percentiles_and_markdown_table() -> Result<()> {
+        let bundle = make_bundle()?;
+        let engine = Engine::new(MockBackend::default());
+        let cfg = crate::bench::BenchmarkConfig {
+            iterations: 3,
+            warmup: 1,
+            branches_per_iter: 2,
+            policy: ExecutionPolicy::default(),
+        };
+
+        let report = engine.run_benchmark(bundle.path(), &cfg)?;
+        assert_eq!(report.iterations, 3);
+        assert_eq!(report.warmup, 1);
+        assert_eq!(report.branches_per_iter, 2);
+        assert_eq!(report.run_latency_us.samples, 3);
+        assert_eq!(report.snapshot_diff_latency_us.samples, 3);
+        assert_eq!(report.branch_batch_latency_us.samples, 3);
+        assert_eq!(report.peak_memory_bytes, Some(4096));
+
+        let md = report.to_markdown_table();
+        assert!(md.contains("sandbox_run"));
+        assert!(md.contains("snapshot_diff"));
+        assert!(md.contains("parallel_branch_batch"));
         Ok(())
     }
 }

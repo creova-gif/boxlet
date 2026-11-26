@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Boxlet V1–V7 End-to-End 22-Check Verification & Demo Suite
+# Boxlet V1–V8 End-to-End 24-Check Verification & Demo Suite
 # Runs on any privileged Linux 5.15+ host with unified cgroup v2 and busybox-static.
 set -euo pipefail
 
@@ -739,7 +739,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 18: MicroVM Specification Synthesis (boxlet microvm-config for Firecracker & libkrun)
 # ------------------------------------------------------------------------------
-echo "==> [Check 18] [18/22] MicroVM Specification Synthesis (boxlet microvm-config for Firecracker & libkrun)"
+echo "==> [Check 18] [18/24] MicroVM Specification Synthesis (boxlet microvm-config for Firecracker & libkrun)"
 "$BOXLET_BIN" microvm-config \
   --driver firecracker \
   --id vm-fc-1 \
@@ -777,7 +777,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 19: Bounded Worker-Pool Concurrency & Rootless Bundle Scaffolding
 # ------------------------------------------------------------------------------
-echo "==> [Check 19] [19/22] Bounded Worker-Pool Concurrency (--max-concurrency 1) & Rootless Bundle Scaffolding (init-bundle --rootless)"
+echo "==> [Check 19] [19/24] Bounded Worker-Pool Concurrency (--max-concurrency 1) & Rootless Bundle Scaffolding (init-bundle --rootless)"
 sudo "$BOXLET_BIN" branch-run \
   --root "$STATE_ROOT" \
   --cgroup-parent "$CGROUP_PARENT" \
@@ -822,7 +822,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 20: Tamper-Evident Hash-Chained Audit Ledger & Prometheus Metrics
 # ------------------------------------------------------------------------------
-echo "==> [Check 20] [20/22] Tamper-Evident Hash-Chained Audit Ledger & Prometheus Metrics (boxlet audit --file ... --json / --prometheus)"
+echo "==> [Check 20] [20/24] Tamper-Evident Hash-Chained Audit Ledger & Prometheus Metrics (boxlet audit --file ... --json / --prometheus)"
 sudo "$BOXLET_BIN" audit --file "$AUDIT_LOG" --json > "$WORK_DIR/check20-audit.json"
 sudo "$BOXLET_BIN" audit --file "$AUDIT_LOG" --prometheus > "$WORK_DIR/check20-audit.prom"
 
@@ -846,7 +846,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 21: Multi-Layer OCI Image Layout Packing & Unpacking with Whiteout (.wh.) Support
 # ------------------------------------------------------------------------------
-echo "==> [Check 21] [21/22] Multi-Layer OCI Image Layout Packing & Unpacking with Whiteout (.wh.) Support (boxlet image-pack + boxlet image-unpack)"
+echo "==> [Check 21] [21/24] Multi-Layer OCI Image Layout Packing & Unpacking with Whiteout (.wh.) Support (boxlet image-pack + boxlet image-unpack)"
 mkdir -p "$WORK_DIR/oci-layer-base/etc" "$WORK_DIR/oci-layer-upper/etc"
 cp -a "$BUNDLE_DIR/rootfs/bin" "$WORK_DIR/oci-layer-base/bin"
 echo "keep-base-v1" > "$WORK_DIR/oci-layer-base/etc/keep.txt"
@@ -890,7 +890,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 22: Cgroup v2 io.max Block I/O Policy Validation
 # ------------------------------------------------------------------------------
-echo "==> [Check 22] [22/22] Cgroup v2 io.max Block I/O Policy Validation (boxlet run --io-max)"
+echo "==> [Check 22] [22/24] Cgroup v2 io.max Block I/O Policy Validation (boxlet run --io-max)"
 "$BOXLET_BIN" run --help | grep -q -- "--io-max"
 IO_ERR_OUT="$WORK_DIR/check22-iomax-err.txt"
 if "$BOXLET_BIN" run --io-max "8:0 rbps=0" "$BUNDLE_DIR" >"$IO_ERR_OUT" 2>&1; then
@@ -900,4 +900,74 @@ fi
 grep -qi "io.max" "$IO_ERR_OUT"
 echo "    cgroup v2 io.max validation verified: $(tr '\n' ' ' < "$IO_ERR_OUT")"
 
-echo "==> ALL 22/22 BOXLET V1+V2+V3+V4+V5+V6+V7 CHECKS PASSED"
+# ------------------------------------------------------------------------------
+# Check 23: POSIX RLIMIT_NOFILE Enforcement (--nofile)
+# ------------------------------------------------------------------------------
+echo "==> [Check 23] [23/24] POSIX RLIMIT_NOFILE Enforcement (boxlet run --nofile 128)"
+"$BOXLET_BIN" init-bundle \
+  --busybox "$BUSYBOX_BIN" \
+  --cmd "ulimit -n" \
+  --json \
+  "$WORK_DIR/nofile-bundle" > "$WORK_DIR/check23-init.json"
+
+NOFILE_OUT=$(sudo "$BOXLET_BIN" \
+  --root "$STATE_ROOT" \
+  --cgroup-parent "$CGROUP_PARENT" \
+  --audit-log "$AUDIT_LOG" \
+  run \
+  --nofile 128 \
+  "$WORK_DIR/nofile-bundle")
+
+NOFILE_TRIMMED="$(echo "$NOFILE_OUT" | tr -d '[:space:]')"
+if [[ "$NOFILE_TRIMMED" != "128" ]]; then
+  echo "FAIL: expected ulimit -n output to equal '128', got '$NOFILE_OUT'" >&2
+  exit 1
+fi
+echo "    POSIX RLIMIT_NOFILE verified: ulimit -n = $NOFILE_TRIMMED"
+
+# ------------------------------------------------------------------------------
+# Check 24: Built-In Deterministic Benchmark Suite (boxlet bench)
+# ------------------------------------------------------------------------------
+echo "==> [Check 24] [24/24] Built-In Deterministic Benchmark Suite (boxlet bench --json / --markdown)"
+write_bundle_config "true"
+sudo "$BOXLET_BIN" \
+  --root "$STATE_ROOT" \
+  --cgroup-parent "$CGROUP_PARENT" \
+  bench \
+  --iterations 2 \
+  --warmup 1 \
+  --branches 2 \
+  --json \
+  "$BUNDLE_DIR" > "$WORK_DIR/check24-bench.json"
+
+python3 - "$WORK_DIR/check24-bench.json" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    raw = f.read()
+    data = json.loads(raw)
+
+assert '"iterations": 2' in raw or data.get("iterations") == 2, f"expected iterations == 2, got {data}"
+assert "run_latency_us" in data, f"expected 'run_latency_us' in {data}"
+assert "branch_batch_latency_us" in data, f"expected 'branch_batch_latency_us' in {data}"
+print(
+    f"    bench JSON verified: iterations={data.get('iterations')}, "
+    f"run_p50_us={data['run_latency_us'].get('p50_us')}, "
+    f"branch_batch_p50_us={data['branch_batch_latency_us'].get('p50_us')}"
+)
+PY
+
+sudo "$BOXLET_BIN" \
+  --root "$STATE_ROOT" \
+  --cgroup-parent "$CGROUP_PARENT" \
+  bench \
+  --iterations 1 \
+  --warmup 0 \
+  --branches 1 \
+  --markdown \
+  "$BUNDLE_DIR" > "$WORK_DIR/check24-bench.md"
+
+grep -q "sandbox_run" "$WORK_DIR/check24-bench.md"
+echo "    bench Markdown verified: $(grep 'sandbox_run' "$WORK_DIR/check24-bench.md")"
+
+echo "==> ALL 24/24 BOXLET V1+V2+V3+V4+V5+V6+V7+V8 CHECKS PASSED"

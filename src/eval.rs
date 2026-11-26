@@ -269,6 +269,7 @@ mod tests {
                     duration: Duration::from_millis(duration_ms),
                     memory_peak_bytes: Some(4096),
                     cpu_usage_usec: Some(200),
+                    psi: None,
                 },
                 violations: PolicyViolations::default(),
                 cleanup: CleanupStatus::Clean,

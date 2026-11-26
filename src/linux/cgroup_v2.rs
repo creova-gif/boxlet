@@ -6,7 +6,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::error::{BoxletError, Result};
-use crate::policy::ResourceLimits;
+use crate::policy::{PsiMetrics, ResourceLimits};
 use crate::traits::{CgroupStats, ResourceController};
 
 /// Default parent cgroup slice (`--cgroup-parent`) outside the runner's active process cgroup.
@@ -123,10 +123,33 @@ impl ResourceController for CgroupV2Controller {
             .map(|s| parse_memory_events_oom_kill(&s))
             .unwrap_or(0);
 
+        let (cpu_some_total_usec, _) = fs::read_to_string(leaf.join("cpu.pressure"))
+            .ok()
+            .map(|s| parse_psi_stall_totals(&s))
+            .unwrap_or((None, None));
+        let (memory_some_total_usec, memory_full_total_usec) =
+            fs::read_to_string(leaf.join("memory.pressure"))
+                .ok()
+                .map(|s| parse_psi_stall_totals(&s))
+                .unwrap_or((None, None));
+        let (io_some_total_usec, io_full_total_usec) = fs::read_to_string(leaf.join("io.pressure"))
+            .ok()
+            .map(|s| parse_psi_stall_totals(&s))
+            .unwrap_or((None, None));
+
+        let psi = PsiMetrics {
+            cpu_some_total_usec,
+            memory_some_total_usec,
+            memory_full_total_usec,
+            io_some_total_usec,
+            io_full_total_usec,
+        };
+
         Ok(CgroupStats {
             memory_peak_bytes,
             cpu_usage_usec,
             oom_kill_count,
+            psi: if psi.is_empty() { None } else { Some(psi) },
         })
     }
 
@@ -210,6 +233,28 @@ pub(crate) fn parse_u64_value(content: &str) -> Option<u64> {
     content.trim().parse::<u64>().ok()
 }
 
+/// Parses `some ... total=<N>` and `full ... total=<N>` from cgroup v2 `*.pressure` files.
+pub(crate) fn parse_psi_stall_totals(content: &str) -> (Option<u64>, Option<u64>) {
+    let mut some_total = None;
+    let mut full_total = None;
+    for line in content.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(kind) = parts.next() else {
+            continue;
+        };
+        let total = parts.find_map(|token| {
+            let val = token.strip_prefix("total=")?;
+            val.parse::<u64>().ok()
+        });
+        match kind {
+            "some" => some_total = total,
+            "full" => full_total = total,
+            _ => {}
+        }
+    }
+    (some_total, full_total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +275,12 @@ mod tests {
 
         assert_eq!(format_cpu_max(Some(50_000), 100_000), "50000 100000");
         assert_eq!(format_cpu_max(None, 100_000), "max 100000");
+
+        let psi_mem =
+            "some avg10=1.25 avg60=0.40 avg300=0.10 total=15400\nfull avg10=0.50 avg60=0.10 avg300=0.00 total=3200\n";
+        assert_eq!(parse_psi_stall_totals(psi_mem), (Some(15_400), Some(3_200)));
+        let psi_cpu = "some avg10=0.00 avg60=0.00 avg300=0.00 total=810\n";
+        assert_eq!(parse_psi_stall_totals(psi_cpu), (Some(810), None));
     }
 
     #[test]
@@ -275,11 +326,36 @@ mod tests {
         fs::write(leaf.join("memory.peak"), "1048576\n").ok();
         fs::write(leaf.join("cpu.stat"), "usage_usec 4200\n").ok();
         fs::write(leaf.join("memory.events"), "oom_kill 1\n").ok();
+        fs::write(
+            leaf.join("cpu.pressure"),
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=900\n",
+        )
+        .ok();
+        fs::write(
+            leaf.join("memory.pressure"),
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=1500\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=400\n",
+        )
+        .ok();
+        fs::write(
+            leaf.join("io.pressure"),
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=2100\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=700\n",
+        )
+        .ok();
 
         let stats = ctrl.read_stats("test-cg")?;
         assert_eq!(stats.memory_peak_bytes, Some(1_048_576));
         assert_eq!(stats.cpu_usage_usec, Some(4_200));
         assert_eq!(stats.oom_kill_count, 1);
+        assert_eq!(
+            stats.psi,
+            Some(PsiMetrics {
+                cpu_some_total_usec: Some(900),
+                memory_some_total_usec: Some(1_500),
+                memory_full_total_usec: Some(400),
+                io_some_total_usec: Some(2_100),
+                io_full_total_usec: Some(700),
+            })
+        );
 
         // Clean up mock files so remove_dir succeeds (real cgroupfs deletes virtual files on rmdir)
         for f in [
@@ -290,6 +366,9 @@ mod tests {
             "memory.peak",
             "cpu.stat",
             "memory.events",
+            "cpu.pressure",
+            "memory.pressure",
+            "io.pressure",
         ] {
             let _ = fs::remove_file(leaf.join(f));
         }

@@ -517,6 +517,7 @@ impl RuntimeBackend for MicroVmBackend {
             timeout: resolved.timeout,
             max_output_bytes: Some(resolved.max_output_bytes),
             max_concurrency: None,
+            nofile_limit: resolved.nofile_limit,
         };
 
         self.create(id, bundle, &resolved.oci_spec)?;
@@ -560,6 +561,7 @@ impl RuntimeBackend for MicroVmBackend {
                 duration: started.elapsed(),
                 memory_peak_bytes: resolved.resources.memory_bytes,
                 cpu_usage_usec: None,
+                psi: None,
             },
             violations: PolicyViolations::default(),
             cleanup,

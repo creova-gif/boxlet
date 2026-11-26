@@ -146,6 +146,9 @@ enum Commands {
         /// Per-device cgroup v2 io.max limit (e.g. "8:0 rbps=10485760 wbps=5242880", repeatable).
         #[arg(long = "io-max")]
         io_max: Vec<String>,
+        /// Maximum open file descriptors (`RLIMIT_NOFILE`) inside the container.
+        #[arg(long)]
+        nofile: Option<u64>,
         /// Network isolation mode (`none` or `host`).
         #[arg(long)]
         network: Option<String>,
@@ -225,6 +228,9 @@ enum Commands {
         /// Per-device cgroup v2 io.max limit (e.g. "8:0 rbps=10485760 wbps=5242880", repeatable).
         #[arg(long = "io-max")]
         io_max: Vec<String>,
+        /// Maximum open file descriptors (`RLIMIT_NOFILE`) inside the container.
+        #[arg(long)]
+        nofile: Option<u64>,
         /// Network isolation mode (`none` or `host`).
         #[arg(long)]
         network: Option<String>,
@@ -244,6 +250,26 @@ enum Commands {
         #[arg(long)]
         json: bool,
         /// Path to the base OCI bundle directory containing `config.json`.
+        bundle: PathBuf,
+    },
+    /// Run deterministic cold-start, snapshot/diff, and parallel branch latency benchmarks.
+    Bench {
+        /// Number of measured benchmark iterations (`>= 1`).
+        #[arg(long, default_value_t = 5)]
+        iterations: usize,
+        /// Number of unmeasured warmup iterations before timing begins.
+        #[arg(long, default_value_t = 1)]
+        warmup: usize,
+        /// Number of concurrent branches per iteration in the parallel branch phase (`>= 1`).
+        #[arg(long, default_value_t = 2)]
+        branches: usize,
+        /// Emit the benchmark report as a GitHub-Flavored Markdown table.
+        #[arg(long, conflicts_with = "json")]
+        markdown: bool,
+        /// Emit the `BenchmarkReport` as JSON to stdout.
+        #[arg(long)]
+        json: bool,
+        /// Path to the OCI bundle directory containing `config.json`.
         bundle: PathBuf,
     },
     /// Scaffold a minimal OCI bundle directory (`config.json` + `rootfs` hierarchy).
@@ -751,6 +777,7 @@ fn dispatch_platform(
             cpus,
             pids,
             io_max,
+            nofile,
             network,
             timeout,
             max_output_bytes,
@@ -763,6 +790,7 @@ fn dispatch_platform(
                 cpus,
                 pids,
                 &io_max,
+                nofile,
                 network.as_deref(),
                 timeout,
                 max_output_bytes,
@@ -791,6 +819,7 @@ fn dispatch_platform(
             cpus,
             pids,
             io_max,
+            nofile,
             network,
             timeout,
             max_output_bytes,
@@ -804,6 +833,7 @@ fn dispatch_platform(
                 cpus,
                 pids,
                 &io_max,
+                nofile,
                 network.as_deref(),
                 timeout,
                 max_output_bytes,
@@ -911,6 +941,37 @@ fn dispatch_platform(
                 Ok(ExitCode::FAILURE)
             }
         }
+        Commands::Bench {
+            iterations,
+            warmup,
+            branches,
+            markdown,
+            json,
+            bundle,
+        } => {
+            let cfg = boxlet::BenchmarkConfig {
+                iterations,
+                warmup,
+                branches_per_iter: branches,
+                policy: ExecutionPolicy::default(),
+            };
+            let report = engine.run_benchmark(&bundle, &cfg)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if markdown {
+                print!("{}", report.to_markdown_table());
+            } else {
+                println!(
+                    "iterations={} run_p50_us={} branch_p50_us={} snap_p50_us={} throughput_rps={:.2}",
+                    report.iterations,
+                    report.run_latency_us.p50_us,
+                    report.branch_batch_latency_us.p50_us,
+                    report.snapshot_diff_latency_us.p50_us,
+                    report.throughput_runs_per_sec
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Commands::Snapshot { .. }
         | Commands::Diff { .. }
         | Commands::Restore { .. }
@@ -939,11 +1000,13 @@ fn dispatch_platform(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn build_execution_policy(
     memory: Option<&str>,
     cpus: Option<f64>,
     pids: Option<i64>,
     io_max_raw: &[String],
+    nofile: Option<u64>,
     network: Option<&str>,
     timeout: Option<u64>,
     max_output_bytes: Option<usize>,
@@ -959,6 +1022,7 @@ fn build_execution_policy(
         cpus,
         pids_limit: pids,
         io_max: if rules.is_empty() { None } else { Some(rules) },
+        nofile_limit: nofile,
         network: network_mode,
         timeout: timeout.map(Duration::from_secs),
         max_output_bytes,
@@ -1430,12 +1494,43 @@ mod tests {
             "8:0 rbps=10485760 wbps=5242880",
             "--io-max",
             "259:0 wiops=1000",
+            "--nofile",
+            "2048",
             bundle_dir.to_str().unwrap_or_default(),
         ])
         .map_err(|err| BoxletError::InvalidPolicy {
             reason: err.to_string(),
         })?;
-        assert!(matches!(run_parse.command, Commands::Run { io_max, .. } if io_max.len() == 2));
+        assert!(
+            matches!(run_parse.command, Commands::Run { io_max, nofile: Some(2048), .. } if io_max.len() == 2)
+        );
+
+        let bench_parse = Cli::try_parse_from([
+            "boxlet",
+            "bench",
+            "--iterations",
+            "4",
+            "--warmup",
+            "1",
+            "--branches",
+            "3",
+            "--markdown",
+            bundle_dir.to_str().unwrap_or_default(),
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+        assert!(matches!(
+            bench_parse.command,
+            Commands::Bench {
+                iterations: 4,
+                warmup: 1,
+                branches: 3,
+                markdown: true,
+                json: false,
+                ..
+            }
+        ));
 
         Ok(())
     }

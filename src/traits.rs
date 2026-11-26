@@ -6,7 +6,7 @@ use oci_spec::runtime::Spec;
 
 use crate::error::Result;
 use crate::oci::state::ContainerState;
-use crate::policy::{ExecutionResult, ResolvedRunSpec, ResourceLimits};
+use crate::policy::{ExecutionResult, PsiMetrics, ResolvedRunSpec, ResourceLimits};
 
 /// Deep execution backend interface consumed by `Engine`.
 ///
@@ -44,6 +44,7 @@ pub struct CgroupStats {
     pub memory_peak_bytes: Option<u64>,
     pub cpu_usage_usec: Option<u64>,
     pub oom_kill_count: u64,
+    pub psi: Option<PsiMetrics>,
 }
 
 /// Internal root filesystem strategy composed inside `LinuxBackend`.
