@@ -16,6 +16,7 @@ const fn default_true() -> bool {
 
 /// Declarative acceptance and ranking rubric applied to each candidate branch in [`EvalSpec`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalRubric {
     /// Require the candidate container to exit with code `0` and zero policy violations (`timed_out`, `oom_killed`).
     #[serde(default = "default_true")]
@@ -52,6 +53,7 @@ impl Default for EvalRubric {
 
 /// Declarative specification for evaluating multiple candidate branches against an [`EvalRubric`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalSpec {
     /// Execution policy applied to every candidate branch.
     #[serde(default)]
@@ -135,6 +137,13 @@ pub fn evaluate_candidate(
         }
     }
 
+    if !rubric.forbidden_stderr_contains.is_empty() && branch_result.execution.stderr_truncated {
+        violations.push(
+            "stderr was truncated while forbidden_stderr_contains guardrails are active"
+                .to_string(),
+        );
+    }
+
     let stderr_str = String::from_utf8_lossy(&branch_result.execution.stderr);
     for forbidden in &rubric.forbidden_stderr_contains {
         if stderr_str.contains(forbidden) {
@@ -143,11 +152,12 @@ pub fn evaluate_candidate(
     }
 
     for required_path in &rubric.required_added_paths {
+        let norm_req = normalize_rel_path(required_path);
         if !branch_result
             .fs_diff
             .added
             .iter()
-            .any(|added| added == required_path)
+            .any(|added| added == &norm_req)
         {
             violations.push(format!(
                 "required added path '{}' missing from fs_diff.added",
@@ -157,12 +167,13 @@ pub fn evaluate_candidate(
     }
 
     for forbidden_path in &rubric.forbidden_modified_paths {
+        let norm_forbid = normalize_rel_path(forbidden_path);
         let touched = branch_result
             .fs_diff
             .modified
             .iter()
             .chain(branch_result.fs_diff.deleted.iter())
-            .find(|p| *p == forbidden_path || p.starts_with(forbidden_path));
+            .find(|p| **p == norm_forbid || p.starts_with(&norm_forbid));
         if let Some(offending) = touched {
             violations.push(format!(
                 "protected path '{}' was modified or deleted (matched rule '{}')",
@@ -209,11 +220,25 @@ pub fn evaluate_candidate(
 pub fn select_winning_verdict(verdicts: &[CandidateVerdict]) -> Option<&CandidateVerdict> {
     let mut best: Option<&CandidateVerdict> = None;
     for verdict in verdicts.iter().filter(|v| v.passed_rubric) {
-        if best.is_none_or(|current| verdict.score > current.score) {
+        let is_better = match best {
+            None => true,
+            Some(current) => verdict.score > current.score,
+        };
+        if is_better {
             best = Some(verdict);
         }
     }
     best
+}
+
+fn normalize_rel_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        if let std::path::Component::Normal(part) = comp {
+            out.push(part);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

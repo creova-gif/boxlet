@@ -193,8 +193,13 @@ fn check_root_privileges() -> DoctorCheck {
 
 #[cfg(target_os = "linux")]
 fn check_cgroup_v2(cgroup_parent: &Path) -> DoctorCheck {
-    let controllers_path = Path::new("/sys/fs/cgroup/cgroup.controllers");
-    match fs::read_to_string(controllers_path) {
+    let parent_controllers = cgroup_parent.join("cgroup.controllers");
+    let probe_path = if parent_controllers.exists() {
+        parent_controllers.as_path()
+    } else {
+        Path::new("/sys/fs/cgroup/cgroup.controllers")
+    };
+    match fs::read_to_string(probe_path) {
         Ok(raw) => {
             let available: Vec<&str> = raw.split_whitespace().collect();
             let required = ["memory", "cpu", "pids"];
@@ -216,9 +221,10 @@ fn check_cgroup_v2(cgroup_parent: &Path) -> DoctorCheck {
             } else {
                 DoctorCheck {
                     name: "cgroup_v2".to_string(),
-                    status: DoctorStatus::Warn,
+                    status: DoctorStatus::Fail,
                     detail: format!(
-                        "cgroup v2 present but missing controllers [{}] (parent={})",
+                        "cgroup v2 present at '{}' but missing required controllers [{}] (parent={})",
+                        probe_path.display(),
                         missing.join(", "),
                         cgroup_parent.display()
                     ),
@@ -233,7 +239,8 @@ fn check_cgroup_v2(cgroup_parent: &Path) -> DoctorCheck {
             name: "cgroup_v2".to_string(),
             status: DoctorStatus::Fail,
             detail: format!(
-                "/sys/fs/cgroup/cgroup.controllers not found (parent={})",
+                "{} not found (parent={})",
+                probe_path.display(),
                 cgroup_parent.display()
             ),
             remediation: Some("Mount unified cgroup v2 hierarchy at /sys/fs/cgroup".to_string()),

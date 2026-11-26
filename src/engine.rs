@@ -500,7 +500,9 @@ impl<B: RuntimeBackend> Engine<B> {
                     match snapshot.promote_branch(&winner_prepared.rootfs_dir, &source_rootfs) {
                         Ok(diff) => diff,
                         Err(err) => {
-                            let _ = snapshot.restore(&source_rootfs);
+                            if !is_pre_sync_divergence_error(&err) {
+                                let _ = snapshot.restore(&source_rootfs);
+                            }
                             return Err(err);
                         }
                     };
@@ -652,7 +654,9 @@ impl<B: RuntimeBackend> Engine<B> {
                     {
                         Ok(diff) => diff,
                         Err(err) => {
-                            let _ = snapshot.restore(&source_rootfs);
+                            if !is_pre_sync_divergence_error(&err) {
+                                let _ = snapshot.restore(&source_rootfs);
+                            }
                             return Err(err);
                         }
                     };
@@ -683,6 +687,14 @@ impl<B: RuntimeBackend> Engine<B> {
             promoted_diff,
         })
     }
+}
+
+fn is_pre_sync_divergence_error(err: &BoxletError) -> bool {
+    matches!(
+        err,
+        BoxletError::StateStore { source, .. }
+            if source.kind() == std::io::ErrorKind::InvalidData
+    )
 }
 
 fn apply_branch_overrides(base_spec: &Spec, branch: &BranchSpec) -> Spec {
