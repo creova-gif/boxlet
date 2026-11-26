@@ -1,14 +1,19 @@
 //! Deterministic filesystem tree manifests, diffs, and copy-on-write workspace snapshots.
 //!
-//! Provides the portable V2 foundation described in `docs/adr/002-filesystem-snapshots-and-diffing.md`:
+//! Provides the portable V2 foundation described in `docs/adr/002-filesystem-snapshots-and-diffing.md`
+//! and `docs/adr/004-branch-promotion-and-rollback.md`:
 //! capturing a base rootfs into a [`WorkspaceSnapshot`], branching it into `N` isolated sandbox
-//! root directories, and computing exact [`FsDiff`]s (`added`, `modified`, `deleted`) after
-//! parallel agent runs complete.
+//! root directories, computing exact [`FsDiff`]s (`added`, `modified`, `deleted`) after
+//! parallel agent runs complete, promoting a winning branch onto a target rootfs, and
+//! deterministically rolling a mutated workspace back to an immutable checkpoint.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +28,8 @@ const FNV1A_64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 
 /// 64-bit FNV-1a prime.
 const FNV1A_64_PRIME: u64 = 0x0100_0000_01b3;
+
+static STAGE_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Classification of a filesystem entry inside a [`TreeManifest`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,6 +242,355 @@ impl WorkspaceSnapshot {
         }
         Ok(branch_path)
     }
+
+    /// Loads an existing [`WorkspaceSnapshot`] from `snapshot_dir` and captures its [`TreeManifest`].
+    pub fn load(id: impl Into<String>, snapshot_dir: &Path) -> Result<Self> {
+        let id = id.into();
+        validate_container_id(&id)?;
+        let manifest = TreeManifest::capture(snapshot_dir)?;
+        Ok(Self {
+            id,
+            snapshot_dir: snapshot_dir.to_path_buf(),
+            manifest,
+        })
+    }
+
+    /// Promotes a winning branch rootfs (`branch_rootfs`) onto `target_rootfs`, updating
+    /// `target_rootfs` to match `branch_rootfs` and returning the branch's [`FsDiff`]
+    /// relative to this snapshot's base [`TreeManifest`].
+    pub fn promote_branch(&self, branch_rootfs: &Path, target_rootfs: &Path) -> Result<FsDiff> {
+        ensure_dir_exists(branch_rootfs, "branch rootfs directory does not exist")?;
+        ensure_dir_exists(target_rootfs, "target rootfs directory does not exist")?;
+        ensure_not_nested(branch_rootfs, target_rootfs)?;
+        ensure_not_nested(target_rootfs, branch_rootfs)?;
+        ensure_not_nested(&self.snapshot_dir, target_rootfs)?;
+        ensure_not_nested(target_rootfs, &self.snapshot_dir)?;
+        ensure_not_nested(&self.snapshot_dir, branch_rootfs)?;
+        ensure_not_nested(branch_rootfs, &self.snapshot_dir)?;
+
+        let current_target = TreeManifest::capture(target_rootfs)?;
+        if !self.manifest.diff(&current_target).is_empty() {
+            return Err(BoxletError::StateStore {
+                path: target_rootfs.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "target rootfs diverged from base snapshot during branch evaluation",
+                ),
+            });
+        }
+
+        let branch_manifest = TreeManifest::capture(branch_rootfs)?;
+        let branch_diff = self.manifest.diff(&branch_manifest);
+        let _applied = sync_tree_to_source(branch_rootfs, &branch_manifest, target_rootfs)?;
+        Ok(branch_diff)
+    }
+
+    /// Restores `target_rootfs` to match this snapshot's immutable checkpoint directory,
+    /// returning the [`FsDiff`] applied from the pre-restore `target_rootfs` state to the snapshot.
+    pub fn restore(&self, target_rootfs: &Path) -> Result<FsDiff> {
+        ensure_dir_exists(&self.snapshot_dir, "snapshot root directory does not exist")?;
+        ensure_dir_exists(target_rootfs, "target rootfs directory does not exist")?;
+        ensure_not_nested(&self.snapshot_dir, target_rootfs)?;
+        ensure_not_nested(target_rootfs, &self.snapshot_dir)?;
+
+        sync_tree_to_source(&self.snapshot_dir, &self.manifest, target_rootfs)
+    }
+
+    /// Restores `target_rootfs` to match an arbitrary `snapshot_dir` on disk, returning the
+    /// [`FsDiff`] applied from the pre-restore `target_rootfs` state to `snapshot_dir`.
+    pub fn restore_from_dir(snapshot_dir: &Path, target_rootfs: &Path) -> Result<FsDiff> {
+        sync_rootfs_delta(snapshot_dir, target_rootfs)
+    }
+}
+
+/// Synchronizes `target_rootfs` so its directory tree matches `source_rootfs`, returning the
+/// [`FsDiff`] applied from `target_rootfs` (before) to `source_rootfs` (after).
+pub fn sync_rootfs_delta(source_rootfs: &Path, target_rootfs: &Path) -> Result<FsDiff> {
+    ensure_dir_exists(source_rootfs, "source rootfs directory does not exist")?;
+    ensure_dir_exists(target_rootfs, "target rootfs directory does not exist")?;
+    ensure_not_nested(source_rootfs, target_rootfs)?;
+    ensure_not_nested(target_rootfs, source_rootfs)?;
+
+    let source_manifest = TreeManifest::capture(source_rootfs)?;
+    sync_tree_to_source(source_rootfs, &source_manifest, target_rootfs)
+}
+
+fn ensure_dir_exists(path: &Path, message: &'static str) -> Result<()> {
+    if !path.exists() {
+        return Err(BoxletError::StateStore {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, message),
+        });
+    }
+    Ok(())
+}
+
+fn sync_tree_to_source(
+    source_rootfs: &Path,
+    source_manifest: &TreeManifest,
+    target_rootfs: &Path,
+) -> Result<FsDiff> {
+    let source_root_meta =
+        fs::symlink_metadata(source_rootfs).map_err(|source| BoxletError::StateStore {
+            path: source_rootfs.to_path_buf(),
+            source,
+        })?;
+    let source_root_mode = extract_mode(&source_root_meta);
+    let target_root_meta =
+        fs::symlink_metadata(target_rootfs).map_err(|source| BoxletError::StateStore {
+            path: target_rootfs.to_path_buf(),
+            source,
+        })?;
+    let target_root_mode = extract_mode(&target_root_meta);
+
+    let target_manifest = TreeManifest::capture(target_rootfs)?;
+    let applied_diff = target_manifest.diff(source_manifest);
+
+    // Collect relative directory paths whose immediate or nested children are added,
+    // modified, or deleted so we only `chmod` directories that actually require writes.
+    let mut touched_dirs = BTreeSet::new();
+    let mut root_touched = false;
+    for changed in applied_diff
+        .added
+        .iter()
+        .chain(applied_diff.modified.iter())
+        .chain(applied_diff.deleted.iter())
+    {
+        let mut cursor = changed.parent();
+        while let Some(parent) = cursor {
+            if parent.as_os_str().is_empty() {
+                root_touched = true;
+                break;
+            }
+            touched_dirs.insert(parent.to_path_buf());
+            cursor = parent.parent();
+        }
+        if changed.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+            root_touched = true;
+        }
+    }
+
+    if root_touched {
+        make_dir_writable(target_rootfs)?;
+    }
+    for rel_dir in &touched_dirs {
+        if let Some(meta) = target_manifest.entries.get(rel_dir) {
+            if meta.kind == EntryKind::Directory {
+                let dir_path = target_rootfs.join(rel_dir);
+                if dir_path.exists() {
+                    make_dir_writable(&dir_path)?;
+                }
+            }
+        }
+    }
+
+    // Remove deleted paths and paths whose EntryKind changed, deepest paths first.
+    let mut paths_to_remove: Vec<PathBuf> = target_manifest
+        .entries
+        .iter()
+        .filter_map(
+            |(rel_path, target_meta)| match source_manifest.entries.get(rel_path) {
+                None => Some(rel_path.clone()),
+                Some(source_meta) if source_meta.kind != target_meta.kind => Some(rel_path.clone()),
+                Some(_) => None,
+            },
+        )
+        .collect();
+    paths_to_remove.sort_by(|a, b| {
+        b.components()
+            .count()
+            .cmp(&a.components().count())
+            .then_with(|| b.cmp(a))
+    });
+
+    for rel_path in paths_to_remove {
+        let dst_path = target_rootfs.join(&rel_path);
+        remove_entry_if_exists(&dst_path)?;
+    }
+
+    // Apply additions and modifications in topological (parent-before-child) order.
+    for (rel_path, src_meta) in &source_manifest.entries {
+        let needs_update = target_manifest.entries.get(rel_path) != Some(src_meta);
+        let src_path = source_rootfs.join(rel_path);
+        let dst_path = target_rootfs.join(rel_path);
+
+        match src_meta.kind {
+            EntryKind::Directory => {
+                if !dst_path.exists() {
+                    fs::create_dir_all(&dst_path).map_err(|source| BoxletError::StateStore {
+                        path: dst_path.clone(),
+                        source,
+                    })?;
+                    touched_dirs.insert(rel_path.clone());
+                }
+                if touched_dirs.contains(rel_path) {
+                    make_dir_writable(&dst_path)?;
+                }
+            }
+            EntryKind::Symlink => {
+                if needs_update {
+                    remove_entry_if_exists(&dst_path)?;
+                    let link_target =
+                        fs::read_link(&src_path).map_err(|source| BoxletError::StateStore {
+                            path: src_path.clone(),
+                            source,
+                        })?;
+                    create_symlink(&link_target, &dst_path)?;
+                }
+            }
+            EntryKind::File => {
+                if needs_update {
+                    atomic_copy_file(&src_path, &dst_path, src_meta.mode)?;
+                }
+            }
+        }
+    }
+
+    // Restore directory permissions in reverse depth order for touched or mode-changed directories.
+    let mut source_dirs: Vec<(&PathBuf, u32)> = source_manifest
+        .entries
+        .iter()
+        .filter_map(|(rel_path, meta)| {
+            if meta.kind == EntryKind::Directory {
+                let mode_changed = target_manifest
+                    .entries
+                    .get(rel_path)
+                    .is_none_or(|t| t.mode != meta.mode);
+                if mode_changed || touched_dirs.contains(rel_path) {
+                    return Some((rel_path, meta.mode));
+                }
+            }
+            None
+        })
+        .collect();
+    source_dirs.sort_by(|(a, _), (b, _)| {
+        b.components()
+            .count()
+            .cmp(&a.components().count())
+            .then_with(|| b.cmp(a))
+    });
+
+    for (rel_path, mode) in source_dirs {
+        let dst_path = target_rootfs.join(rel_path);
+        set_mode_permissions(&dst_path, mode)?;
+    }
+
+    if root_touched || source_root_mode != target_root_mode {
+        set_mode_permissions(target_rootfs, source_root_mode)?;
+    }
+
+    Ok(applied_diff)
+}
+
+fn atomic_copy_file(src_path: &Path, dst_path: &Path, mode: u32) -> Result<()> {
+    let parent = dst_path.parent().unwrap_or_else(|| Path::new("."));
+    let pid = std::process::id();
+    let seq = STAGE_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let stage_path = parent.join(format!(".boxlet-stage-{pid}-{seq}"));
+
+    if let Err(source) = fs::copy(src_path, &stage_path) {
+        let _ = fs::remove_file(&stage_path);
+        return Err(BoxletError::StateStore {
+            path: dst_path.to_path_buf(),
+            source,
+        });
+    }
+    if let Err(err) = set_mode_permissions(&stage_path, mode) {
+        let _ = fs::remove_file(&stage_path);
+        return Err(err);
+    }
+    if let Err(source) = fs::rename(&stage_path, dst_path) {
+        let _ = fs::remove_file(&stage_path);
+        return Err(BoxletError::StateStore {
+            path: dst_path.to_path_buf(),
+            source,
+        });
+    }
+    Ok(())
+}
+
+fn remove_entry_if_exists(path: &Path) -> Result<()> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(BoxletError::StateStore {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    if meta.file_type().is_dir() {
+        fs::remove_dir_all(path).map_err(|source| BoxletError::StateStore {
+            path: path.to_path_buf(),
+            source,
+        })
+    } else {
+        fs::remove_file(path).map_err(|source| BoxletError::StateStore {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn make_dir_writable(path: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(path).map_err(|source| BoxletError::StateStore {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let current_mode = meta.permissions().mode() & 0o7777;
+    if current_mode & 0o700 != 0o700 {
+        fs::set_permissions(path, fs::Permissions::from_mode(current_mode | 0o700)).map_err(
+            |source| BoxletError::StateStore {
+                path: path.to_path_buf(),
+                source,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_dir_writable(path: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(path).map_err(|source| BoxletError::StateStore {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut perms = meta.permissions();
+    if perms.readonly() {
+        perms.set_readonly(false);
+        fs::set_permissions(path, perms).map_err(|source| BoxletError::StateStore {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_mode_permissions(path: &Path, mode: u32) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777)).map_err(|source| {
+        BoxletError::StateStore {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn set_mode_permissions(path: &Path, mode: u32) -> Result<()> {
+    let meta = fs::symlink_metadata(path).map_err(|source| BoxletError::StateStore {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut perms = meta.permissions();
+    perms.set_readonly(mode & 0o200 == 0);
+    fs::set_permissions(path, perms).map_err(|source| BoxletError::StateStore {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn resolve_existing_prefix(path: &Path) -> Result<PathBuf> {
@@ -433,7 +789,6 @@ fn copy_tree_recursive(src_dir: &Path, dst_dir: &Path, is_root: bool) -> Result<
 
 #[cfg(unix)]
 fn extract_mode(meta: &fs::Metadata) -> u32 {
-    use std::os::unix::fs::MetadataExt;
     meta.mode() & 0o7777
 }
 
@@ -670,8 +1025,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn same_length_symlink_retarget_and_readonly_dir_copy_work() -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
         let tmp = make_tempdir()?;
         let source_rootfs = tmp.path().join("rootfs");
         let snapshot_base = tmp.path().join("snapshots");
@@ -722,6 +1075,113 @@ mod tests {
                 source,
             },
         )?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn promote_branch_applies_winning_branch_changes_and_restore_rolls_back_cleanly() -> Result<()>
+    {
+        let tmp = make_tempdir()?;
+        let source_rootfs = tmp.path().join("source-rootfs");
+        let snapshot_base = tmp.path().join("snapshots");
+        let branches_base = tmp.path().join("branches");
+
+        // Populate initial workspace state
+        write_file(
+            &source_rootfs.join("Cargo.toml"),
+            b"[package]\nname = \"demo\"\n",
+        )?;
+        write_file(
+            &source_rootfs.join("src/lib.rs"),
+            b"pub fn answer() -> u32 { 0 }\n",
+        )?;
+        write_file(&source_rootfs.join("src/legacy.rs"), b"// remove me\n")?;
+        write_file(&source_rootfs.join("README.md"), b"# Demo\n")?;
+
+        let snapshot = WorkspaceSnapshot::create("checkpoint-1", &source_rootfs, &snapshot_base)?;
+        let loaded = WorkspaceSnapshot::load("checkpoint-1", &snapshot.snapshot_dir)?;
+        assert_eq!(loaded.manifest, snapshot.manifest);
+
+        let branch_fail = snapshot.branch("branch-fail", &branches_base)?;
+        let branch_win = snapshot.branch("branch-win", &branches_base)?;
+
+        // Mutate branch-fail: breaks code and adds garbage artifacts
+        write_file(
+            &branch_fail.join("src/lib.rs"),
+            b"pub fn answer() -> u32 { panic!(\"broken\") }\n",
+        )?;
+        write_file(&branch_fail.join("tmp/crash.log"), b"segfault\n")?;
+        fs::remove_file(branch_fail.join("README.md")).map_err(|source| {
+            BoxletError::StateStore {
+                path: branch_fail.join("README.md"),
+                source,
+            }
+        })?;
+
+        // Mutate branch-win: fixes implementation, adds unit test, removes legacy file
+        write_file(
+            &branch_win.join("src/lib.rs"),
+            b"pub fn answer() -> u32 { 42 }\n",
+        )?;
+        write_file(
+            &branch_win.join("tests/answer_test.rs"),
+            b"#[test] fn it_works() { assert_eq!(42, 42); }\n",
+        )?;
+        fs::remove_file(branch_win.join("src/legacy.rs")).map_err(|source| {
+            BoxletError::StateStore {
+                path: branch_win.join("src/legacy.rs"),
+                source,
+            }
+        })?;
+
+        // Promote winning branch onto source_rootfs
+        let promoted_diff = snapshot.promote_branch(&branch_win, &source_rootfs)?;
+        assert_eq!(
+            promoted_diff.added,
+            vec![
+                PathBuf::from("tests"),
+                PathBuf::from("tests/answer_test.rs")
+            ]
+        );
+        assert_eq!(promoted_diff.modified, vec![PathBuf::from("src/lib.rs")]);
+        assert_eq!(promoted_diff.deleted, vec![PathBuf::from("src/legacy.rs")]);
+
+        // Verify source_rootfs now matches branch-win identically
+        let promoted_manifest = TreeManifest::capture(&source_rootfs)?;
+        let win_manifest = TreeManifest::capture(&branch_win)?;
+        assert_eq!(promoted_manifest, win_manifest);
+        assert!(!source_rootfs.join("src/legacy.rs").exists());
+        assert!(source_rootfs.join("tests/answer_test.rs").exists());
+
+        // Roll source_rootfs back to the original checkpoint via snapshot.restore
+        let rollback_diff = snapshot.restore(&source_rootfs)?;
+        assert_eq!(rollback_diff.added, vec![PathBuf::from("src/legacy.rs")]);
+        assert_eq!(rollback_diff.modified, vec![PathBuf::from("src/lib.rs")]);
+        assert_eq!(
+            rollback_diff.deleted,
+            vec![
+                PathBuf::from("tests"),
+                PathBuf::from("tests/answer_test.rs")
+            ]
+        );
+
+        let restored_manifest = TreeManifest::capture(&source_rootfs)?;
+        assert_eq!(restored_manifest, snapshot.manifest);
+        assert!(snapshot.manifest.diff(&restored_manifest).is_empty());
+
+        // Also verify restore_from_dir after directly dirtying source_rootfs
+        write_file(&source_rootfs.join("untracked/new.txt"), b"dirty")?;
+        let dir_restore_diff =
+            WorkspaceSnapshot::restore_from_dir(&snapshot.snapshot_dir, &source_rootfs)?;
+        assert_eq!(
+            dir_restore_diff.deleted,
+            vec![
+                PathBuf::from("untracked"),
+                PathBuf::from("untracked/new.txt")
+            ]
+        );
+        assert_eq!(TreeManifest::capture(&source_rootfs)?, snapshot.manifest);
 
         Ok(())
     }

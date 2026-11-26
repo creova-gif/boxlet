@@ -4,6 +4,7 @@
 - **ADR-001 (V1 Architecture & Isolation Seams):** [docs/adr/001-v1-architecture-and-seams.md](docs/adr/001-v1-architecture-and-seams.md)
 - **ADR-002 (Filesystem Snapshots & Deterministic Diffing):** [docs/adr/002-filesystem-snapshots-and-diffing.md](docs/adr/002-filesystem-snapshots-and-diffing.md)
 - **ADR-003 (Parallel Multi-Agent Branch Execution):** [docs/adr/003-parallel-branch-execution.md](docs/adr/003-parallel-branch-execution.md)
+- **ADR-004 (Branch Promotion & Workspace Rollback):** [ADR-004: Branch Promotion and Workspace Rollback](docs/adr/004-branch-promotion-and-rollback.md)
 - **Threat Model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)
 - **Design Doc:** [docs/designs/boxlet-v1-oci-runtime.md](docs/designs/boxlet-v1-oci-runtime.md)
 - **Engineering Standards:** [AGENTS.md](AGENTS.md)
@@ -124,11 +125,11 @@ sudo ./scripts/demo-v1.sh ./target/release/boxlet
 
 ---
 
-## V2 Workspace Snapshots, Diffs & Parallel Branching
+## V2 Workspace Snapshots, Diffs, Parallel Branching, Winner Promotion & Rollback
 
-Boxlet V2 adds deterministic rootfs snapshots, `O(N)` single-pass tree diffing (`added`, `modified`, `deleted`), and parallel multi-agent sandbox branching (`boxlet branch-run` / `Engine::run_branches`).
+Boxlet V2 adds deterministic rootfs snapshots, `O(N)` single-pass tree diffing (`added`, `modified`, `deleted`), parallel multi-agent sandbox branching (`boxlet branch-run` / `Engine::run_branches`), automatic winner promotion (`boxlet branch-run --promote-winner` / `Engine::run_branches_with_promotion`), and deterministic workspace rollback (`boxlet restore` / `WorkspaceSnapshot::restore`).
 
-### CLI Usage (`snapshot`, `diff`, `branch-run`)
+### CLI Usage (`snapshot`, `diff`, `branch-run`, `restore`)
 
 Checkpoint a base rootfs directory and compute a structured JSON diff against a modified directory (portable across Linux and macOS):
 
@@ -161,16 +162,38 @@ sudo ./target/release/boxlet branch-run \
   ./bundle
 ```
 
-### Rust SDK Usage (`WorkspaceSnapshot`, `TreeManifest::diff`, `Engine::run_branches`)
+Evaluate candidate branches in parallel, automatically promote the first clean winning branch (`exit_code == 0` with zero violations) back into `./bundle/rootfs`, and emit a `BranchBatchReport` JSON:
+
+```bash
+sudo ./target/release/boxlet branch-run \
+  --memory 128m \
+  --network none \
+  --promote-winner \
+  --cmd "echo broken-patch > /tmp/failed_attempt.txt && exit 1" \
+  --cmd "echo verified-fix > /tmp/winning_patch.txt && echo winner-ok" \
+  --json \
+  ./bundle
+```
+
+Roll back a mutated `rootfs` directory to a previously captured snapshot checkpoint and emit the applied `FsDiff` JSON:
+
+```bash
+sudo ./target/release/boxlet restore \
+  --snapshot ./snapshots/snap-base-1 \
+  --target ./bundle/rootfs \
+  --json
+```
+
+### Rust SDK Usage (`WorkspaceSnapshot`, `TreeManifest::diff`, `Engine::run_branches`, `Engine::run_branches_with_promotion`)
 
 ```rust
 use std::path::Path;
-use boxlet::engine::BranchSpec;
+use boxlet::engine::{BranchBatchReport, BranchSpec};
 use boxlet::policy::{ExecutionPolicy, NetworkMode};
 use boxlet::snapshot::{TreeManifest, WorkspaceSnapshot};
 
 fn inspect_and_branch() -> boxlet::error::Result<()> {
-    // Portable workspace snapshot + deterministic diff:
+    // Portable workspace snapshot + deterministic diff + rollback:
     let snap = WorkspaceSnapshot::create(
         "base-v1",
         Path::new("./bundle/rootfs"),
@@ -180,7 +203,11 @@ fn inspect_and_branch() -> boxlet::error::Result<()> {
     let diff = snap.manifest.diff(&TreeManifest::capture(&branch_dir)?);
     println!("changes={} (empty={})", diff.total_changes(), diff.is_empty());
 
-    // Parallel multi-agent branch execution on Linux:
+    // Roll back a modified directory to match `snap` exactly:
+    let reverted = snap.restore(&branch_dir)?;
+    println!("reverted changes={}", reverted.total_changes());
+
+    // Parallel multi-agent branch execution + automatic winner promotion on Linux:
     #[cfg(target_os = "linux")]
     {
         let engine = boxlet::Engine::new(boxlet::LinuxBackend::with_defaults());
@@ -188,7 +215,7 @@ fn inspect_and_branch() -> boxlet::error::Result<()> {
             BranchSpec::new("branch-a").with_args(vec![
                 "/bin/sh".into(),
                 "-c".into(),
-                "echo patch-a > /tmp/a.txt".into(),
+                "echo patch-a > /tmp/a.txt && exit 1".into(),
             ]),
             BranchSpec::new("branch-b").with_args(vec![
                 "/bin/sh".into(),
@@ -202,8 +229,18 @@ fn inspect_and_branch() -> boxlet::error::Result<()> {
             ..ExecutionPolicy::default()
         };
 
-        let results = engine.run_branches(Path::new("./bundle"), &branches, &policy)?;
-        for item in results {
+        let report: BranchBatchReport = engine.run_branches_with_promotion(
+            Path::new("./bundle"),
+            &branches,
+            &policy,
+            true,
+        )?;
+        println!(
+            "promoted_branch_id={:?} promoted_diff={:?}",
+            report.promoted_branch_id,
+            report.promoted_diff,
+        );
+        for item in &report.branches {
             println!(
                 "branch={} exit={:?} added={:?} modified={:?} deleted={:?}",
                 item.branch_id,

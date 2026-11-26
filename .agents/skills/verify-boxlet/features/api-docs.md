@@ -5,7 +5,7 @@ Public API documentation verifies that Boxlet's exported crate modules, types, a
 ## Sub-features
 
 - `doc-build` compiles crate docs with `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`.
-- `doc-symbol-index` confirms `target/doc/boxlet/index.html` is generated and lists `healthcheck`, `Engine`, `engine`, `policy`, `oci`, `snapshot`, `traits`, and `error`, and confirms the V2 branching contracts `BranchSpec` and `BranchExecutionResult` appear in the generated `rustdoc` HTML (`target/doc/boxlet/engine/index.html` or `target/doc/boxlet/index.html`).
+- `doc-symbol-index` confirms `target/doc/boxlet/index.html` is generated and lists `healthcheck`, `Engine`, `engine`, `policy`, `oci`, `snapshot`, `traits`, and `error`, and confirms the V2 branching contracts `BranchSpec`, `BranchExecutionResult`, and `BranchBatchReport` appear in the generated `rustdoc` HTML (`target/doc/boxlet/engine/index.html` or `target/doc/boxlet/index.html`).
 
 ## How to get to it (user POV)
 
@@ -18,7 +18,7 @@ Preconditions:
 - `control-boxlet launch --run <RUN_ID>` succeeded with `READY=true`.
 - `control-boxlet doctor --run <RUN_ID>` reported `doctor: OK`.
 
-- **Build and verify docs.** Execute `.agents/skills/verify-boxlet/scripts/control-boxlet drive api-docs --run <RUN_ID>`. Exit code is `0` and stdout prints `doc-verified: healthcheck, Engine, engine, policy, oci, snapshot, traits, error, BranchSpec, BranchExecutionResult present in rustdoc output`.
+- **Build and verify docs.** Execute `.agents/skills/verify-boxlet/scripts/control-boxlet drive api-docs --run <RUN_ID>`. Exit code is `0` and stdout prints `doc-verified: healthcheck, Engine, engine, policy, oci, snapshot, traits, error, BranchSpec, BranchExecutionResult, BranchBatchReport present in rustdoc output`.
 - **Inspect proof artifacts.** Read `/tmp/boxlet-verify-evidence/<RUN_ID>/api-docs/stdout.txt`, `exit_code.txt`, and `meta.json`. `exit_code.txt` contains `0` and `stdout.txt` confirms the generated HTML index exists and documents all exported V1 and V2 public modules and symbols.
 
 ## Gotchas

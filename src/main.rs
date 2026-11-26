@@ -138,6 +138,18 @@ enum Commands {
         #[arg(value_name = "AFTER", required_unless_present = "after_flag")]
         after: Option<PathBuf>,
     },
+    /// Restore a target rootfs directory to match a previously captured snapshot directory.
+    Restore {
+        /// Path to the snapshot directory (`<out>/<id>`).
+        #[arg(long)]
+        snapshot: PathBuf,
+        /// Path to the target rootfs directory to restore.
+        #[arg(long)]
+        target: PathBuf,
+        /// Emit the applied `FsDiff` as JSON to stdout.
+        #[arg(long)]
+        json: bool,
+    },
     /// Fan out N isolated sandbox branches in parallel from a base OCI bundle and collect diffs.
     BranchRun {
         /// Shell command (`sh -c <CMD>`) to execute in each parallel branch (repeatable).
@@ -161,7 +173,10 @@ enum Commands {
         /// Maximum bytes captured per stream (`stdout` and `stderr`) per branch.
         #[arg(long)]
         max_output_bytes: Option<usize>,
-        /// Emit the full `Vec<BranchExecutionResult>` as JSON to stdout.
+        /// Promote the first passing branch (`exit_code == 0`, no violations) back onto the bundle rootfs.
+        #[arg(long)]
+        promote_winner: bool,
+        /// Emit the full `Vec<BranchExecutionResult>` (or `BranchBatchReport` with `--promote-winner`) as JSON to stdout.
         #[arg(long)]
         json: bool,
         /// Path to the base OCI bundle directory containing `config.json`.
@@ -257,6 +272,23 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Restore {
+            snapshot,
+            target,
+            json,
+        } => {
+            let diff = WorkspaceSnapshot::restore_from_dir(&snapshot, &target)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&diff)?);
+            } else {
+                println!(
+                    "restored target={} changes={}",
+                    target.display(),
+                    diff.total_changes()
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         other => dispatch_platform(cli.root, cli.cgroup_parent, other),
     }
 }
@@ -341,6 +373,7 @@ fn dispatch_platform(root: PathBuf, cgroup_parent: PathBuf, command: Commands) -
             network,
             timeout,
             max_output_bytes,
+            promote_winner,
             json,
             bundle,
         } => {
@@ -365,36 +398,61 @@ fn dispatch_platform(root: PathBuf, cgroup_parent: PathBuf, command: Commands) -
                 })
                 .collect();
 
-            let results = engine.run_branches(&bundle, &specs, &policy)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&results)?);
+            if promote_winner {
+                let report = engine.run_branches_with_promotion(&bundle, &specs, &policy, true)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    for item in &report.branches {
+                        println!(
+                            "branch={} exit={:?} added={} modified={} deleted={}",
+                            item.branch_id,
+                            item.execution.exit_code,
+                            item.fs_diff.added.len(),
+                            item.fs_diff.modified.len(),
+                            item.fs_diff.deleted.len(),
+                        );
+                    }
+                    println!("promoted_branch_id={:?}", report.promoted_branch_id);
+                }
+                if report.promoted_branch_id.is_some() {
+                    Ok(ExitCode::SUCCESS)
+                } else {
+                    Ok(ExitCode::FAILURE)
+                }
             } else {
-                for item in &results {
-                    println!(
-                        "branch={} exit={:?} added={} modified={} deleted={}",
-                        item.branch_id,
-                        item.execution.exit_code,
-                        item.fs_diff.added.len(),
-                        item.fs_diff.modified.len(),
-                        item.fs_diff.deleted.len(),
-                    );
+                let results = engine.run_branches(&bundle, &specs, &policy)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&results)?);
+                } else {
+                    for item in &results {
+                        println!(
+                            "branch={} exit={:?} added={} modified={} deleted={}",
+                            item.branch_id,
+                            item.execution.exit_code,
+                            item.fs_diff.added.len(),
+                            item.fs_diff.modified.len(),
+                            item.fs_diff.deleted.len(),
+                        );
+                    }
+                }
+
+                let all_ok = results.iter().all(|r| {
+                    r.execution.exit_code == Some(0)
+                        && !r.execution.violations.timed_out
+                        && !r.execution.violations.oom_killed
+                });
+                if all_ok {
+                    Ok(ExitCode::SUCCESS)
+                } else {
+                    Ok(ExitCode::FAILURE)
                 }
             }
-
-            let all_ok = results.iter().all(|r| {
-                r.execution.exit_code == Some(0)
-                    && !r.execution.violations.timed_out
-                    && !r.execution.violations.oom_killed
-            });
-            if all_ok {
-                Ok(ExitCode::SUCCESS)
-            } else {
-                Ok(ExitCode::FAILURE)
-            }
         }
-        Commands::Snapshot { .. } | Commands::Diff { .. } | Commands::InternalInit { .. } => {
-            Ok(ExitCode::SUCCESS)
-        }
+        Commands::Snapshot { .. }
+        | Commands::Diff { .. }
+        | Commands::Restore { .. }
+        | Commands::InternalInit { .. } => Ok(ExitCode::SUCCESS),
     }
 }
 
@@ -595,6 +653,28 @@ mod tests {
             reason: err.to_string(),
         })?;
         assert_eq!(dispatch(diff_cli)?, ExitCode::SUCCESS);
+
+        let snap_dir = out_dir.join("snap-cli-1");
+        let restore_cli = Cli::try_parse_from([
+            "boxlet",
+            "restore",
+            "--snapshot",
+            snap_dir.to_str().unwrap_or_default(),
+            "--target",
+            rootfs_b.to_str().unwrap_or_default(),
+            "--json",
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+        assert_eq!(dispatch(restore_cli)?, ExitCode::SUCCESS);
+        assert!(!rootfs_b.join("added.txt").exists());
+        let restored_bytes =
+            std::fs::read(rootfs_b.join("file.txt")).map_err(|source| BoxletError::StateStore {
+                path: rootfs_b.join("file.txt"),
+                source,
+            })?;
+        assert_eq!(restored_bytes, b"v1\n");
         Ok(())
     }
 }

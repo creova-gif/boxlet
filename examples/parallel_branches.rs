@@ -1,8 +1,11 @@
-//! Example demonstrating parallel N-way sandbox branching and filesystem diffing via `Engine::run_branches`.
+//! Example demonstrating parallel N-way sandbox branching, filesystem diffing, and winner promotion
+//! via `Engine::run_branches` and `Engine::run_branches_with_promotion`.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use boxlet::engine::BranchBatchReport;
 use boxlet::engine::BranchSpec;
 use boxlet::policy::{ExecutionPolicy, NetworkMode};
 
@@ -22,9 +25,12 @@ fn main() {
     }
 
     let bundle = args
-        .get(1)
+        .iter()
+        .skip(1)
+        .find(|arg| !arg.starts_with("--"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("./bundle"));
+    let promote_winner = args.iter().any(|arg| arg == "--promote-winner");
 
     let branches = vec![
         BranchSpec::new("candidate-a")
@@ -58,8 +64,12 @@ fn main() {
     {
         let backend = boxlet::LinuxBackend::with_defaults();
         let engine = boxlet::Engine::new(backend);
-        match engine.run_branches(&bundle, &branches, &policy) {
-            Ok(results) => {
+        match engine.run_branches_with_promotion(&bundle, &branches, &policy, promote_winner) {
+            Ok(BranchBatchReport {
+                branches: results,
+                promoted_branch_id,
+                promoted_diff,
+            }) => {
                 for res in results {
                     println!(
                         "branch={} exit={:?} duration={:?} added={:?} modified={:?} deleted={:?}",
@@ -69,6 +79,12 @@ fn main() {
                         res.fs_diff.added,
                         res.fs_diff.modified,
                         res.fs_diff.deleted,
+                    );
+                }
+                if let Some(winner) = promoted_branch_id {
+                    println!(
+                        "promoted winner={} applied_diff={:?}",
+                        winner, promoted_diff
                     );
                 }
             }
@@ -82,9 +98,10 @@ fn main() {
     #[cfg(not(target_os = "linux"))]
     {
         println!(
-            "Configured {} parallel branches against bundle '{}' (policy memory={:?}, network={:?}):",
+            "Configured {} parallel branches against bundle '{}' (promote_winner={}, policy memory={:?}, network={:?}):",
             branches.len(),
             bundle.display(),
+            promote_winner,
             policy.memory_bytes,
             policy.network,
         );
