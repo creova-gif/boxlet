@@ -16,6 +16,7 @@ use boxlet::oci::state::DEFAULT_STATE_ROOT;
 #[cfg(target_os = "linux")]
 use boxlet::policy::{ExecutionPolicy, NetworkMode};
 use boxlet::snapshot::{TreeManifest, WorkspaceSnapshot};
+use boxlet::{BundleBuilder, JsonlAuditLogger};
 
 const DEFAULT_CGROUP_PARENT: &str = "/sys/fs/cgroup/boxlet.slice";
 
@@ -33,6 +34,10 @@ struct Cli {
     /// Dedicated cgroup v2 parent slice for container leaf cgroups.
     #[arg(long, global = true, default_value = DEFAULT_CGROUP_PARENT)]
     cgroup_parent: PathBuf,
+
+    /// Optional path to an append-only JSON Lines (`.jsonl`) audit log file.
+    #[arg(long, global = true)]
+    audit_log: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
@@ -182,6 +187,29 @@ enum Commands {
         /// Path to the base OCI bundle directory containing `config.json`.
         bundle: PathBuf,
     },
+    /// Scaffold a minimal OCI bundle directory (`config.json` + `rootfs` hierarchy).
+    InitBundle {
+        /// Shell command (`sh -c <CMD>`) to configure as the container entrypoint.
+        #[arg(long, default_value = "echo boxlet-ok")]
+        cmd: String,
+        /// Optional path to a static `busybox` binary to populate `/bin/busybox` and standard applets.
+        #[arg(long)]
+        busybox: Option<PathBuf>,
+        /// Container UTS hostname.
+        #[arg(long, default_value = "boxlet-sandbox")]
+        hostname: String,
+        /// Working directory inside the container rootfs.
+        #[arg(long, default_value = "/")]
+        cwd: String,
+        /// Mark the root filesystem read-only in `config.json`.
+        #[arg(long)]
+        readonly: bool,
+        /// Emit a JSON summary of the generated bundle to stdout.
+        #[arg(long)]
+        json: bool,
+        /// Target directory where `<bundle>/config.json` and `<bundle>/rootfs` will be created.
+        bundle: PathBuf,
+    },
     /// Hidden internal self-re-exec container init stage.
     #[command(name = "__init", hide = true)]
     InternalInit {
@@ -289,19 +317,65 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        other => dispatch_platform(cli.root, cli.cgroup_parent, other),
+        Commands::InitBundle {
+            cmd,
+            busybox,
+            hostname,
+            cwd,
+            readonly,
+            json,
+            bundle,
+        } => {
+            let mut builder = BundleBuilder::new()
+                .with_shell_command(cmd)
+                .with_hostname(hostname)
+                .with_cwd(cwd)
+                .with_readonly_rootfs(readonly);
+            if let Some(bb) = busybox {
+                builder = builder.with_busybox(bb);
+            }
+            let spec = builder.build(&bundle)?;
+            if json {
+                let summary = serde_json::json!({
+                    "bundle": bundle,
+                    "config": bundle.join("config.json"),
+                    "rootfs": bundle.join("rootfs"),
+                    "oci_version": spec.version(),
+                });
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                println!(
+                    "initialized bundle={} config={} rootfs={}",
+                    bundle.display(),
+                    bundle.join("config.json").display(),
+                    bundle.join("rootfs").display()
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        other => dispatch_platform(
+            cli.root,
+            cli.cgroup_parent,
+            cli.audit_log.map(JsonlAuditLogger::new),
+            other,
+        ),
     }
 }
 
 #[cfg(target_os = "linux")]
-fn dispatch_platform(root: PathBuf, cgroup_parent: PathBuf, command: Commands) -> Result<ExitCode> {
+fn dispatch_platform(
+    root: PathBuf,
+    cgroup_parent: PathBuf,
+    audit_logger: Option<JsonlAuditLogger>,
+    command: Commands,
+) -> Result<ExitCode> {
     if let Commands::InternalInit { config } = command {
         boxlet::run_internal_init(&config)?;
         return Ok(ExitCode::SUCCESS);
     }
 
     let backend = boxlet::LinuxBackend::new(root, cgroup_parent);
-    let engine = boxlet::Engine::new(backend);
+    let engine = boxlet::Engine::new(backend).with_optional_audit_logger(audit_logger);
 
     match command {
         Commands::Create { bundle, id } => {
@@ -452,6 +526,7 @@ fn dispatch_platform(root: PathBuf, cgroup_parent: PathBuf, command: Commands) -
         Commands::Snapshot { .. }
         | Commands::Diff { .. }
         | Commands::Restore { .. }
+        | Commands::InitBundle { .. }
         | Commands::InternalInit { .. } => Ok(ExitCode::SUCCESS),
     }
 }
@@ -460,6 +535,7 @@ fn dispatch_platform(root: PathBuf, cgroup_parent: PathBuf, command: Commands) -
 fn dispatch_platform(
     _root: PathBuf,
     _cgroup_parent: PathBuf,
+    _audit_logger: Option<JsonlAuditLogger>,
     _command: Commands,
 ) -> Result<ExitCode> {
     Err(BoxletError::UnsupportedPlatform {
@@ -675,6 +751,32 @@ mod tests {
                 source,
             })?;
         assert_eq!(restored_bytes, b"v1\n");
+        Ok(())
+    }
+
+    #[test]
+    fn cli_init_bundle_parses_and_executes_portably() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|source| BoxletError::StateStore {
+            path: PathBuf::from("tempdir"),
+            source,
+        })?;
+        let bundle_dir = tmp.path().join("demo-bundle");
+
+        let init_cli = Cli::try_parse_from([
+            "boxlet",
+            "init-bundle",
+            "--cmd",
+            "echo hi",
+            "--json",
+            bundle_dir.to_str().unwrap_or_default(),
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+
+        assert_eq!(dispatch(init_cli)?, ExitCode::SUCCESS);
+        assert!(bundle_dir.join("config.json").exists());
+        assert!(bundle_dir.join("rootfs").is_dir());
         Ok(())
     }
 }

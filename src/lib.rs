@@ -1,5 +1,6 @@
 //! Boxlet: Minimal Linux OCI-compatible container runtime and programmable execution core.
 
+pub mod audit;
 pub mod engine;
 pub mod error;
 #[cfg(target_os = "linux")]
@@ -9,9 +10,11 @@ pub mod policy;
 pub mod snapshot;
 pub mod traits;
 
+pub use audit::{AuditEvent, AuditRecord, JsonlAuditLogger};
 pub use engine::{BranchBatchReport, BranchExecutionResult, BranchSpec, Engine};
 #[cfg(target_os = "linux")]
 pub use linux::LinuxBackend;
+pub use oci::BundleBuilder;
 
 /// Executes the internal self-re-exec container init stage (`boxlet __init <config>`).
 #[cfg(target_os = "linux")]

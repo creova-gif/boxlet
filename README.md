@@ -5,6 +5,7 @@
 - **ADR-002 (Filesystem Snapshots & Deterministic Diffing):** [docs/adr/002-filesystem-snapshots-and-diffing.md](docs/adr/002-filesystem-snapshots-and-diffing.md)
 - **ADR-003 (Parallel Multi-Agent Branch Execution):** [docs/adr/003-parallel-branch-execution.md](docs/adr/003-parallel-branch-execution.md)
 - **ADR-004 (Branch Promotion & Workspace Rollback):** [ADR-004: Branch Promotion and Workspace Rollback](docs/adr/004-branch-promotion-and-rollback.md)
+- **ADR-005 (Structured Audit Trail & OCI Bundle Scaffolding):** [ADR-005: Structured Audit Trail and OCI Bundle Scaffolding](docs/adr/005-audit-trail-and-bundle-scaffolding.md)
 - **Threat Model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)
 - **Design Doc:** [docs/designs/boxlet-v1-oci-runtime.md](docs/designs/boxlet-v1-oci-runtime.md)
 - **Engineering Standards:** [AGENTS.md](AGENTS.md)
@@ -86,6 +87,31 @@ For a completely static Linux `musl` binary:
 rustup target add x86_64-unknown-linux-musl
 RUSTFLAGS="-C target-feature=+crt-static" \
   cargo build --release --target x86_64-unknown-linux-musl
+```
+
+### Zero-Config OCI Bundle Scaffolding (`boxlet init-bundle`)
+
+Scaffold a ready-to-run BusyBox OCI bundle directory (`config.json` + `rootfs/{bin,proc,dev,tmp,etc,var/tmp}` + applet symlinks) in a single command:
+
+```bash
+./target/release/boxlet init-bundle \
+  --cmd "echo boxlet-ready && uname -a" \
+  --busybox /bin/busybox \
+  --hostname "boxlet-sandbox" \
+  --json \
+  ./bundle
+```
+
+### Structured JSONL Audit Trail (`--audit-log <PATH>`)
+
+Pass the global `--audit-log <PATH>` flag to record every lifecycle operation (`container_run_completed`, `branch_batch_completed`, `snapshot_created`, `workspace_restored`, `oci_lifecycle`) as an append-only, `flock`-synchronized JSON Lines record with `0600` permissions:
+
+```bash
+sudo ./target/release/boxlet --audit-log /var/log/boxlet-audit.jsonl run \
+  --memory 128m \
+  --network none \
+  --json \
+  ./bundle
 ```
 
 ### High-Level Policy Execution (`boxlet run`)
@@ -184,15 +210,24 @@ sudo ./target/release/boxlet restore \
   --json
 ```
 
-### Rust SDK Usage (`WorkspaceSnapshot`, `TreeManifest::diff`, `Engine::run_branches`, `Engine::run_branches_with_promotion`)
+### Rust SDK Usage (`BundleBuilder`, `JsonlAuditLogger`, `WorkspaceSnapshot`, `TreeManifest::diff`, `Engine::run_branches_with_promotion`)
 
 ```rust
 use std::path::Path;
+use boxlet::audit::JsonlAuditLogger;
 use boxlet::engine::{BranchBatchReport, BranchSpec};
+use boxlet::oci::BundleBuilder;
 use boxlet::policy::{ExecutionPolicy, NetworkMode};
 use boxlet::snapshot::{TreeManifest, WorkspaceSnapshot};
 
 fn inspect_and_branch() -> boxlet::error::Result<()> {
+    // Zero-config OCI bundle scaffolding + structured JSONL audit logger:
+    let _scaffold = BundleBuilder::new()
+        .with_shell_command("echo scaffold-ok")
+        .with_hostname("boxlet-sdk")
+        .build(Path::new("./scaffolded-bundle"))?;
+    let audit_logger = JsonlAuditLogger::new("/var/log/boxlet/audit.jsonl");
+
     // Portable workspace snapshot + deterministic diff + rollback:
     let snap = WorkspaceSnapshot::create(
         "base-v1",
@@ -210,7 +245,8 @@ fn inspect_and_branch() -> boxlet::error::Result<()> {
     // Parallel multi-agent branch execution + automatic winner promotion on Linux:
     #[cfg(target_os = "linux")]
     {
-        let engine = boxlet::Engine::new(boxlet::LinuxBackend::with_defaults());
+        let engine = boxlet::Engine::new(boxlet::LinuxBackend::with_defaults())
+            .with_audit_logger(audit_logger);
         let branches = vec![
             BranchSpec::new("branch-a").with_args(vec![
                 "/bin/sh".into(),
