@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::audit::{AuditEvent, JsonlAuditLogger};
 use crate::error::{BoxletError, Result};
+use crate::eval::{
+    evaluate_candidate, select_winning_verdict, CandidateVerdict, EvalReport, EvalSpec,
+};
 use crate::oci::state::{ContainerState, ContainerStatus};
 use crate::oci::{load_bundle_spec, validate_container_id};
 use crate::policy::{merge_policy_with_spec, ExecutionPolicy, ExecutionResult, ResolvedRunSpec};
@@ -497,7 +500,9 @@ impl<B: RuntimeBackend> Engine<B> {
                     match snapshot.promote_branch(&winner_prepared.rootfs_dir, &source_rootfs) {
                         Ok(diff) => diff,
                         Err(err) => {
-                            let _ = snapshot.restore(&source_rootfs);
+                            if !is_pre_sync_divergence_error(&err) {
+                                let _ = snapshot.restore(&source_rootfs);
+                            }
                             return Err(err);
                         }
                     };
@@ -521,6 +526,175 @@ impl<B: RuntimeBackend> Engine<B> {
             promoted_diff,
         })
     }
+
+    /// Evaluates multiple parallel candidate branches against a declarative [`EvalSpec`]
+    /// rubric, scores each candidate, selects the highest-scoring passing candidate,
+    /// and optionally promotes the winning candidate's rootfs diff back onto `<bundle>`.
+    pub fn run_eval(&self, bundle: &Path, spec: &EvalSpec) -> Result<EvalReport> {
+        spec.policy.validate()?;
+        self.preflight_audit()?;
+
+        let mut seen_ids = BTreeSet::new();
+        for candidate in &spec.candidates {
+            validate_container_id(&candidate.id)?;
+            if !seen_ids.insert(candidate.id.as_str()) {
+                return Err(BoxletError::ContainerAlreadyExists {
+                    id: candidate.id.clone(),
+                });
+            }
+        }
+
+        let base_spec = load_bundle_spec(bundle)?;
+        if spec.candidates.is_empty() {
+            return Ok(EvalReport {
+                verdicts: Vec::new(),
+                winning_branch_id: None,
+                promoted: false,
+                promoted_diff: None,
+            });
+        }
+
+        let configured_rootfs = base_spec
+            .root()
+            .as_ref()
+            .map(|r| r.path().clone())
+            .unwrap_or_else(|| PathBuf::from("rootfs"));
+        let source_rootfs = if configured_rootfs.is_absolute() {
+            configured_rootfs
+        } else {
+            bundle.join(configured_rootfs)
+        };
+
+        let workspace = TempWorkspaceGuard::create(bundle)?;
+        let snapshot_base = workspace.path().join("snapshots");
+        let bundles_base = workspace.path().join("bundles");
+
+        let snapshot = WorkspaceSnapshot::create("base", &source_rootfs, &snapshot_base)?;
+
+        let mut prepared = Vec::with_capacity(spec.candidates.len());
+        for candidate in &spec.candidates {
+            let branch_bundle_dir = bundles_base.join(&candidate.id);
+            let branch_rootfs_dir = snapshot.branch("rootfs", &branch_bundle_dir)?;
+            let branch_spec = apply_branch_overrides(&base_spec, candidate);
+            let config_path = branch_bundle_dir.join("config.json");
+            branch_spec
+                .save(&config_path)
+                .map_err(|source| BoxletError::OciSpec {
+                    path: config_path,
+                    source,
+                })?;
+            let resolved = merge_policy_with_spec(&branch_spec, &spec.policy)?;
+            prepared.push(PreparedBranch {
+                branch_id: candidate.id.clone(),
+                bundle_dir: branch_bundle_dir,
+                rootfs_dir: branch_rootfs_dir,
+                resolved,
+            });
+        }
+
+        let results = thread::scope(|scope| -> Result<Vec<BranchExecutionResult>> {
+            let mut handles = Vec::with_capacity(prepared.len());
+            for item in &prepared {
+                let backend = &self.backend;
+                let base_manifest = &snapshot.manifest;
+                handles.push(scope.spawn(move || -> Result<BranchExecutionResult> {
+                    let execution =
+                        backend.run(&item.branch_id, &item.bundle_dir, &item.resolved)?;
+                    let after_manifest = TreeManifest::capture(&item.rootfs_dir)?;
+                    let fs_diff = base_manifest.diff(&after_manifest);
+                    Ok(BranchExecutionResult {
+                        branch_id: item.branch_id.clone(),
+                        execution,
+                        fs_diff,
+                    })
+                }));
+            }
+
+            let mut out = Vec::with_capacity(handles.len());
+            let mut first_err: Option<BoxletError> = None;
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(branch_res)) => out.push(branch_res),
+                    Ok(Err(err)) => {
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                        }
+                    }
+                    Err(_) => {
+                        if first_err.is_none() {
+                            first_err = Some(BoxletError::Runtime {
+                                subsystem: "engine",
+                                message: "eval candidate execution worker thread panicked"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            if let Some(err) = first_err {
+                return Err(err);
+            }
+            Ok(out)
+        })?;
+
+        let verdicts: Vec<CandidateVerdict> = results
+            .into_iter()
+            .map(|branch_res| evaluate_candidate(&spec.rubric, branch_res))
+            .collect();
+
+        let winning_branch_id = select_winning_verdict(&verdicts).map(|v| v.branch_id.clone());
+
+        let mut promoted = false;
+        let mut promoted_diff = None;
+        if spec.promote_winner {
+            if let Some(ref win_id) = winning_branch_id {
+                if let Some(winner_prepared) = prepared.iter().find(|p| &p.branch_id == win_id) {
+                    let applied_diff = match snapshot
+                        .promote_branch(&winner_prepared.rootfs_dir, &source_rootfs)
+                    {
+                        Ok(diff) => diff,
+                        Err(err) => {
+                            if !is_pre_sync_divergence_error(&err) {
+                                let _ = snapshot.restore(&source_rootfs);
+                            }
+                            return Err(err);
+                        }
+                    };
+                    promoted = true;
+                    promoted_diff = Some(applied_diff);
+                }
+            }
+        }
+
+        if let Some(ref logger) = self.audit_logger {
+            let succeeded_count = verdicts.iter().filter(|v| v.passed_rubric).count();
+            logger.record(AuditEvent::BranchBatchCompleted {
+                branch_count: verdicts.len(),
+                succeeded_count,
+                promoted_branch_id: if promoted {
+                    winning_branch_id.clone()
+                } else {
+                    None
+                },
+                promoted_changes: promoted_diff.as_ref().map(FsDiff::total_changes),
+            })?;
+        }
+
+        Ok(EvalReport {
+            verdicts,
+            winning_branch_id,
+            promoted,
+            promoted_diff,
+        })
+    }
+}
+
+fn is_pre_sync_divergence_error(err: &BoxletError) -> bool {
+    matches!(
+        err,
+        BoxletError::StateStore { source, .. }
+            if source.kind() == std::io::ErrorKind::InvalidData
+    )
 }
 
 fn apply_branch_overrides(base_spec: &Spec, branch: &BranchSpec) -> Spec {
@@ -570,6 +744,7 @@ mod tests {
 
     use super::*;
     use crate::error::BoxletError;
+    use crate::eval::EvalRubric;
     use crate::oci::state::ContainerStatus;
     use crate::oci::OCI_RUNTIME_VERSION;
     use crate::policy::{
@@ -747,6 +922,23 @@ mod tests {
                         fs::write(&winner, b"winning patch\n").map_err(|source| {
                             BoxletError::StateStore {
                                 path: winner,
+                                source,
+                            }
+                        })?;
+                        exit_code = 0;
+                    }
+                    "eval-cand-1-action" => {
+                        let winner = rootfs.join("winner.txt");
+                        fs::write(&winner, b"cand-1 patch\n").map_err(|source| {
+                            BoxletError::StateStore {
+                                path: winner,
+                                source,
+                            }
+                        })?;
+                        let protected = rootfs.join("etc/protected.conf");
+                        fs::write(&protected, b"tampered=true\n").map_err(|source| {
+                            BoxletError::StateStore {
+                                path: protected,
                                 source,
                             }
                         })?;
@@ -1067,6 +1259,75 @@ mod tests {
                 removed_count: 2,
                 skipped_active_count: 0,
                 force: true,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn engine_run_eval_enforces_rubric_guardrails_and_promotes_winning_candidate() -> Result<()> {
+        let bundle = make_bundle()?;
+        let etc_dir = bundle.path().join("rootfs/etc");
+        fs::create_dir_all(&etc_dir).map_err(|source| BoxletError::StateStore {
+            path: etc_dir.clone(),
+            source,
+        })?;
+        let protected_path = etc_dir.join("protected.conf");
+        fs::write(&protected_path, b"immutable=1\n").map_err(|source| BoxletError::StateStore {
+            path: protected_path.clone(),
+            source,
+        })?;
+
+        let log_dir = tempfile::tempdir().map_err(|source| BoxletError::StateStore {
+            path: PathBuf::from("tempdir"),
+            source,
+        })?;
+        let logger = JsonlAuditLogger::new(log_dir.path().join("audit.jsonl"));
+        let engine = Engine::new(MockBackend::default()).with_audit_logger(logger.clone());
+
+        let eval_spec = EvalSpec {
+            policy: ExecutionPolicy::default(),
+            rubric: EvalRubric {
+                require_exit_zero: true,
+                required_stdout_contains: Vec::new(),
+                forbidden_stderr_contains: Vec::new(),
+                required_added_paths: vec![PathBuf::from("winner.txt")],
+                forbidden_modified_paths: vec![PathBuf::from("etc/protected.conf")],
+                max_changed_files: Some(2),
+            },
+            candidates: vec![
+                BranchSpec::new("cand-1").with_args(vec!["eval-cand-1-action".to_string()]),
+                BranchSpec::new("cand-2").with_args(vec!["branch-fail-action".to_string()]),
+                BranchSpec::new("cand-3").with_args(vec!["branch-win-action".to_string()]),
+            ],
+            promote_winner: true,
+        };
+
+        let report = engine.run_eval(bundle.path(), &eval_spec)?;
+        assert_eq!(report.verdicts.len(), 3);
+        assert!(!report.verdicts[0].passed_rubric);
+        assert!(!report.verdicts[1].passed_rubric);
+        assert!(report.verdicts[2].passed_rubric);
+        assert_eq!(report.winning_branch_id, Some("cand-3".to_string()));
+        assert!(report.promoted);
+
+        assert!(bundle.path().join("rootfs/winner.txt").exists());
+        let protected_after =
+            fs::read(&protected_path).map_err(|source| BoxletError::StateStore {
+                path: protected_path,
+                source,
+            })?;
+        assert_eq!(protected_after, b"immutable=1\n");
+
+        let records = logger.read_all()?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].event,
+            AuditEvent::BranchBatchCompleted {
+                branch_count: 3,
+                succeeded_count: 1,
+                promoted_branch_id: Some("cand-3".to_string()),
+                promoted_changes: Some(1),
             }
         );
         Ok(())

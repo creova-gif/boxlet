@@ -1,8 +1,10 @@
 //! Boxlet: Minimal Linux OCI-compatible container runtime and programmable execution core.
 
 pub mod audit;
+pub mod doctor;
 pub mod engine;
 pub mod error;
+pub mod eval;
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
 pub mod oci;
@@ -11,7 +13,9 @@ pub mod snapshot;
 pub mod traits;
 
 pub use audit::{AuditEvent, AuditRecord, AuditSummary, JsonlAuditLogger};
+pub use doctor::{run_doctor, DoctorCheck, DoctorReport, DoctorStatus};
 pub use engine::{BranchBatchReport, BranchExecutionResult, BranchSpec, Engine, PruneReport};
+pub use eval::{CandidateVerdict, EvalReport, EvalRubric, EvalSpec};
 #[cfg(target_os = "linux")]
 pub use linux::LinuxBackend;
 pub use oci::BundleBuilder;
