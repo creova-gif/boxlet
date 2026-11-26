@@ -8,8 +8,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use oci_spec::runtime::{
-    LinuxBuilder, LinuxNamespaceBuilder, LinuxNamespaceType, ProcessBuilder, RootBuilder, Spec,
-    SpecBuilder, UserBuilder,
+    LinuxBuilder, LinuxIdMappingBuilder, LinuxNamespaceBuilder, LinuxNamespaceType, ProcessBuilder,
+    RootBuilder, Spec, SpecBuilder, UserBuilder,
 };
 
 use crate::error::{BoxletError, Result};
@@ -32,6 +32,7 @@ pub struct BundleBuilder {
     hostname: String,
     readonly_rootfs: bool,
     busybox_path: Option<PathBuf>,
+    rootless_uid_gid: Option<(u32, u32)>,
 }
 
 impl Default for BundleBuilder {
@@ -54,6 +55,7 @@ impl BundleBuilder {
             hostname: "boxlet-sandbox".to_string(),
             readonly_rootfs: false,
             busybox_path: None,
+            rootless_uid_gid: None,
         }
     }
 
@@ -96,6 +98,24 @@ impl BundleBuilder {
     /// Copies a static `busybox` binary into `rootfs/bin/busybox` and populates standard applet symlinks.
     pub fn with_busybox(mut self, busybox_path: impl Into<PathBuf>) -> Self {
         self.busybox_path = Some(busybox_path.into());
+        self
+    }
+
+    /// Enables or disables rootless user namespace configuration (`CLONE_NEWUSER`)
+    /// mapping container root (`0:0`) to the current host effective UID/GID.
+    pub fn with_rootless(mut self, rootless: bool) -> Self {
+        if rootless {
+            self.rootless_uid_gid = Some(current_host_uid_gid());
+        } else {
+            self.rootless_uid_gid = None;
+        }
+        self
+    }
+
+    /// Configures rootless user namespace (`CLONE_NEWUSER`) with an explicit
+    /// single-user `0 -> host_uid` and `0 -> host_gid` mapping.
+    pub fn with_uid_gid_mapping(mut self, host_uid: u32, host_gid: u32) -> Self {
+        self.rootless_uid_gid = Some((host_uid, host_gid));
         self
     }
 
@@ -231,7 +251,7 @@ impl BundleBuilder {
             LinuxNamespaceType::Ipc,
             LinuxNamespaceType::Network,
         ];
-        let mut namespaces = Vec::with_capacity(namespace_types.len());
+        let mut namespaces = Vec::with_capacity(namespace_types.len() + 1);
         for ns_type in namespace_types {
             let ns = LinuxNamespaceBuilder::default()
                 .typ(ns_type)
@@ -242,9 +262,43 @@ impl BundleBuilder {
                 })?;
             namespaces.push(ns);
         }
+        if self.rootless_uid_gid.is_some() {
+            let user_ns = LinuxNamespaceBuilder::default()
+                .typ(LinuxNamespaceType::User)
+                .build()
+                .map_err(|source| BoxletError::OciSpec {
+                    path: config_path.clone(),
+                    source,
+                })?;
+            namespaces.push(user_ns);
+        }
 
-        let mut linux = LinuxBuilder::default()
-            .namespaces(namespaces)
+        let mut linux_builder = LinuxBuilder::default().namespaces(namespaces);
+        if let Some((host_uid, host_gid)) = self.rootless_uid_gid {
+            let uid_map = LinuxIdMappingBuilder::default()
+                .container_id(0u32)
+                .host_id(host_uid)
+                .size(1u32)
+                .build()
+                .map_err(|source| BoxletError::OciSpec {
+                    path: config_path.clone(),
+                    source,
+                })?;
+            let gid_map = LinuxIdMappingBuilder::default()
+                .container_id(0u32)
+                .host_id(host_gid)
+                .size(1u32)
+                .build()
+                .map_err(|source| BoxletError::OciSpec {
+                    path: config_path.clone(),
+                    source,
+                })?;
+            linux_builder = linux_builder
+                .uid_mappings(vec![uid_map])
+                .gid_mappings(vec![gid_map]);
+        }
+
+        let mut linux = linux_builder
             .build()
             .map_err(|source| BoxletError::OciSpec {
                 path: config_path.clone(),
@@ -273,6 +327,19 @@ impl BundleBuilder {
 
         Ok(spec)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn current_host_uid_gid() -> (u32, u32) {
+    (
+        nix::unistd::geteuid().as_raw(),
+        nix::unistd::getegid().as_raw(),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_host_uid_gid() -> (u32, u32) {
+    (1000, 1000)
 }
 
 fn reject_if_symlink(path: &Path) -> Result<()> {
@@ -440,6 +507,58 @@ mod tests {
             assert_eq!(sh_link, PathBuf::from("/bin/busybox"));
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn bundle_builder_with_uid_gid_mapping_configures_user_namespace() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|source| BoxletError::StateStore {
+            path: PathBuf::from("tempdir"),
+            source,
+        })?;
+        let bundle_dir = dir.path().join("rootless-bundle");
+        let spec = BundleBuilder::new()
+            .with_uid_gid_mapping(1000, 1000)
+            .build(&bundle_dir)?;
+
+        let linux = spec.linux().as_ref().ok_or_else(|| BoxletError::Runtime {
+            subsystem: "test",
+            message: "expected linux section in generated spec".to_string(),
+        })?;
+        let namespaces = linux
+            .namespaces()
+            .as_ref()
+            .ok_or_else(|| BoxletError::Runtime {
+                subsystem: "test",
+                message: "expected namespaces in generated spec".to_string(),
+            })?;
+        assert!(namespaces
+            .iter()
+            .any(|ns| ns.typ() == LinuxNamespaceType::User));
+
+        let uid_maps = linux
+            .uid_mappings()
+            .as_ref()
+            .ok_or_else(|| BoxletError::Runtime {
+                subsystem: "test",
+                message: "expected uid_mappings in generated spec".to_string(),
+            })?;
+        assert_eq!(uid_maps.len(), 1);
+        assert_eq!(uid_maps[0].container_id(), 0);
+        assert_eq!(uid_maps[0].host_id(), 1000);
+        assert_eq!(uid_maps[0].size(), 1);
+
+        let gid_maps = linux
+            .gid_mappings()
+            .as_ref()
+            .ok_or_else(|| BoxletError::Runtime {
+                subsystem: "test",
+                message: "expected gid_mappings in generated spec".to_string(),
+            })?;
+        assert_eq!(gid_maps.len(), 1);
+        assert_eq!(gid_maps[0].container_id(), 0);
+        assert_eq!(gid_maps[0].host_id(), 1000);
+        assert_eq!(gid_maps[0].size(), 1);
         Ok(())
     }
 }

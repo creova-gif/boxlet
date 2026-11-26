@@ -15,6 +15,7 @@
 - **ADR-006 (Container Inventory, Garbage Collection & Audit Analytics):** [ADR-006: Container Inventory, Garbage Collection, and Audit Analytics](docs/adr/006-container-inventory-prune-and-audit-analytics.md)
 - **ADR-007 (Host Readiness Diagnostics & Declarative Evaluation Rubrics):** [ADR-007: Host Readiness Diagnostics and Declarative Evaluation Rubrics](docs/adr/007-doctor-diagnostics-and-declarative-eval-rubrics.md)
 - **ADR-008 (MicroVM Backend & OCI Rootfs Tar Archives):** [ADR-008: MicroVM Backend and OCI Rootfs Tar Archives](docs/adr/008-microvm-backend-and-oci-image-archives.md)
+- **ADR-009 (Enterprise Hardening, Tamper-Evident Audit & Rootless Support):** [ADR-009: Enterprise Audit Hash Chaining, Worker Pool, and Rootless User Namespaces](docs/adr/009-enterprise-audit-hash-chaining-worker-pool-and-rootless.md)
 - **Threat Model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)
 - **Design Doc:** [docs/designs/boxlet-v1-oci-runtime.md](docs/designs/boxlet-v1-oci-runtime.md)
 - **Engineering Standards:** [AGENTS.md](AGENTS.md)
@@ -100,9 +101,9 @@ RUSTFLAGS="-C target-feature=+crt-static" \
   cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-### Zero-Config OCI Bundle Scaffolding (`boxlet init-bundle`)
+### Zero-Config OCI Bundle Scaffolding (`boxlet init-bundle` & `--rootless`)
 
-Scaffold a ready-to-run BusyBox OCI bundle directory (`config.json` + `rootfs/{bin,proc,dev,tmp,etc,var/tmp}` + applet symlinks) in a single command:
+Scaffold a ready-to-run BusyBox OCI bundle directory (`config.json` + `rootfs/{bin,proc,dev,tmp,etc,var/tmp}` + applet symlinks) in a single command, or pass `--rootless` (`BundleBuilder::with_rootless`) to scaffold an unprivileged user-namespace bundle (`CLONE_NEWUSER`) with `uidMappings` and `gidMappings` (`uid_map`, `gid_map`, `setgroups` `"deny"`):
 
 ```bash
 ./target/release/boxlet init-bundle \
@@ -111,16 +112,45 @@ Scaffold a ready-to-run BusyBox OCI bundle directory (`config.json` + `rootfs/{b
   --hostname "boxlet-sandbox" \
   --json \
   ./bundle
+
+# Scaffold a rootless user-namespace OCI bundle (CLONE_NEWUSER + uidMappings/gidMappings)
+./target/release/boxlet init-bundle \
+  --rootless \
+  --busybox /bin/busybox \
+  --cmd "id -u" \
+  --json \
+  ./rootless-bundle
 ```
 
-### Structured JSONL Audit Trail (`--audit-log <PATH>`)
+### Tamper-Evident Hash-Chained Audit Ledger & Prometheus/OpenMetrics Export (`--audit-log <PATH>`, `boxlet audit --prometheus`)
 
-Pass the global `--audit-log <PATH>` flag to record every lifecycle operation (`container_run_completed`, `branch_batch_completed`, `snapshot_created`, `workspace_restored`, `oci_lifecycle`) as an append-only, `flock`-synchronized JSON Lines record with `0600` permissions:
+Pass the global `--audit-log <PATH>` flag to record every lifecycle operation (`container_run_completed`, `branch_batch_completed`, `snapshot_created`, `workspace_restored`, `oci_lifecycle`) as an append-only, `flock`-synchronized (`File::lock()`) JSON Lines record with `0600` permissions, monotonic sequence number (`seq`), and 64-bit FNV-1a hash chain (`prev_hash_fnv1a64`, `record_hash_fnv1a64`):
 
 ```bash
-sudo ./target/release/boxlet --audit-log /var/log/boxlet-audit.jsonl run \
+sudo ./target/release/boxlet --audit-log /var/log/boxlet/audit.jsonl run \
   --memory 128m \
   --network none \
+  --json \
+  ./bundle
+
+# Verify cryptographic FNV-1a hash-chain integrity (hash_chain_valid) and summarize telemetry
+sudo ./target/release/boxlet audit --file /var/log/boxlet/audit.jsonl --json
+
+# Export audit & execution telemetry in Prometheus / OpenMetrics text-exposition format
+sudo ./target/release/boxlet audit --file /var/log/boxlet/audit.jsonl --prometheus
+```
+
+### Bounded Concurrency Worker Pool (`--max-concurrency <N>` / `ExecutionPolicy::max_concurrency`)
+
+Throttle parallel multi-agent sandbox fan-out in `boxlet branch-run` and `boxlet eval` using a bounded worker pool (`--max-concurrency <N>` / `ExecutionPolicy::max_concurrency`) to prevent host CPU/memory saturation on high-branch-count evaluations:
+
+```bash
+sudo ./target/release/boxlet branch-run \
+  --max-concurrency 2 \
+  --memory 128m \
+  --network none \
+  --cmd "echo candidate-1 > /tmp/c1.txt" \
+  --cmd "echo candidate-2 > /tmp/c2.txt" \
   --json \
   ./bundle
 ```
@@ -224,9 +254,9 @@ Synthesize deterministic **AWS Firecracker** (`FirecrackerVmSpec`) or **`libkrun
   ./bundle
 ```
 
-### Run the End-to-End 18-Check V1–V5 Demo Script
+### Run the End-to-End 20-Check V1–V6 Demo Script
 
-On a Linux 5.15+ host with `busybox` (`busybox-static`) and `python3` installed, run the self-contained 18-check verification demo covering normal execution, `memory.max` OOM-kill telemetry (`oom_killed: true`), fail-closed seccomp/capability enforcement, zero-leak cleanup, V2 workspace snapshots/diffs, parallel multi-agent branch execution, winner promotion/rollback, OCI bundle scaffolding, container inventory/garbage collection (`list`/`prune`), JSONL audit log analytics (`audit --file`), host readiness diagnostics (`doctor`), declarative rubric evaluation (`eval --spec`), OCI rootfs tar archive export/import round-trip (`image-export`/`image-import`), and Firecracker/`libkrun` MicroVM specification synthesis (`microvm-config`):
+On a Linux 5.15+ host with `busybox` (`busybox-static`) and `python3` installed, run the self-contained 20/20 check verification demo covering normal execution, `memory.max` OOM-kill telemetry (`oom_killed: true`), fail-closed seccomp/capability enforcement, zero-leak cleanup, V2 workspace snapshots/diffs, parallel multi-agent branch execution, winner promotion/rollback, OCI bundle scaffolding, container inventory/garbage collection (`list`/`prune`), JSONL audit log analytics (`audit --file`), host readiness diagnostics (`doctor`), declarative rubric evaluation (`eval --spec`), OCI rootfs tar archive export/import round-trip (`image-export`/`image-import`), Firecracker/`libkrun` MicroVM specification synthesis (`microvm-config`), bounded worker-pool concurrency (`branch-run --max-concurrency`) + rootless user-namespace bundle scaffolding (`init-bundle --rootless`), and tamper-evident hash-chained audit verification + Prometheus metrics export (`audit --file ... --prometheus`):
 
 ```bash
 sudo ./scripts/demo-v1.sh ./target/release/boxlet
@@ -484,6 +514,8 @@ For the full trust-boundary diagram, threat matrix, and residual risk analysis, 
 | **Milestone 8 (V4)** | Host kernel/environment readiness diagnostics (`boxlet doctor`) and declarative multi-agent evaluation specs with forbidden-path guardrails & rubric scoring (`boxlet eval --spec`) ([ADR-007](docs/adr/007-doctor-diagnostics-and-declarative-eval-rubrics.md)) | **Shipped** |
 | **Milestone 9 (V5)** | Hardware-virtualized MicroVM `RuntimeBackend` adapters (`MicroVmBackend`, `FirecrackerVmSpec`, `LibkrunVmSpec`, `boxlet microvm-config`) for hostile multi-tenant workloads ([ADR-008](docs/adr/008-microvm-backend-and-oci-image-archives.md)) | **Shipped** |
 | **Milestone 10 (V5)** | Deterministic OCI rootfs tar archive export & fail-closed import (`export_rootfs_tar`, `import_rootfs_tar`, `RootfsArchiveReport`, `boxlet image-export`, `boxlet image-import`) ([ADR-008](docs/adr/008-microvm-backend-and-oci-image-archives.md)) | **Shipped** |
+| **Milestone 11 (V6)** | Tamper-evident FNV-1a hash-chained JSONL audit ledger (`seq`, `prev_hash_fnv1a64`, `record_hash_fnv1a64`, `hash_chain_valid`), Prometheus/OpenMetrics exporter (`boxlet audit --prometheus`, `AuditSummary::to_prometheus_text`), and bounded worker-pool concurrency (`--max-concurrency`, `ExecutionPolicy::max_concurrency`) ([ADR-009](docs/adr/009-enterprise-audit-hash-chaining-worker-pool-and-rootless.md)) | **Shipped** |
+| **Milestone 12 (V6)** | Rootless Linux user-namespace scaffolding & runtime mapping (`boxlet init-bundle --rootless`, `BundleBuilder::with_rootless`, `CLONE_NEWUSER`, `/proc/self/setgroups` `"deny"`, `uid_map`/`gid_map`) ([ADR-009](docs/adr/009-enterprise-audit-hash-chaining-worker-pool-and-rootless.md)) | **Shipped** |
 
 ---
 
@@ -508,6 +540,7 @@ For the full trust-boundary diagram, threat matrix, and residual risk analysis, 
 | `timeout` | `--timeout <SECONDS>` | `None` | Wall-clock execution timeout before `cgroup.kill` teardown |
 | `max_output_bytes` | `--max-output-bytes <BYTES>` | `1048576` (1 MiB) | Maximum captured bytes per stream (`stdout` / `stderr`) |
 | `no_new_privileges` | *(enabled in `run`)* | `true` | Enforces `PR_SET_NO_NEW_PRIVS` before `execve` |
+| `max_concurrency` | `--max-concurrency <N>` | `None` (unbounded) | Maximum concurrent worker threads for `branch-run` and `eval` |
 
 ### `EvalRubric` Fields (`boxlet eval --spec <FILE>`)
 

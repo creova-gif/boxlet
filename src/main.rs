@@ -102,6 +102,9 @@ enum Commands {
         /// Emit the `AuditSummary` as JSON to stdout.
         #[arg(long)]
         json: bool,
+        /// Emit the summary in Prometheus / OpenMetrics text exposition format.
+        #[arg(long, conflicts_with = "json")]
+        prometheus: bool,
     },
     /// Run host preflight diagnostics for Linux namespaces, cgroup v2, and state directories.
     Doctor {
@@ -114,6 +117,9 @@ enum Commands {
         /// Path to the JSON `EvalSpec` file.
         #[arg(long)]
         spec: PathBuf,
+        /// Override maximum number of candidate branches to execute concurrently.
+        #[arg(long)]
+        max_concurrency: Option<usize>,
         /// Override `promote_winner = true` to promote the winning candidate back to the bundle rootfs.
         #[arg(long)]
         promote_winner: bool,
@@ -222,6 +228,9 @@ enum Commands {
         /// Maximum bytes captured per stream (`stdout` and `stderr`) per branch.
         #[arg(long)]
         max_output_bytes: Option<usize>,
+        /// Maximum number of branches to execute concurrently.
+        #[arg(long)]
+        max_concurrency: Option<usize>,
         /// Promote the first passing branch (`exit_code == 0`, no violations) back onto the bundle rootfs.
         #[arg(long)]
         promote_winner: bool,
@@ -248,6 +257,9 @@ enum Commands {
         /// Mark the root filesystem read-only in `config.json`.
         #[arg(long)]
         readonly: bool,
+        /// Configure rootless user namespace (`CLONE_NEWUSER`) mapping container root (0:0) to the current host UID/GID.
+        #[arg(long)]
+        rootless: bool,
         /// Emit a JSON summary of the generated bundle to stdout.
         #[arg(long)]
         json: bool,
@@ -417,6 +429,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             hostname,
             cwd,
             readonly,
+            rootless,
             json,
             bundle,
         } => {
@@ -424,7 +437,8 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 .with_shell_command(cmd)
                 .with_hostname(hostname)
                 .with_cwd(cwd)
-                .with_readonly_rootfs(readonly);
+                .with_readonly_rootfs(readonly)
+                .with_rootless(rootless);
             if let Some(bb) = busybox {
                 builder = builder.with_busybox(bb);
             }
@@ -447,17 +461,24 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Audit { file, json } => {
+        Commands::Audit {
+            file,
+            json,
+            prometheus,
+        } => {
             let summary = JsonlAuditLogger::new(&file).summarize()?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else if prometheus {
+                println!("{}", summary.to_prometheus_metrics());
             } else {
                 println!(
-                    "records={} runs={} batches={} chronological_valid={}",
+                    "records={} runs={} batches={} chronological_valid={} hash_chain_valid={}",
                     summary.total_records,
                     summary.runs_completed,
                     summary.branch_batches_completed,
-                    summary.chronological_valid
+                    summary.chronological_valid,
+                    summary.hash_chain_valid
                 );
             }
             Ok(ExitCode::SUCCESS)
@@ -692,11 +713,12 @@ fn dispatch_platform(
             network,
             timeout,
             max_output_bytes,
+            max_concurrency,
             promote_winner,
             json,
             bundle,
         } => {
-            let policy = build_execution_policy(
+            let mut policy = build_execution_policy(
                 memory.as_deref(),
                 cpus,
                 pids,
@@ -704,6 +726,7 @@ fn dispatch_platform(
                 timeout,
                 max_output_bytes,
             )?;
+            policy.max_concurrency = max_concurrency;
             let prefix = generate_container_id();
             let specs: Vec<BranchSpec> = cmds
                 .into_iter()
@@ -770,11 +793,15 @@ fn dispatch_platform(
         }
         Commands::Eval {
             spec,
+            max_concurrency,
             promote_winner,
             json,
             bundle,
         } => {
             let mut eval_spec = boxlet::EvalSpec::load(&spec)?;
+            if let Some(mc) = max_concurrency {
+                eval_spec.policy.max_concurrency = Some(mc);
+            }
             if promote_winner {
                 eval_spec.promote_winner = true;
             }
@@ -1051,6 +1078,7 @@ mod tests {
             "init-bundle",
             "--cmd",
             "echo hi",
+            "--rootless",
             "--json",
             bundle_dir.to_str().unwrap_or_default(),
         ])
@@ -1061,6 +1089,12 @@ mod tests {
         assert_eq!(dispatch(init_cli)?, ExitCode::SUCCESS);
         assert!(bundle_dir.join("config.json").exists());
         assert!(bundle_dir.join("rootfs").is_dir());
+        let loaded_spec = boxlet::oci::load_bundle_spec(&bundle_dir)?;
+        assert!(loaded_spec
+            .linux()
+            .as_ref()
+            .and_then(|l| l.uid_mappings().as_ref())
+            .is_some());
         Ok(())
     }
 
@@ -1096,6 +1130,19 @@ mod tests {
         })?;
 
         assert_eq!(dispatch(audit_cli)?, ExitCode::SUCCESS);
+
+        let prom_cli = Cli::try_parse_from([
+            "boxlet",
+            "audit",
+            "--file",
+            audit_path.to_str().unwrap_or_default(),
+            "--prometheus",
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+        assert_eq!(dispatch(prom_cli)?, ExitCode::SUCCESS);
+
         let summary = logger.summarize()?;
         assert_eq!(summary.total_records, 2);
         assert_eq!(summary.branch_batches_completed, 1);

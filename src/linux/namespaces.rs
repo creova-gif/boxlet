@@ -1,5 +1,7 @@
 //! Linux namespace unsharing, UTS hostname configuration, and loopback (`lo`) activation.
 
+use std::fs;
+
 use nix::sched::{unshare, CloneFlags};
 use nix::unistd::sethostname;
 use oci_spec::runtime::{LinuxNamespaceType, Spec};
@@ -23,6 +25,7 @@ pub(crate) fn build_unshare_flags(
                 LinuxNamespaceType::Ipc => flags |= CloneFlags::CLONE_NEWIPC,
                 LinuxNamespaceType::Network => flags |= CloneFlags::CLONE_NEWNET,
                 LinuxNamespaceType::Cgroup => flags |= CloneFlags::CLONE_NEWCGROUP,
+                LinuxNamespaceType::User => flags |= CloneFlags::CLONE_NEWUSER,
                 _ => {}
             }
         }
@@ -52,6 +55,83 @@ pub(crate) fn unshare_namespaces(flags: CloneFlags) -> Result<()> {
         subsystem: "namespaces",
         message: format!("unshare({flags:?}) failed: {err}"),
     })
+}
+
+/// Configures `/proc/self/setgroups`, `/proc/self/uid_map`, and `/proc/self/gid_map`
+/// after `unshare(CLONE_NEWUSER)` so the unprivileged host caller maps cleanly to
+/// container UID/GID `0:0`.
+pub(crate) fn apply_user_namespace_mappings(
+    spec: &Spec,
+    flags: CloneFlags,
+    host_euid: u32,
+    host_egid: u32,
+) -> Result<()> {
+    if !flags.contains(CloneFlags::CLONE_NEWUSER) {
+        return Ok(());
+    }
+
+    if let Err(err) = fs::write("/proc/self/setgroups", b"deny") {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(BoxletError::Runtime {
+                subsystem: "namespaces",
+                message: format!("failed to write 'deny' to /proc/self/setgroups: {err}"),
+            });
+        }
+    }
+
+    let uid_map_body = match spec
+        .linux()
+        .as_ref()
+        .and_then(|l| l.uid_mappings().as_ref())
+    {
+        Some(mappings) if !mappings.is_empty() => {
+            let mut buf = String::new();
+            for m in mappings {
+                buf.push_str(&format!(
+                    "{} {} {}\n",
+                    m.container_id(),
+                    m.host_id(),
+                    m.size()
+                ));
+            }
+            buf
+        }
+        _ => format!("0 {host_euid} 1\n"),
+    };
+    fs::write("/proc/self/uid_map", uid_map_body.as_bytes()).map_err(|err| {
+        BoxletError::Runtime {
+            subsystem: "namespaces",
+            message: format!("failed to write /proc/self/uid_map: {err}"),
+        }
+    })?;
+
+    let gid_map_body = match spec
+        .linux()
+        .as_ref()
+        .and_then(|l| l.gid_mappings().as_ref())
+    {
+        Some(mappings) if !mappings.is_empty() => {
+            let mut buf = String::new();
+            for m in mappings {
+                buf.push_str(&format!(
+                    "{} {} {}\n",
+                    m.container_id(),
+                    m.host_id(),
+                    m.size()
+                ));
+            }
+            buf
+        }
+        _ => format!("0 {host_egid} 1\n"),
+    };
+    fs::write("/proc/self/gid_map", gid_map_body.as_bytes()).map_err(|err| {
+        BoxletError::Runtime {
+            subsystem: "namespaces",
+            message: format!("failed to write /proc/self/gid_map: {err}"),
+        }
+    })?;
+
+    Ok(())
 }
 
 /// Sets the container UTS hostname when configured in the OCI spec.
@@ -123,5 +203,22 @@ mod tests {
         let host_flags = build_unshare_flags(&spec, Some(NetworkMode::Host));
         assert!(!host_flags.contains(CloneFlags::CLONE_NEWNET));
         assert!(host_flags.contains(CloneFlags::CLONE_NEWPID));
+    }
+
+    #[test]
+    fn build_unshare_flags_includes_user_namespace_when_configured() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|source| BoxletError::StateStore {
+            path: std::path::PathBuf::from("tempdir"),
+            source,
+        })?;
+        let bundle_dir = dir.path().join("bundle");
+        let spec = crate::oci::BundleBuilder::new()
+            .with_uid_gid_mapping(1000, 1000)
+            .build(&bundle_dir)?;
+
+        let flags = build_unshare_flags(&spec, None);
+        assert!(flags.contains(CloneFlags::CLONE_NEWUSER));
+        assert!(flags.contains(CloneFlags::CLONE_NEWPID));
+        Ok(())
     }
 }
