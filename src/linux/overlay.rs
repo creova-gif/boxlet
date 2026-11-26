@@ -7,8 +7,6 @@
 //!   by walking only the writable `upperdir` and interpreting Linux `overlayfs` whiteout
 //!   character devices (`c 0:0`) and `.wh.<name>` markers without re-scanning `lowerdir`.
 
-#![allow(dead_code)]
-
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};

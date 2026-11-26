@@ -692,4 +692,83 @@ assert_zero_leaks "eval-cand-tamper"
 assert_zero_leaks "eval-cand-fail"
 assert_zero_leaks "eval-cand-clean"
 
-echo "==> All 16 Boxlet V1–V4 end-to-end checks passed with zero leaked cgroups or state directories!"
+# ------------------------------------------------------------------------------
+# Check 17: Rootfs Tar Archive Export & Import Round-Trip (boxlet image-export + boxlet image-import)
+# ------------------------------------------------------------------------------
+echo "==> [Check 17] Rootfs Tar Archive Export & Import Round-Trip (boxlet image-export + boxlet image-import)"
+"$BOXLET_BIN" image-export \
+  --rootfs "$WORK_DIR/scaffolded-bundle/rootfs" \
+  --out "$WORK_DIR/rootfs.tar" \
+  --json > "$WORK_DIR/check17-export.json"
+
+"$BOXLET_BIN" image-import \
+  --archive "$WORK_DIR/rootfs.tar" \
+  --out "$WORK_DIR/imported-rootfs" \
+  --json > "$WORK_DIR/check17-import.json"
+
+"$BOXLET_BIN" diff \
+  --json \
+  "$WORK_DIR/scaffolded-bundle/rootfs" \
+  "$WORK_DIR/imported-rootfs" > "$WORK_DIR/check17-diff.json"
+
+python3 - "$WORK_DIR/check17-export.json" "$WORK_DIR/check17-import.json" "$WORK_DIR/check17-diff.json" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    exp = json.load(f)
+with open(sys.argv[2]) as f:
+    imp = json.load(f)
+with open(sys.argv[3]) as f:
+    diff = json.load(f)
+
+assert exp.get("entry_count", 0) > 0, f"expected export entry_count > 0, got {exp}"
+assert imp.get("entry_count") == exp.get("entry_count"), f"entry_count mismatch: exp={exp}, imp={imp}"
+assert imp.get("archive_fnv1a64") == exp.get("archive_fnv1a64"), f"digest mismatch: exp={exp}, imp={imp}"
+assert diff.get("added") == [], f"expected empty added in round-trip diff, got {diff}"
+assert diff.get("modified") == [], f"expected empty modified in round-trip diff, got {diff}"
+assert diff.get("deleted") == [], f"expected empty deleted in round-trip diff, got {diff}"
+print(
+    f"    image round-trip verified: entry_count={exp['entry_count']}, "
+    f"archive_fnv1a64={exp['archive_fnv1a64']}, diff=empty"
+)
+PY
+
+# ------------------------------------------------------------------------------
+# Check 18: MicroVM Specification Synthesis (boxlet microvm-config for Firecracker & libkrun)
+# ------------------------------------------------------------------------------
+echo "==> [Check 18] MicroVM Specification Synthesis (boxlet microvm-config for Firecracker & libkrun)"
+"$BOXLET_BIN" microvm-config \
+  --driver firecracker \
+  --id vm-fc-1 \
+  --mem-mib 256 \
+  --vcpus 2 \
+  "$WORK_DIR/scaffolded-bundle" > "$WORK_DIR/check18-fc.json"
+
+"$BOXLET_BIN" microvm-config \
+  --driver libkrun \
+  --id vm-krun-1 \
+  --mem-mib 256 \
+  --vcpus 2 \
+  "$WORK_DIR/scaffolded-bundle" > "$WORK_DIR/check18-krun.json"
+
+python3 - "$WORK_DIR/check18-fc.json" "$WORK_DIR/check18-krun.json" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    fc = json.load(f)
+with open(sys.argv[2]) as f:
+    krun = json.load(f)
+
+assert fc.get("sandbox_id") == "vm-fc-1", f"expected fc sandbox_id=='vm-fc-1', got {fc}"
+assert fc.get("mem_size_mib") == 256, f"expected fc mem_size_mib==256, got {fc}"
+assert fc.get("vcpu_count") == 2, f"expected fc vcpu_count==2, got {fc}"
+assert krun.get("sandbox_id") == "vm-krun-1", f"expected krun sandbox_id=='vm-krun-1', got {krun}"
+assert krun.get("ram_mib") == 256, f"expected krun ram_mib==256, got {krun}"
+assert krun.get("num_vcpus") == 2, f"expected krun num_vcpus==2, got {krun}"
+print(
+    f"    microvm specs verified: firecracker(id={fc['sandbox_id']}, vcpus={fc['vcpu_count']}, mem={fc['mem_size_mib']}MiB), "
+    f"libkrun(id={krun['sandbox_id']}, vcpus={krun['num_vcpus']}, ram={krun['ram_mib']}MiB)"
+)
+PY
+
+echo "==> All 18 Boxlet V1–V5 end-to-end checks passed with zero leaked cgroups or state directories!"

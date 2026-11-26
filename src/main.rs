@@ -254,6 +254,56 @@ enum Commands {
         /// Target directory where `<bundle>/config.json` and `<bundle>/rootfs` will be created.
         bundle: PathBuf,
     },
+    /// Export a rootfs directory into a deterministic POSIX USTAR `.tar` archive.
+    ImageExport {
+        /// Source rootfs directory to archive.
+        #[arg(long)]
+        rootfs: PathBuf,
+        /// Output `.tar` archive file path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Emit the `RootfsArchiveReport` as JSON to stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import a POSIX USTAR `.tar` archive into a target rootfs directory with path-traversal protection.
+    ImageImport {
+        /// Input `.tar` archive file path.
+        #[arg(long)]
+        archive: PathBuf,
+        /// Target rootfs directory to populate.
+        #[arg(long)]
+        out: PathBuf,
+        /// Emit the `RootfsArchiveReport` as JSON to stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Generate a validated Firecracker or `libkrun` microVM configuration from an OCI bundle.
+    MicrovmConfig {
+        /// VMM driver target (`firecracker` or `libkrun`).
+        #[arg(long, default_value = "firecracker")]
+        driver: String,
+        /// Sandbox identifier.
+        #[arg(long, default_value = "microvm-1")]
+        id: String,
+        /// Guest kernel image path (`vmlinux`) for Firecracker.
+        #[arg(long, default_value = "/var/lib/boxlet/vmlinux")]
+        kernel: PathBuf,
+        /// Optional guest initrd path.
+        #[arg(long)]
+        initrd: Option<PathBuf>,
+        /// Guest memory size in MiB (or overridden via `--memory`).
+        #[arg(long, default_value_t = 128)]
+        mem_mib: u64,
+        /// Guest vCPU count.
+        #[arg(long, default_value_t = 1)]
+        vcpus: u8,
+        /// Optional output file path for the generated JSON config (prints to stdout if omitted).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Path to the OCI bundle directory containing `config.json`.
+        bundle: PathBuf,
+    },
     /// Hidden internal self-re-exec container init stage.
     #[command(name = "__init", hide = true)]
     InternalInit {
@@ -431,6 +481,90 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             } else {
                 Ok(ExitCode::FAILURE)
             }
+        }
+        Commands::ImageExport { rootfs, out, json } => {
+            let report = boxlet::export_rootfs_tar(&rootfs, &out)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "exported rootfs={} archive={} entries={} bytes={} fnv1a64={:#018x}",
+                    report.rootfs_path.display(),
+                    report.archive_path.display(),
+                    report.entry_count,
+                    report.total_file_bytes,
+                    report.archive_fnv1a64
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::ImageImport { archive, out, json } => {
+            let report = boxlet::import_rootfs_tar(&archive, &out)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "imported archive={} rootfs={} entries={} bytes={} fnv1a64={:#018x}",
+                    report.archive_path.display(),
+                    report.rootfs_path.display(),
+                    report.entry_count,
+                    report.total_file_bytes,
+                    report.archive_fnv1a64
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::MicrovmConfig {
+            driver,
+            id,
+            kernel,
+            initrd,
+            mem_mib,
+            vcpus,
+            out,
+            bundle,
+        } => {
+            let vmm_driver: boxlet::VmmDriver = driver.parse()?;
+            let spec = boxlet::oci::load_bundle_spec(&bundle)?;
+            let vm_cfg = boxlet::MicroVmConfig {
+                driver: vmm_driver,
+                kernel_image_path: kernel,
+                initrd_path: initrd,
+                vcpu_count: vcpus,
+                mem_size_mib: mem_mib,
+                ..boxlet::MicroVmConfig::default()
+            };
+            let rendered = match vmm_driver {
+                boxlet::VmmDriver::Firecracker => {
+                    let fc_spec = vm_cfg.build_firecracker_spec(&id, &bundle, &spec, None)?;
+                    serde_json::to_string_pretty(&fc_spec)?
+                }
+                boxlet::VmmDriver::Libkrun => {
+                    let lk_spec = vm_cfg.build_libkrun_spec(&id, &bundle, &spec, None)?;
+                    serde_json::to_string_pretty(&lk_spec)?
+                }
+            };
+            if let Some(out_path) = out {
+                if let Some(parent) = out_path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent).map_err(|source| {
+                            BoxletError::StateStore {
+                                path: parent.to_path_buf(),
+                                source,
+                            }
+                        })?;
+                    }
+                }
+                std::fs::write(&out_path, format!("{rendered}\n")).map_err(|source| {
+                    BoxletError::StateStore {
+                        path: out_path,
+                        source,
+                    }
+                })?;
+            } else {
+                println!("{rendered}");
+            }
+            Ok(ExitCode::SUCCESS)
         }
         other => dispatch_platform(
             cli.root,
@@ -672,6 +806,9 @@ fn dispatch_platform(
         | Commands::Diff { .. }
         | Commands::Restore { .. }
         | Commands::InitBundle { .. }
+        | Commands::ImageExport { .. }
+        | Commands::ImageImport { .. }
+        | Commands::MicrovmConfig { .. }
         | Commands::Audit { .. }
         | Commands::Doctor { .. }
         | Commands::InternalInit { .. } => Ok(ExitCode::SUCCESS),
@@ -998,6 +1135,105 @@ mod tests {
 
         assert_eq!(dispatch(doctor_cli)?, expected_code);
         assert!(!expected_report.checks.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn cli_image_export_import_and_microvm_config_execute_portably() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|source| BoxletError::StateStore {
+            path: PathBuf::from("tempdir"),
+            source,
+        })?;
+        let bundle_dir = tmp.path().join("vm-bundle");
+        BundleBuilder::new()
+            .with_shell_command("echo vm-ready")
+            .build(&bundle_dir)?;
+
+        let rootfs_src = bundle_dir.join("rootfs");
+        std::fs::write(rootfs_src.join("etc/agent.conf"), b"mode=microvm\n").map_err(|source| {
+            BoxletError::StateStore {
+                path: rootfs_src.join("etc/agent.conf"),
+                source,
+            }
+        })?;
+
+        let tar_path = tmp.path().join("rootfs.tar");
+        let export_cli = Cli::try_parse_from([
+            "boxlet",
+            "image-export",
+            "--rootfs",
+            rootfs_src.to_str().unwrap_or_default(),
+            "--out",
+            tar_path.to_str().unwrap_or_default(),
+            "--json",
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+        assert_eq!(dispatch(export_cli)?, ExitCode::SUCCESS);
+        assert!(tar_path.is_file());
+
+        let imported_rootfs = tmp.path().join("imported-rootfs");
+        let import_cli = Cli::try_parse_from([
+            "boxlet",
+            "image-import",
+            "--archive",
+            tar_path.to_str().unwrap_or_default(),
+            "--out",
+            imported_rootfs.to_str().unwrap_or_default(),
+            "--json",
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+        assert_eq!(dispatch(import_cli)?, ExitCode::SUCCESS);
+        let imported_conf = std::fs::read_to_string(imported_rootfs.join("etc/agent.conf"))
+            .map_err(|source| BoxletError::StateStore {
+                path: imported_rootfs.join("etc/agent.conf"),
+                source,
+            })?;
+        assert_eq!(imported_conf, "mode=microvm\n");
+
+        let fc_out = tmp.path().join("firecracker.json");
+        let fc_cli = Cli::try_parse_from([
+            "boxlet",
+            "microvm-config",
+            "--driver",
+            "firecracker",
+            "--id",
+            "vm-test-1",
+            "--mem-mib",
+            "256",
+            "--vcpus",
+            "2",
+            "--out",
+            fc_out.to_str().unwrap_or_default(),
+            bundle_dir.to_str().unwrap_or_default(),
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+        assert_eq!(dispatch(fc_cli)?, ExitCode::SUCCESS);
+        assert!(fc_out.is_file());
+
+        let lk_out = tmp.path().join("libkrun.json");
+        let lk_cli = Cli::try_parse_from([
+            "boxlet",
+            "microvm-config",
+            "--driver",
+            "libkrun",
+            "--id",
+            "vm-test-2",
+            "--out",
+            lk_out.to_str().unwrap_or_default(),
+            bundle_dir.to_str().unwrap_or_default(),
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+        assert_eq!(dispatch(lk_cli)?, ExitCode::SUCCESS);
+        assert!(lk_out.is_file());
+
         Ok(())
     }
 }
