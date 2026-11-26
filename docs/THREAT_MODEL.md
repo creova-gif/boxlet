@@ -75,7 +75,17 @@
 
 ---
 
-## 5. Residual Risks & Explicit Non-Goals (V1)
+## 5. V7 Storage & Block I/O Isolation Invariants (`io.max` & OCI Image Layout Whiteouts)
+
+1. **Fail-Closed Cgroup v2 `io.max` Block I/O Throttling (`src/policy.rs`, `src/linux/cgroup.rs`):**
+   - `IoMaxRule::parse()` validates major:minor device numbers (`major > 0`) and requires at least one positive bandwidth (`rbps`, `wbps`) or IOPS (`riops`, `wiops`) limit, rejecting zero limits (`rbps=0`), unknown keys, or empty rule strings with `BoxletError::InvalidPolicy` before any container process is spawned.
+   - On Linux, `CgroupV2::apply_limits()` enables `+io` in parent `cgroup.subtree_control` and writes each formatted `IoMaxRule::to_cgroup_line()` (`<MAJ>:<MIN> rbps=... wbps=... riops=... wiops=...`) to the container's `io.max` control file to prevent noisy-neighbor disk bandwidth or IOPS exhaustion ([ADR-010](adr/010-cgroup-io-max-and-oci-image-layout.md)).
+2. **Fail-Closed Multi-Layer OCI Image Layout Unpacking & Whiteout Sanitization (`src/image.rs`):**
+   - `unpack_oci_image_layout()` verifies `oci-layout` (`imageLayoutVersion == "1.0.0"`), validates every layer blob's 16-hex-character `fnv1a64` digest against its actual content hash before extraction, and rejects any `.wh.<target>` whiteout marker containing `/`, `..`, or empty target names so malicious layers cannot delete files outside their parent directory.
+
+---
+
+## 6. Residual Risks & Explicit Non-Goals (V1)
 
 1. **Shared host kernel exploits (residual risk):** A Linux kernel vulnerability triggered by an allowed syscall can break out of namespaces and seccomp. V1 accepts this boundary for single-host dev/test environments; hostile multi-tenant isolation is deferred to a future microVM `RuntimeBackend` (Firecracker / `libkrun`).
 2. **Root execution requirement (non-goal in V1):** V1 requires `root` on a dedicated Linux 5.15+ host/VM. Rootless user-namespace containers are explicitly excluded from V1 to avoid premature complexity and false security claims.

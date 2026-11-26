@@ -50,6 +50,149 @@ pub enum SeccompPolicy {
     Disabled,
 }
 
+/// Per-device cgroup v2 `io.max` bandwidth (bytes/sec) and IOPS throttle rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IoMaxRule {
+    /// Block device major number (e.g. `8` for SCSI/SATA, `259` for NVMe).
+    pub major: u32,
+    /// Block device minor number (e.g. `0`).
+    pub minor: u32,
+    /// Maximum read bytes per second (`rbps`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rbps: Option<u64>,
+    /// Maximum write bytes per second (`wbps`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wbps: Option<u64>,
+    /// Maximum read I/O operations per second (`riops`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub riops: Option<u64>,
+    /// Maximum write I/O operations per second (`wiops`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wiops: Option<u64>,
+}
+
+impl IoMaxRule {
+    /// Validates that at least one limit is set and all set limits are strictly positive.
+    pub fn validate(&self) -> Result<()> {
+        if self.rbps.is_none()
+            && self.wbps.is_none()
+            && self.riops.is_none()
+            && self.wiops.is_none()
+        {
+            return Err(BoxletError::InvalidPolicy {
+                reason: "io.max rule must specify at least one of rbps, wbps, riops, or wiops"
+                    .to_string(),
+            });
+        }
+        if matches!(self.rbps, Some(0))
+            || matches!(self.wbps, Some(0))
+            || matches!(self.riops, Some(0))
+            || matches!(self.wiops, Some(0))
+        {
+            return Err(BoxletError::InvalidPolicy {
+                reason: "io.max limits must be greater than 0".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Formats this rule as a single cgroup v2 `io.max` line (without trailing newline).
+    pub fn to_cgroup_line(&self) -> String {
+        let fmt_opt = |opt: Option<u64>| match opt {
+            Some(v) => v.to_string(),
+            None => "max".to_string(),
+        };
+        format!(
+            "{}:{} rbps={} wbps={} riops={} wiops={}",
+            self.major,
+            self.minor,
+            fmt_opt(self.rbps),
+            fmt_opt(self.wbps),
+            fmt_opt(self.riops),
+            fmt_opt(self.wiops),
+        )
+    }
+}
+
+impl FromStr for IoMaxRule {
+    type Err = BoxletError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let mut tokens = s
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|t| !t.is_empty());
+
+        let dev_token = tokens.next().ok_or_else(|| BoxletError::InvalidPolicy {
+            reason: "io.max rule must start with '<major>:<minor>'".to_string(),
+        })?;
+        let (maj_str, min_str) =
+            dev_token
+                .split_once(':')
+                .ok_or_else(|| BoxletError::InvalidPolicy {
+                    reason: format!(
+                        "invalid io.max device '{dev_token}' (expected '<major>:<minor>')"
+                    ),
+                })?;
+        let major = maj_str
+            .parse::<u32>()
+            .map_err(|_| BoxletError::InvalidPolicy {
+                reason: format!("invalid io.max major number '{maj_str}'"),
+            })?;
+        let minor = min_str
+            .parse::<u32>()
+            .map_err(|_| BoxletError::InvalidPolicy {
+                reason: format!("invalid io.max minor number '{min_str}'"),
+            })?;
+
+        let mut rule = Self {
+            major,
+            minor,
+            rbps: None,
+            wbps: None,
+            riops: None,
+            wiops: None,
+        };
+
+        for token in tokens {
+            let (key, val_str) =
+                token
+                    .split_once('=')
+                    .ok_or_else(|| BoxletError::InvalidPolicy {
+                        reason: format!(
+                            "invalid io.max parameter '{token}' (expected 'key=value')"
+                        ),
+                    })?;
+            let parsed_val = if val_str.eq_ignore_ascii_case("max") {
+                None
+            } else {
+                let n = val_str
+                    .parse::<u64>()
+                    .map_err(|_| BoxletError::InvalidPolicy {
+                        reason: format!("invalid io.max limit value '{val_str}' for '{key}'"),
+                    })?;
+                Some(n)
+            };
+
+            match key {
+                "rbps" => rule.rbps = parsed_val,
+                "wbps" => rule.wbps = parsed_val,
+                "riops" => rule.riops = parsed_val,
+                "wiops" => rule.wiops = parsed_val,
+                other => {
+                    return Err(BoxletError::InvalidPolicy {
+                        reason: format!(
+                            "unknown io.max key '{other}' (expected rbps, wbps, riops, or wiops)"
+                        ),
+                    });
+                }
+            }
+        }
+
+        rule.validate()?;
+        Ok(rule)
+    }
+}
+
 /// First-class execution policy overlaid onto an OCI bundle by `boxlet run`.
 ///
 /// Fields set to `None` defer to the bundle's `config.json`, falling back to
@@ -62,6 +205,9 @@ pub struct ExecutionPolicy {
     pub cpus: Option<f64>,
     /// Maximum number of processes/threads (`pids.max`).
     pub pids_limit: Option<i64>,
+    /// Per-device cgroup v2 `io.max` block I/O bandwidth and IOPS limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_max: Option<Vec<IoMaxRule>>,
     /// Network isolation mode (`none` or `host`).
     pub network: Option<NetworkMode>,
     /// Whether to enforce `PR_SET_NO_NEW_PRIVS`.
@@ -101,6 +247,16 @@ impl ExecutionPolicy {
                 });
             }
         }
+        if let Some(ref rules) = self.io_max {
+            if rules.is_empty() {
+                return Err(BoxletError::InvalidPolicy {
+                    reason: "io_max must not be an empty list".to_string(),
+                });
+            }
+            for rule in rules {
+                rule.validate()?;
+            }
+        }
         if let Some(0) = self.max_concurrency {
             return Err(BoxletError::InvalidPolicy {
                 reason: "max_concurrency must be at least 1".to_string(),
@@ -121,6 +277,9 @@ pub struct ResourceLimits {
     pub cpu_period_usec: u64,
     /// `pids.max` process limit.
     pub pids_limit: Option<i64>,
+    /// Per-device cgroup v2 `io.max` throttle rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub io_max: Vec<IoMaxRule>,
 }
 
 /// Fully resolved specification produced by merging an OCI `config.json` with an [`ExecutionPolicy`].
@@ -205,6 +364,7 @@ pub fn merge_policy_with_spec(base: &Spec, policy: &ExecutionPolicy) -> Result<R
     };
 
     let max_output_bytes = policy.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES);
+    let io_max = policy.io_max.clone().unwrap_or_default();
 
     Ok(ResolvedRunSpec {
         oci_spec: base.clone(),
@@ -213,6 +373,7 @@ pub fn merge_policy_with_spec(base: &Spec, policy: &ExecutionPolicy) -> Result<R
             cpu_quota_usec,
             cpu_period_usec,
             pids_limit,
+            io_max,
         },
         network,
         no_new_privs,
@@ -381,6 +542,48 @@ mod tests {
             zero_concurrency.validate(),
             Err(BoxletError::InvalidPolicy { .. })
         ));
+
+        let empty_io_max = ExecutionPolicy {
+            io_max: Some(Vec::new()),
+            ..ExecutionPolicy::default()
+        };
+        assert!(matches!(
+            empty_io_max.validate(),
+            Err(BoxletError::InvalidPolicy { .. })
+        ));
+    }
+
+    #[test]
+    fn io_max_rule_parses_formats_and_rejects_invalid_rules() -> Result<()> {
+        let parsed: IoMaxRule = "8:0 rbps=10485760 wbps=max riops=1000".parse()?;
+        assert_eq!(
+            parsed,
+            IoMaxRule {
+                major: 8,
+                minor: 0,
+                rbps: Some(10_485_760),
+                wbps: None,
+                riops: Some(1000),
+                wiops: None,
+            }
+        );
+        assert_eq!(
+            parsed.to_cgroup_line(),
+            "8:0 rbps=10485760 wbps=max riops=1000 wiops=max"
+        );
+
+        let comma_parsed: IoMaxRule = "259:1,wbps=5242880,wiops=500".parse()?;
+        assert_eq!(
+            comma_parsed.to_cgroup_line(),
+            "259:1 rbps=max wbps=5242880 riops=max wiops=500"
+        );
+
+        assert!("8:0".parse::<IoMaxRule>().is_err());
+        assert!("8:0 rbps=max wbps=max".parse::<IoMaxRule>().is_err());
+        assert!("8:0 rbps=0".parse::<IoMaxRule>().is_err());
+        assert!("8:0 unknown=100".parse::<IoMaxRule>().is_err());
+        assert!("invalid rbps=100".parse::<IoMaxRule>().is_err());
+        Ok(())
     }
 
     #[test]
@@ -394,16 +597,19 @@ mod tests {
         assert_eq!(resolved.seccomp, SeccompPolicy::DefaultDeny);
         assert_eq!(resolved.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
         assert_eq!(resolved.resources.cpu_period_usec, DEFAULT_CPU_PERIOD_USEC);
+        assert!(resolved.resources.io_max.is_empty());
         Ok(())
     }
 
     #[test]
     fn merge_policy_overrides_oci_spec_values() -> Result<()> {
         let spec = Spec::default();
+        let io_rule: IoMaxRule = "8:0 rbps=10485760 wbps=5242880".parse()?;
         let policy = ExecutionPolicy {
             memory_bytes: Some(128 * 1024 * 1024),
             cpus: Some(0.5),
             pids_limit: Some(64),
+            io_max: Some(vec![io_rule.clone()]),
             network: Some(NetworkMode::Host),
             no_new_privs: Some(true),
             capabilities: Some(Vec::new()),
@@ -417,6 +623,7 @@ mod tests {
         assert_eq!(resolved.resources.memory_bytes, Some(128 * 1024 * 1024));
         assert_eq!(resolved.resources.cpu_quota_usec, Some(50_000));
         assert_eq!(resolved.resources.pids_limit, Some(64));
+        assert_eq!(resolved.resources.io_max, vec![io_rule]);
         assert_eq!(resolved.network, NetworkMode::Host);
         assert_eq!(resolved.seccomp, SeccompPolicy::Disabled);
         assert_eq!(resolved.timeout, Some(Duration::from_secs(30)));

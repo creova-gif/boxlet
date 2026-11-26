@@ -622,5 +622,6 @@ fn extract_oci_limits(spec: &Spec) -> ResourceLimits {
         cpu_quota_usec,
         cpu_period_usec,
         pids_limit,
+        io_max: Vec::new(),
     }
 }

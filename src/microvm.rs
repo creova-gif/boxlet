@@ -505,6 +505,11 @@ impl RuntimeBackend for MicroVmBackend {
             memory_bytes: resolved.resources.memory_bytes,
             cpus: derived_cpus,
             pids_limit: resolved.resources.pids_limit,
+            io_max: if resolved.resources.io_max.is_empty() {
+                None
+            } else {
+                Some(resolved.resources.io_max.clone())
+            },
             network: Some(resolved.network),
             no_new_privs: Some(resolved.no_new_privs),
             capabilities: resolved.capabilities.clone(),
