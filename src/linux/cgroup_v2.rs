@@ -79,6 +79,19 @@ impl ResourceController for CgroupV2Controller {
             write_cgroup_file(&leaf.join("pids.max"), &format!("{pids}\n"))?;
         }
 
+        if !limits.io_max.is_empty() {
+            let subtree_control = self.parent.join("cgroup.subtree_control");
+            if subtree_control.exists() {
+                let _ = fs::write(&subtree_control, "+io\n");
+            }
+            let io_lines: String = limits
+                .io_max
+                .iter()
+                .map(|r| format!("{}\n", r.to_cgroup_line()))
+                .collect();
+            write_cgroup_file(&leaf.join("io.max"), &io_lines)?;
+        }
+
         Ok(leaf)
     }
 
@@ -200,6 +213,7 @@ pub(crate) fn parse_u64_value(content: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::IoMaxRule;
 
     #[test]
     fn parses_cgroup_v2_stats_files_correctly() {
@@ -230,6 +244,14 @@ mod tests {
             cpu_quota_usec: Some(50_000),
             cpu_period_usec: 100_000,
             pids_limit: Some(64),
+            io_max: vec![IoMaxRule {
+                major: 8,
+                minor: 0,
+                rbps: Some(10_485_760),
+                wbps: None,
+                riops: Some(1000),
+                wiops: None,
+            }],
         };
 
         let leaf = ctrl.create_cgroup("test-cg", &limits)?;
@@ -244,6 +266,10 @@ mod tests {
         assert_eq!(
             fs::read_to_string(leaf.join("pids.max")).ok().as_deref(),
             Some("64\n")
+        );
+        assert_eq!(
+            fs::read_to_string(leaf.join("io.max")).ok().as_deref(),
+            Some("8:0 rbps=10485760 wbps=max riops=1000 wiops=max\n")
         );
 
         fs::write(leaf.join("memory.peak"), "1048576\n").ok();
@@ -260,6 +286,7 @@ mod tests {
             "memory.max",
             "cpu.max",
             "pids.max",
+            "io.max",
             "memory.peak",
             "cpu.stat",
             "memory.events",

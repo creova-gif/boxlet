@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Boxlet V1–V6 End-to-End 20-Check Verification & Demo Suite
+# Boxlet V1–V7 End-to-End 22-Check Verification & Demo Suite
 # Runs on any privileged Linux 5.15+ host with unified cgroup v2 and busybox-static.
 set -euo pipefail
 
@@ -739,7 +739,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 18: MicroVM Specification Synthesis (boxlet microvm-config for Firecracker & libkrun)
 # ------------------------------------------------------------------------------
-echo "==> [Check 18] [18/20] MicroVM Specification Synthesis (boxlet microvm-config for Firecracker & libkrun)"
+echo "==> [Check 18] [18/22] MicroVM Specification Synthesis (boxlet microvm-config for Firecracker & libkrun)"
 "$BOXLET_BIN" microvm-config \
   --driver firecracker \
   --id vm-fc-1 \
@@ -777,7 +777,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 19: Bounded Worker-Pool Concurrency & Rootless Bundle Scaffolding
 # ------------------------------------------------------------------------------
-echo "==> [Check 19] [19/20] Bounded Worker-Pool Concurrency (--max-concurrency 1) & Rootless Bundle Scaffolding (init-bundle --rootless)"
+echo "==> [Check 19] [19/22] Bounded Worker-Pool Concurrency (--max-concurrency 1) & Rootless Bundle Scaffolding (init-bundle --rootless)"
 sudo "$BOXLET_BIN" branch-run \
   --root "$STATE_ROOT" \
   --cgroup-parent "$CGROUP_PARENT" \
@@ -822,7 +822,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 20: Tamper-Evident Hash-Chained Audit Ledger & Prometheus Metrics
 # ------------------------------------------------------------------------------
-echo "==> [Check 20] [20/20] Tamper-Evident Hash-Chained Audit Ledger & Prometheus Metrics (boxlet audit --file ... --json / --prometheus)"
+echo "==> [Check 20] [20/22] Tamper-Evident Hash-Chained Audit Ledger & Prometheus Metrics (boxlet audit --file ... --json / --prometheus)"
 sudo "$BOXLET_BIN" audit --file "$AUDIT_LOG" --json > "$WORK_DIR/check20-audit.json"
 sudo "$BOXLET_BIN" audit --file "$AUDIT_LOG" --prometheus > "$WORK_DIR/check20-audit.prom"
 
@@ -843,4 +843,61 @@ print(
 )
 PY
 
-echo "==> ALL 20/20 BOXLET V1+V2+V3+V4+V5+V6 CHECKS PASSED"
+# ------------------------------------------------------------------------------
+# Check 21: Multi-Layer OCI Image Layout Packing & Unpacking with Whiteout (.wh.) Support
+# ------------------------------------------------------------------------------
+echo "==> [Check 21] [21/22] Multi-Layer OCI Image Layout Packing & Unpacking with Whiteout (.wh.) Support (boxlet image-pack + boxlet image-unpack)"
+mkdir -p "$WORK_DIR/oci-layer-base/etc" "$WORK_DIR/oci-layer-upper/etc"
+cp -a "$BUNDLE_DIR/rootfs/bin" "$WORK_DIR/oci-layer-base/bin"
+echo "keep-base-v1" > "$WORK_DIR/oci-layer-base/etc/keep.txt"
+echo "obsolete-v1" > "$WORK_DIR/oci-layer-base/etc/obsolete.txt"
+: > "$WORK_DIR/oci-layer-upper/etc/.wh.obsolete.txt"
+echo "added-in-layer2" > "$WORK_DIR/oci-layer-upper/etc/added-in-layer2.txt"
+
+"$BOXLET_BIN" image-pack \
+  --rootfs "$WORK_DIR/oci-layer-base" \
+  --layer "$WORK_DIR/oci-layer-upper" \
+  --out "$WORK_DIR/oci-layout" \
+  --tag "v7-demo" \
+  --json > "$WORK_DIR/check21-pack.json"
+
+"$BOXLET_BIN" image-unpack \
+  --layout "$WORK_DIR/oci-layout" \
+  --out "$WORK_DIR/unpacked-oci-rootfs" \
+  --json > "$WORK_DIR/check21-unpack.json"
+
+test -f "$WORK_DIR/unpacked-oci-rootfs/etc/keep.txt"
+test -f "$WORK_DIR/unpacked-oci-rootfs/etc/added-in-layer2.txt"
+test ! -e "$WORK_DIR/unpacked-oci-rootfs/etc/obsolete.txt"
+test ! -e "$WORK_DIR/unpacked-oci-rootfs/etc/.wh.obsolete.txt"
+
+python3 - "$WORK_DIR/check21-pack.json" "$WORK_DIR/check21-unpack.json" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    pack_data = json.load(f)
+with open(sys.argv[2]) as f:
+    unpack_data = json.load(f)
+
+assert len(pack_data.get("layers", [])) == 2, f"expected 2 packed layers, got {pack_data}"
+assert len(unpack_data.get("layers", [])) == 2, f"expected 2 unpacked layers, got {unpack_data}"
+print(
+    f"    OCI image layout verified: layers={len(pack_data['layers'])}, "
+    f"tag={pack_data.get('reference_tag')}, whiteout_removed=etc/obsolete.txt"
+)
+PY
+
+# ------------------------------------------------------------------------------
+# Check 22: Cgroup v2 io.max Block I/O Policy Validation
+# ------------------------------------------------------------------------------
+echo "==> [Check 22] [22/22] Cgroup v2 io.max Block I/O Policy Validation (boxlet run --io-max)"
+"$BOXLET_BIN" run --help | grep -q -- "--io-max"
+IO_ERR_OUT="$WORK_DIR/check22-iomax-err.txt"
+if "$BOXLET_BIN" run --io-max "8:0 rbps=0" "$BUNDLE_DIR" >"$IO_ERR_OUT" 2>&1; then
+  echo "FAIL: expected boxlet run --io-max '8:0 rbps=0' to fail closed" >&2
+  exit 1
+fi
+grep -qi "io.max" "$IO_ERR_OUT"
+echo "    cgroup v2 io.max validation verified: $(tr '\n' ' ' < "$IO_ERR_OUT")"
+
+echo "==> ALL 22/22 BOXLET V1+V2+V3+V4+V5+V6+V7 CHECKS PASSED"

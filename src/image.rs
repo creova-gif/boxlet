@@ -1,4 +1,5 @@
-//! Pure-Rust POSIX USTAR `.tar` rootfs archive export and fail-closed import.
+//! Pure-Rust POSIX USTAR `.tar` rootfs archive export, fail-closed import, and multi-layer
+//! OCI Image Layout v1.1.0 packing/unpacking with whiteout (`.wh.` / `.wh..wh..opq`) semantics.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -26,6 +27,18 @@ const FNV1A_64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 /// 64-bit FNV-1a prime.
 const FNV1A_64_PRIME: u64 = 0x0100_0000_01b3;
 
+/// Media type for an uncompressed POSIX USTAR OCI image layer.
+pub const OCI_LAYER_TAR_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar";
+
+/// Version string written to `<layout_dir>/oci-layout`.
+pub const OCI_IMAGE_LAYOUT_VERSION: &str = "1.0.0";
+
+/// OCI whiteout marker that clears all lower-layer entries in the containing directory.
+const OCI_OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
+
+/// Prefix for OCI explicit whiteout markers that delete a single lower-layer entry.
+const OCI_WHITEOUT_PREFIX: &str = ".wh.";
+
 /// Metadata summary returned by [`export_rootfs_tar`] and [`import_rootfs_tar`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RootfsArchiveReport {
@@ -33,12 +46,56 @@ pub struct RootfsArchiveReport {
     pub archive_path: PathBuf,
     /// Path to the rootfs directory exported from or imported into.
     pub rootfs_path: PathBuf,
-    /// Number of filesystem entries (files, directories, symlinks) processed.
+    /// Number of filesystem entries (files, directories, symlinks, whiteouts) processed.
     pub entry_count: usize,
     /// Total logical file payload bytes processed.
     pub total_file_bytes: u64,
     /// Deterministic 64-bit FNV-1a digest of the `.tar` archive stream.
     pub archive_fnv1a64: u64,
+}
+
+/// Descriptor for a single POSIX USTAR layer blob in an OCI Image Layout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OciLayerDescriptor {
+    /// OCI layer media type (`application/vnd.oci.image.layer.v1.tar`).
+    pub media_type: String,
+    /// Hex-encoded 64-bit FNV-1a digest (`fnv1a64:<16-hex-digits>`).
+    pub digest: String,
+    /// Archive file size in bytes.
+    pub size: u64,
+    /// Number of filesystem entries in the layer archive.
+    pub entry_count: usize,
+}
+
+/// Summary returned by [`pack_oci_image_layout`] and [`unpack_oci_image_layout`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OciImageLayoutReport {
+    /// Path to the OCI Image Layout directory.
+    pub layout_dir: PathBuf,
+    /// Image reference tag (`org.opencontainers.image.ref.name`).
+    pub tag: String,
+    /// Total number of layers packed or unpacked.
+    pub layer_count: usize,
+    /// Ordered layer descriptors (base layer first, upper layers after).
+    pub layers: Vec<OciLayerDescriptor>,
+    /// Deterministic 64-bit FNV-1a digest of `index.json` (`fnv1a64:<16-hex-digits>`).
+    pub index_digest: String,
+    /// Sum of all layer `.tar` blob sizes in bytes.
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OciLayoutFile {
+    #[serde(rename = "imageLayoutVersion")]
+    image_layout_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OciIndexFile {
+    #[serde(rename = "schemaVersion")]
+    schema_version: u32,
+    tag: String,
+    layers: Vec<OciLayerDescriptor>,
 }
 
 /// Streaming writer wrapper that computes a 64-bit FNV-1a digest over all written bytes.
@@ -331,6 +388,68 @@ pub fn import_rootfs_tar(archive_path: &Path, target_rootfs: &Path) -> Result<Ro
         let linkname = parse_ustar_string(&block[157..257], archive_path)?.to_string();
 
         ensure_safe_parent_dirs(target_rootfs, &rel_path)?;
+        let parent_dir = match rel_path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => target_rootfs.join(p),
+            _ => target_rootfs.to_path_buf(),
+        };
+
+        if let Some(fname) = rel_path.file_name().and_then(|n| n.to_str()) {
+            if fname == OCI_OPAQUE_WHITEOUT {
+                if size != 0 || (typeflag != b'0' && typeflag != b'\0') {
+                    return Err(BoxletError::StateStore {
+                        path: archive_path.to_path_buf(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "opaque whiteout marker in tar archive must be a zero-byte regular file",
+                        ),
+                    });
+                }
+                clear_directory_contents(&parent_dir)?;
+                if let Some(rel_parent) = rel_path.parent() {
+                    dir_modes.retain(|(dir_rel, _)| {
+                        dir_rel == rel_parent || !dir_rel.starts_with(rel_parent)
+                    });
+                }
+                entry_count += 1;
+                continue;
+            }
+            if let Some(whited_out_name) = fname.strip_prefix(OCI_WHITEOUT_PREFIX) {
+                if size != 0 || (typeflag != b'0' && typeflag != b'\0') {
+                    return Err(BoxletError::StateStore {
+                        path: archive_path.to_path_buf(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "whiteout marker in tar archive must be a zero-byte regular file",
+                        ),
+                    });
+                }
+                if whited_out_name.is_empty()
+                    || whited_out_name == "."
+                    || whited_out_name == ".."
+                    || whited_out_name.contains('/')
+                    || whited_out_name.contains('\\')
+                    || whited_out_name.contains('\0')
+                {
+                    return Err(BoxletError::StateStore {
+                        path: archive_path.to_path_buf(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "whiteout marker in tar archive contains invalid target name",
+                        ),
+                    });
+                }
+                let victim = parent_dir.join(whited_out_name);
+                remove_path_recursively_if_exists(&victim)?;
+                let rel_victim = match rel_path.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => p.join(whited_out_name),
+                    _ => PathBuf::from(whited_out_name),
+                };
+                dir_modes.retain(|(dir_rel, _)| !dir_rel.starts_with(&rel_victim));
+                entry_count += 1;
+                continue;
+            }
+        }
+
         let dst_path = target_rootfs.join(&rel_path);
 
         match typeflag {
@@ -462,6 +581,406 @@ pub fn import_rootfs_tar(archive_path: &Path, target_rootfs: &Path) -> Result<Ro
         total_file_bytes,
         archive_fnv1a64: hash,
     })
+}
+
+/// Packs an ordered slice of layer directories (`layer_dirs`, base layer first) into a
+/// deterministic OCI Image Layout directory (`layout_dir`) tagged with `tag`.
+///
+/// Writes `<layout_dir>/oci-layout`, `<layout_dir>/blobs/fnv1a64/<hex>.tar` for each layer,
+/// and `<layout_dir>/index.json` referencing all layer descriptors in application order.
+pub fn pack_oci_image_layout(
+    layer_dirs: &[PathBuf],
+    layout_dir: &Path,
+    tag: &str,
+) -> Result<OciImageLayoutReport> {
+    if layer_dirs.is_empty() {
+        return Err(BoxletError::InvalidPolicy {
+            reason: "pack_oci_image_layout requires at least one layer directory".to_string(),
+        });
+    }
+    let trimmed_tag = tag.trim();
+    if trimmed_tag.is_empty() {
+        return Err(BoxletError::InvalidPolicy {
+            reason: "OCI image layout tag must not be empty".to_string(),
+        });
+    }
+
+    for layer_dir in layer_dirs {
+        if !layer_dir.is_dir() {
+            return Err(BoxletError::StateStore {
+                path: layer_dir.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "OCI image layer directory does not exist or is not a directory",
+                ),
+            });
+        }
+        ensure_dir_not_inside_rootfs(layer_dir, layout_dir)?;
+    }
+
+    let blobs_dir = layout_dir.join("blobs").join("fnv1a64");
+    fs::create_dir_all(&blobs_dir).map_err(|source| BoxletError::StateStore {
+        path: blobs_dir.clone(),
+        source,
+    })?;
+
+    let oci_layout_path = layout_dir.join("oci-layout");
+    fs::write(
+        &oci_layout_path,
+        format!("{{\"imageLayoutVersion\":\"{OCI_IMAGE_LAYOUT_VERSION}\"}}\n"),
+    )
+    .map_err(|source| BoxletError::StateStore {
+        path: oci_layout_path,
+        source,
+    })?;
+
+    let mut layers = Vec::with_capacity(layer_dirs.len());
+    let mut total_bytes: u64 = 0;
+
+    for (idx, layer_dir) in layer_dirs.iter().enumerate() {
+        let stage_blob = blobs_dir.join(format!(".stage-layer-{idx}-{}.tar", std::process::id()));
+        let export_report = export_rootfs_tar(layer_dir, &stage_blob)?;
+        let hex_digest = format!("{:016x}", export_report.archive_fnv1a64);
+        let final_blob = blobs_dir.join(format!("{hex_digest}.tar"));
+
+        if let Err(source) = fs::rename(&stage_blob, &final_blob) {
+            let _ = fs::remove_file(&stage_blob);
+            return Err(BoxletError::StateStore {
+                path: final_blob,
+                source,
+            });
+        }
+
+        let size = fs::metadata(&final_blob)
+            .map_err(|source| BoxletError::StateStore {
+                path: final_blob,
+                source,
+            })?
+            .len();
+        total_bytes = total_bytes.saturating_add(size);
+
+        layers.push(OciLayerDescriptor {
+            media_type: OCI_LAYER_TAR_MEDIA_TYPE.to_string(),
+            digest: format!("fnv1a64:{hex_digest}"),
+            size,
+            entry_count: export_report.entry_count,
+        });
+    }
+
+    let index_file = OciIndexFile {
+        schema_version: 2,
+        tag: trimmed_tag.to_string(),
+        layers: layers.clone(),
+    };
+    let mut index_bytes = serde_json::to_vec_pretty(&index_file)?;
+    index_bytes.push(b'\n');
+
+    let index_path = layout_dir.join("index.json");
+    fs::write(&index_path, &index_bytes).map_err(|source| BoxletError::StateStore {
+        path: index_path,
+        source,
+    })?;
+
+    let index_digest = format!("fnv1a64:{:016x}", fnv1a64_bytes(&index_bytes));
+
+    Ok(OciImageLayoutReport {
+        layout_dir: layout_dir.to_path_buf(),
+        tag: trimmed_tag.to_string(),
+        layer_count: layers.len(),
+        layers,
+        index_digest,
+        total_bytes,
+    })
+}
+
+/// Unpacks a multi-layer OCI Image Layout directory (`layout_dir`) sequentially into
+/// `target_rootfs`, verifying every layer blob's 64-bit FNV-1a digest and applying
+/// OCI whiteout markers (`.wh.<name>` and `.wh..wh..opq`) across layers.
+pub fn unpack_oci_image_layout(
+    layout_dir: &Path,
+    target_rootfs: &Path,
+) -> Result<OciImageLayoutReport> {
+    let oci_layout_path = layout_dir.join("oci-layout");
+    let oci_layout_raw =
+        fs::read_to_string(&oci_layout_path).map_err(|source| BoxletError::StateStore {
+            path: oci_layout_path.clone(),
+            source,
+        })?;
+    let oci_layout: OciLayoutFile =
+        serde_json::from_str(&oci_layout_raw).map_err(|err| BoxletError::StateStore {
+            path: oci_layout_path.clone(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid oci-layout JSON: {err}"),
+            ),
+        })?;
+    if oci_layout.image_layout_version != OCI_IMAGE_LAYOUT_VERSION {
+        return Err(BoxletError::StateStore {
+            path: oci_layout_path,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported oci-layout imageLayoutVersion '{}' (expected '{}')",
+                    oci_layout.image_layout_version, OCI_IMAGE_LAYOUT_VERSION
+                ),
+            ),
+        });
+    }
+
+    let index_path = layout_dir.join("index.json");
+    let index_bytes = fs::read(&index_path).map_err(|source| BoxletError::StateStore {
+        path: index_path.clone(),
+        source,
+    })?;
+    let index_digest = format!("fnv1a64:{:016x}", fnv1a64_bytes(&index_bytes));
+    let index_file: OciIndexFile =
+        serde_json::from_slice(&index_bytes).map_err(|err| BoxletError::StateStore {
+            path: index_path.clone(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid OCI index.json: {err}"),
+            ),
+        })?;
+
+    if index_file.schema_version != 2 {
+        return Err(BoxletError::StateStore {
+            path: index_path,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported OCI index.json schemaVersion {} (expected 2)",
+                    index_file.schema_version
+                ),
+            ),
+        });
+    }
+    if index_file.layers.is_empty() {
+        return Err(BoxletError::StateStore {
+            path: index_path,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "OCI index.json must contain at least one layer descriptor",
+            ),
+        });
+    }
+
+    let blobs_dir = layout_dir.join("blobs").join("fnv1a64");
+    let mut total_bytes: u64 = 0;
+
+    for desc in &index_file.layers {
+        if desc.media_type != OCI_LAYER_TAR_MEDIA_TYPE {
+            return Err(BoxletError::StateStore {
+                path: index_path,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "unsupported OCI layer mediaType '{}' (expected '{}')",
+                        desc.media_type, OCI_LAYER_TAR_MEDIA_TYPE
+                    ),
+                ),
+            });
+        }
+
+        let hex_digest =
+            desc.digest
+                .strip_prefix("fnv1a64:")
+                .ok_or_else(|| BoxletError::StateStore {
+                    path: index_path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid OCI layer digest '{}': must start with 'fnv1a64:'",
+                            desc.digest
+                        ),
+                    ),
+                })?;
+        if hex_digest.len() != 16 || !hex_digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(BoxletError::StateStore {
+                path: index_path,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid OCI layer digest '{}': expected 16 hexadecimal characters",
+                        desc.digest
+                    ),
+                ),
+            });
+        }
+
+        let blob_path = blobs_dir.join(format!("{hex_digest}.tar"));
+        let blob_meta = fs::metadata(&blob_path).map_err(|source| BoxletError::StateStore {
+            path: blob_path.clone(),
+            source,
+        })?;
+        if blob_meta.len() != desc.size {
+            return Err(BoxletError::StateStore {
+                path: blob_path,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "OCI layer blob size mismatch for '{}': expected {} bytes, found {} bytes",
+                        desc.digest,
+                        desc.size,
+                        blob_meta.len()
+                    ),
+                ),
+            });
+        }
+
+        let import_report = import_rootfs_tar(&blob_path, target_rootfs)?;
+        let actual_digest = format!("fnv1a64:{:016x}", import_report.archive_fnv1a64);
+        if actual_digest != desc.digest {
+            return Err(BoxletError::StateStore {
+                path: blob_path,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "OCI layer blob digest mismatch: expected '{}', computed '{}'",
+                        desc.digest, actual_digest
+                    ),
+                ),
+            });
+        }
+        if import_report.entry_count != desc.entry_count {
+            return Err(BoxletError::StateStore {
+                path: blob_path,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "OCI layer entry_count mismatch for '{}': expected {}, unpacked {}",
+                        desc.digest, desc.entry_count, import_report.entry_count
+                    ),
+                ),
+            });
+        }
+
+        total_bytes = total_bytes.saturating_add(desc.size);
+    }
+
+    Ok(OciImageLayoutReport {
+        layout_dir: layout_dir.to_path_buf(),
+        tag: index_file.tag,
+        layer_count: index_file.layers.len(),
+        layers: index_file.layers,
+        index_digest,
+        total_bytes,
+    })
+}
+
+fn fnv1a64_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = FNV1A_64_OFFSET_BASIS;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(FNV1A_64_PRIME);
+    }
+    hash
+}
+
+fn ensure_dir_not_inside_rootfs(rootfs_dir: &Path, target_dir: &Path) -> Result<()> {
+    let abs_rootfs = fs::canonicalize(rootfs_dir).map_err(|source| BoxletError::StateStore {
+        path: rootfs_dir.to_path_buf(),
+        source,
+    })?;
+    let mut current = if target_dir.is_absolute() {
+        target_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| BoxletError::StateStore {
+                path: target_dir.to_path_buf(),
+                source,
+            })?
+            .join(target_dir)
+    };
+    let mut tail = Vec::new();
+    while !current.exists() {
+        if let Some(name) = current.file_name() {
+            tail.push(name.to_os_string());
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    let mut abs_target = fs::canonicalize(&current).map_err(|source| BoxletError::StateStore {
+        path: current,
+        source,
+    })?;
+    for part in tail.into_iter().rev() {
+        abs_target.push(part);
+    }
+    if abs_target.starts_with(&abs_rootfs) {
+        return Err(BoxletError::StateStore {
+            path: target_dir.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "OCI layout_dir must not be located inside a source layer directory",
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn clear_directory_contents(dir: &Path) -> Result<()> {
+    make_dir_writable(dir)?;
+    let entries = fs::read_dir(dir).map_err(|source| BoxletError::StateStore {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    for item in entries {
+        let entry = item.map_err(|source| BoxletError::StateStore {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        remove_path_recursively_if_exists(&entry.path())?;
+    }
+    Ok(())
+}
+
+fn remove_path_recursively_if_exists(path: &Path) -> Result<()> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(BoxletError::StateStore {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if meta.file_type().is_dir() {
+        make_tree_writable_recursive(path)?;
+        fs::remove_dir_all(path).map_err(|source| BoxletError::StateStore {
+            path: path.to_path_buf(),
+            source,
+        })
+    } else {
+        fs::remove_file(path).map_err(|source| BoxletError::StateStore {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+}
+
+fn make_tree_writable_recursive(dir: &Path) -> Result<()> {
+    make_dir_writable(dir)?;
+    let entries = fs::read_dir(dir).map_err(|source| BoxletError::StateStore {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    for item in entries {
+        let entry = item.map_err(|source| BoxletError::StateStore {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        let child_path = entry.path();
+        let meta = fs::symlink_metadata(&child_path).map_err(|source| BoxletError::StateStore {
+            path: child_path.clone(),
+            source,
+        })?;
+        if meta.file_type().is_dir() {
+            make_tree_writable_recursive(&child_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn ensure_archive_not_inside_rootfs(rootfs_dir: &Path, archive_path: &Path) -> Result<()> {
@@ -1102,6 +1621,200 @@ mod tests {
             source,
         })?;
         assert!(import_rootfs_tar(&truncated_archive, &target_rootfs).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn oci_image_layout_pack_and_unpack_applies_explicit_and_opaque_whiteouts() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|source| BoxletError::StateStore {
+            path: PathBuf::from("tempdir"),
+            source,
+        })?;
+        let layer0 = tmp.path().join("layer0-base");
+        let layer1 = tmp.path().join("layer1-upper");
+        let layout_dir = tmp.path().join("oci-layout-out");
+        let unpacked_rootfs = tmp.path().join("unpacked-rootfs");
+
+        // Layer 0 (base):
+        // - /bin/app (kept and updated in layer 1)
+        // - /etc/legacy.conf (explicitly whited out in layer 1 via .wh.legacy.conf)
+        // - /etc/keep.conf (retained from layer 0)
+        // - /var/cache/old1.dat and /var/cache/sub/old2.dat (cleared via .wh..wh..opq in layer 1)
+        fs::create_dir_all(layer0.join("bin")).map_err(|source| BoxletError::StateStore {
+            path: layer0.join("bin"),
+            source,
+        })?;
+        fs::create_dir_all(layer0.join("etc")).map_err(|source| BoxletError::StateStore {
+            path: layer0.join("etc"),
+            source,
+        })?;
+        fs::create_dir_all(layer0.join("var/cache/sub")).map_err(|source| {
+            BoxletError::StateStore {
+                path: layer0.join("var/cache/sub"),
+                source,
+            }
+        })?;
+
+        fs::write(layer0.join("bin/app"), b"v1\n").map_err(|source| BoxletError::StateStore {
+            path: layer0.join("bin/app"),
+            source,
+        })?;
+        set_mode_permissions(&layer0.join("bin/app"), 0o755)?;
+        fs::write(layer0.join("etc/legacy.conf"), b"legacy=true\n").map_err(|source| {
+            BoxletError::StateStore {
+                path: layer0.join("etc/legacy.conf"),
+                source,
+            }
+        })?;
+        fs::write(layer0.join("etc/keep.conf"), b"keep=1\n").map_err(|source| {
+            BoxletError::StateStore {
+                path: layer0.join("etc/keep.conf"),
+                source,
+            }
+        })?;
+        fs::write(layer0.join("var/cache/old1.dat"), b"stale1").map_err(|source| {
+            BoxletError::StateStore {
+                path: layer0.join("var/cache/old1.dat"),
+                source,
+            }
+        })?;
+        fs::write(layer0.join("var/cache/sub/old2.dat"), b"stale2").map_err(|source| {
+            BoxletError::StateStore {
+                path: layer0.join("var/cache/sub/old2.dat"),
+                source,
+            }
+        })?;
+        set_mode_permissions(&layer0.join("var/cache/sub"), 0o555)?;
+
+        // Layer 1 (upper delta):
+        // - /bin/app (modified to v2)
+        // - /etc/.wh.legacy.conf (explicit whiteout of /etc/legacy.conf)
+        // - /var/cache/.wh..wh..opq (opaque whiteout clearing /var/cache/*)
+        // - /var/cache/fresh.dat (new file inside cleared /var/cache)
+        fs::create_dir_all(layer1.join("bin")).map_err(|source| BoxletError::StateStore {
+            path: layer1.join("bin"),
+            source,
+        })?;
+        fs::create_dir_all(layer1.join("etc")).map_err(|source| BoxletError::StateStore {
+            path: layer1.join("etc"),
+            source,
+        })?;
+        fs::create_dir_all(layer1.join("var/cache")).map_err(|source| BoxletError::StateStore {
+            path: layer1.join("var/cache"),
+            source,
+        })?;
+
+        fs::write(layer1.join("bin/app"), b"v2\n").map_err(|source| BoxletError::StateStore {
+            path: layer1.join("bin/app"),
+            source,
+        })?;
+        set_mode_permissions(&layer1.join("bin/app"), 0o755)?;
+        fs::write(layer1.join("etc/.wh.legacy.conf"), b"").map_err(|source| {
+            BoxletError::StateStore {
+                path: layer1.join("etc/.wh.legacy.conf"),
+                source,
+            }
+        })?;
+        fs::write(layer1.join("var/cache/.wh..wh..opq"), b"").map_err(|source| {
+            BoxletError::StateStore {
+                path: layer1.join("var/cache/.wh..wh..opq"),
+                source,
+            }
+        })?;
+        fs::write(layer1.join("var/cache/fresh.dat"), b"fresh=true\n").map_err(|source| {
+            BoxletError::StateStore {
+                path: layer1.join("var/cache/fresh.dat"),
+                source,
+            }
+        })?;
+
+        let layers = vec![layer0.clone(), layer1];
+        let pack_report = pack_oci_image_layout(&layers, &layout_dir, "boxlet/app:v7")?;
+        // Restore write bit on layer0/var/cache/sub so tempdir cleanup succeeds on all hosts
+        set_mode_permissions(&layer0.join("var/cache/sub"), 0o755)?;
+
+        assert_eq!(pack_report.tag, "boxlet/app:v7");
+        assert_eq!(pack_report.layer_count, 2);
+        assert_eq!(pack_report.layers.len(), 2);
+        assert!(pack_report.index_digest.starts_with("fnv1a64:"));
+        assert!(layout_dir.join("oci-layout").is_file());
+        assert!(layout_dir.join("index.json").is_file());
+
+        let unpack_report = unpack_oci_image_layout(&layout_dir, &unpacked_rootfs)?;
+        assert_eq!(pack_report, unpack_report);
+
+        assert_eq!(
+            fs::read_to_string(unpacked_rootfs.join("bin/app")).ok(),
+            Some("v2\n".to_string())
+        );
+        assert_eq!(
+            fs::read_to_string(unpacked_rootfs.join("etc/keep.conf")).ok(),
+            Some("keep=1\n".to_string())
+        );
+        assert!(!unpacked_rootfs.join("etc/legacy.conf").exists());
+        assert!(!unpacked_rootfs.join("etc/.wh.legacy.conf").exists());
+        assert!(!unpacked_rootfs.join("var/cache/old1.dat").exists());
+        assert!(!unpacked_rootfs.join("var/cache/sub").exists());
+        assert!(!unpacked_rootfs.join("var/cache/.wh..wh..opq").exists());
+        assert_eq!(
+            fs::read_to_string(unpacked_rootfs.join("var/cache/fresh.dat")).ok(),
+            Some("fresh=true\n".to_string())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn unpack_oci_image_layout_rejects_tampered_layer_blob_fail_closed() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|source| BoxletError::StateStore {
+            path: PathBuf::from("tempdir"),
+            source,
+        })?;
+        let layer0 = tmp.path().join("layer0");
+        let layout_dir = tmp.path().join("oci-layout");
+        let unpacked_rootfs = tmp.path().join("unpacked");
+
+        fs::create_dir_all(layer0.join("etc")).map_err(|source| BoxletError::StateStore {
+            path: layer0.join("etc"),
+            source,
+        })?;
+        fs::write(layer0.join("etc/config.toml"), b"port = 8080\n").map_err(|source| {
+            BoxletError::StateStore {
+                path: layer0.join("etc/config.toml"),
+                source,
+            }
+        })?;
+
+        let report = pack_oci_image_layout(&[layer0], &layout_dir, "boxlet/tamper-test:v1")?;
+        let hex = report.layers[0]
+            .digest
+            .strip_prefix("fnv1a64:")
+            .unwrap_or("");
+        let blob_path = layout_dir
+            .join("blobs")
+            .join("fnv1a64")
+            .join(format!("{hex}.tar"));
+
+        // Corrupt a single payload byte inside the 512-byte data block (after the first 512-byte dir
+        // header and second 512-byte file header) while keeping the archive size identical.
+        let mut raw_bytes = fs::read(&blob_path).map_err(|source| BoxletError::StateStore {
+            path: blob_path.clone(),
+            source,
+        })?;
+        assert!(raw_bytes.len() >= TAR_BLOCK_SIZE * 3);
+        raw_bytes[TAR_BLOCK_SIZE * 2] ^= 0x01;
+        fs::write(&blob_path, &raw_bytes).map_err(|source| BoxletError::StateStore {
+            path: blob_path.clone(),
+            source,
+        })?;
+
+        let err = unpack_oci_image_layout(&layout_dir, &unpacked_rootfs);
+        assert!(matches!(
+            err,
+            Err(BoxletError::StateStore { ref source, .. })
+                if source.kind() == std::io::ErrorKind::InvalidData
+        ));
 
         Ok(())
     }

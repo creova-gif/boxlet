@@ -18,13 +18,17 @@ pub use audit::{AuditEvent, AuditRecord, AuditSummary, JsonlAuditLogger};
 pub use doctor::{run_doctor, DoctorCheck, DoctorReport, DoctorStatus};
 pub use engine::{BranchBatchReport, BranchExecutionResult, BranchSpec, Engine, PruneReport};
 pub use eval::{CandidateVerdict, EvalReport, EvalRubric, EvalSpec};
-pub use image::{export_rootfs_tar, import_rootfs_tar, RootfsArchiveReport};
+pub use image::{
+    export_rootfs_tar, import_rootfs_tar, pack_oci_image_layout, unpack_oci_image_layout,
+    OciImageLayoutReport, OciLayerDescriptor, RootfsArchiveReport,
+};
 #[cfg(target_os = "linux")]
 pub use linux::overlay::{inspect_upper_diff, OverlayDirs, OverlayRootfsProvider};
 #[cfg(target_os = "linux")]
 pub use linux::LinuxBackend;
 pub use microvm::{FirecrackerVmSpec, LibkrunVmSpec, MicroVmBackend, MicroVmConfig, VmmDriver};
 pub use oci::BundleBuilder;
+pub use policy::IoMaxRule;
 
 /// Executes the internal self-re-exec container init stage (`boxlet __init <config>`).
 #[cfg(target_os = "linux")]

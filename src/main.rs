@@ -14,7 +14,7 @@ use boxlet::engine::BranchSpec;
 use boxlet::error::{BoxletError, Result};
 use boxlet::oci::state::DEFAULT_STATE_ROOT;
 #[cfg(target_os = "linux")]
-use boxlet::policy::{ExecutionPolicy, NetworkMode};
+use boxlet::policy::{ExecutionPolicy, IoMaxRule, NetworkMode};
 use boxlet::snapshot::{TreeManifest, WorkspaceSnapshot};
 use boxlet::{run_doctor, BundleBuilder, DoctorStatus, JsonlAuditLogger};
 
@@ -143,6 +143,9 @@ enum Commands {
         /// Maximum number of processes/threads (`pids.max`).
         #[arg(long)]
         pids: Option<i64>,
+        /// Per-device cgroup v2 io.max limit (e.g. "8:0 rbps=10485760 wbps=5242880", repeatable).
+        #[arg(long = "io-max")]
+        io_max: Vec<String>,
         /// Network isolation mode (`none` or `host`).
         #[arg(long)]
         network: Option<String>,
@@ -219,6 +222,9 @@ enum Commands {
         /// Maximum number of processes/threads (`pids.max`) per branch.
         #[arg(long)]
         pids: Option<i64>,
+        /// Per-device cgroup v2 io.max limit (e.g. "8:0 rbps=10485760 wbps=5242880", repeatable).
+        #[arg(long = "io-max")]
+        io_max: Vec<String>,
         /// Network isolation mode (`none` or `host`).
         #[arg(long)]
         network: Option<String>,
@@ -287,6 +293,36 @@ enum Commands {
         #[arg(long)]
         out: PathBuf,
         /// Emit the `RootfsArchiveReport` as JSON to stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pack one or more rootfs layer directories into an OCI Image Layout v1.1.0 directory.
+    ImagePack {
+        /// Base rootfs layer directory to pack.
+        #[arg(long)]
+        rootfs: PathBuf,
+        /// Additional upper layer directories applied on top of `--rootfs` in order (repeatable).
+        #[arg(long = "layer")]
+        layers: Vec<PathBuf>,
+        /// Output OCI Image Layout directory path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Image reference tag recorded in `index.json`.
+        #[arg(long, default_value = "latest")]
+        tag: String,
+        /// Emit the `OciImageLayoutReport` as JSON to stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Unpack a multi-layer OCI Image Layout directory into a target rootfs with whiteout support.
+    ImageUnpack {
+        /// Input OCI Image Layout directory containing `oci-layout` and `index.json`.
+        #[arg(long)]
+        layout: PathBuf,
+        /// Target rootfs directory to materialize.
+        #[arg(long)]
+        out: PathBuf,
+        /// Emit the `OciImageLayoutReport` as JSON to stdout.
         #[arg(long)]
         json: bool,
     },
@@ -535,6 +571,48 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Commands::ImagePack {
+            rootfs,
+            layers,
+            out,
+            tag,
+            json,
+        } => {
+            let mut all_layers = Vec::with_capacity(1 + layers.len());
+            all_layers.push(rootfs);
+            all_layers.extend(layers);
+            let report = boxlet::pack_oci_image_layout(&all_layers, &out, &tag)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "packed layout={} tag={} layers={} bytes={} index_digest={}",
+                    report.layout_dir.display(),
+                    report.tag,
+                    report.layer_count,
+                    report.total_bytes,
+                    report.index_digest
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::ImageUnpack { layout, out, json } => {
+            let report = boxlet::unpack_oci_image_layout(&layout, &out)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "unpacked layout={} rootfs={} tag={} layers={} bytes={} index_digest={}",
+                    report.layout_dir.display(),
+                    out.display(),
+                    report.tag,
+                    report.layer_count,
+                    report.total_bytes,
+                    report.index_digest
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Commands::MicrovmConfig {
             driver,
             id,
@@ -672,6 +750,7 @@ fn dispatch_platform(
             memory,
             cpus,
             pids,
+            io_max,
             network,
             timeout,
             max_output_bytes,
@@ -683,6 +762,7 @@ fn dispatch_platform(
                 memory.as_deref(),
                 cpus,
                 pids,
+                &io_max,
                 network.as_deref(),
                 timeout,
                 max_output_bytes,
@@ -710,6 +790,7 @@ fn dispatch_platform(
             memory,
             cpus,
             pids,
+            io_max,
             network,
             timeout,
             max_output_bytes,
@@ -722,6 +803,7 @@ fn dispatch_platform(
                 memory.as_deref(),
                 cpus,
                 pids,
+                &io_max,
                 network.as_deref(),
                 timeout,
                 max_output_bytes,
@@ -835,6 +917,8 @@ fn dispatch_platform(
         | Commands::InitBundle { .. }
         | Commands::ImageExport { .. }
         | Commands::ImageImport { .. }
+        | Commands::ImagePack { .. }
+        | Commands::ImageUnpack { .. }
         | Commands::MicrovmConfig { .. }
         | Commands::Audit { .. }
         | Commands::Doctor { .. }
@@ -859,16 +943,22 @@ fn build_execution_policy(
     memory: Option<&str>,
     cpus: Option<f64>,
     pids: Option<i64>,
+    io_max_raw: &[String],
     network: Option<&str>,
     timeout: Option<u64>,
     max_output_bytes: Option<usize>,
 ) -> Result<ExecutionPolicy> {
     let memory_bytes = memory.map(parse_byte_size).transpose()?;
     let network_mode = network.map(|m| m.parse::<NetworkMode>()).transpose()?;
+    let mut rules = Vec::with_capacity(io_max_raw.len());
+    for raw in io_max_raw {
+        rules.push(raw.parse::<IoMaxRule>()?);
+    }
     Ok(ExecutionPolicy {
         memory_bytes,
         cpus,
         pids_limit: pids,
+        io_max: if rules.is_empty() { None } else { Some(rules) },
         network: network_mode,
         timeout: timeout.map(Duration::from_secs),
         max_output_bytes,
@@ -1280,6 +1370,72 @@ mod tests {
         })?;
         assert_eq!(dispatch(lk_cli)?, ExitCode::SUCCESS);
         assert!(lk_out.is_file());
+
+        let layer_upper = tmp.path().join("upper-layer");
+        std::fs::create_dir_all(layer_upper.join("etc")).map_err(|source| {
+            BoxletError::StateStore {
+                path: layer_upper.join("etc"),
+                source,
+            }
+        })?;
+        std::fs::write(layer_upper.join("etc/upper.conf"), b"upper=1\n").map_err(|source| {
+            BoxletError::StateStore {
+                path: layer_upper.join("etc/upper.conf"),
+                source,
+            }
+        })?;
+
+        let oci_layout_dir = tmp.path().join("oci-layout-out");
+        let pack_cli = Cli::try_parse_from([
+            "boxlet",
+            "image-pack",
+            "--rootfs",
+            rootfs_src.to_str().unwrap_or_default(),
+            "--layer",
+            layer_upper.to_str().unwrap_or_default(),
+            "--out",
+            oci_layout_dir.to_str().unwrap_or_default(),
+            "--tag",
+            "v7-test",
+            "--json",
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+        assert_eq!(dispatch(pack_cli)?, ExitCode::SUCCESS);
+        assert!(oci_layout_dir.join("oci-layout").is_file());
+        assert!(oci_layout_dir.join("index.json").is_file());
+
+        let unpacked_rootfs = tmp.path().join("unpacked-rootfs");
+        let unpack_cli = Cli::try_parse_from([
+            "boxlet",
+            "image-unpack",
+            "--layout",
+            oci_layout_dir.to_str().unwrap_or_default(),
+            "--out",
+            unpacked_rootfs.to_str().unwrap_or_default(),
+            "--json",
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+        assert_eq!(dispatch(unpack_cli)?, ExitCode::SUCCESS);
+        assert!(unpacked_rootfs.join("etc/agent.conf").is_file());
+        assert!(unpacked_rootfs.join("etc/upper.conf").is_file());
+
+        let run_parse = Cli::try_parse_from([
+            "boxlet",
+            "run",
+            "--io-max",
+            "8:0 rbps=10485760 wbps=5242880",
+            "--io-max",
+            "259:0 wiops=1000",
+            bundle_dir.to_str().unwrap_or_default(),
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+        assert!(matches!(run_parse.command, Commands::Run { io_max, .. } if io_max.len() == 2));
 
         Ok(())
     }
