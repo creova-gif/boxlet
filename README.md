@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust: 1.80+](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![OCI Runtime Spec: v1.0.2](https://img.shields.io/badge/OCI%20Runtime-v1.0.2-2ea44f.svg)](https://github.com/opencontainers/runtime-spec)
-[![Live Linux Demo: 26/26 Checks](https://img.shields.io/badge/Live%20Linux%20Demo-26%2F26%20Checks-brightgreen.svg)](scripts/demo-v1.sh)
+[![Live Linux Demo: 28/28 Checks](https://img.shields.io/badge/Live%20Linux%20Demo-28%2F28%20Checks-brightgreen.svg)](scripts/demo-v1.sh)
 
 - **Spec Doc:** [Boxlet: Minimal OCI-Compatible Container Runtime](https://docs.google.com/document/d/1XDaWCxQUGEH9LMqC95nJ4WZy_ut_YOQJ5_yChSJrlvA/edit?usp=drivesdk&ouid=110227624285917376281)
 - **ADR-001 (V1 Architecture & Isolation Seams):** [docs/adr/001-v1-architecture-and-seams.md](docs/adr/001-v1-architecture-and-seams.md)
@@ -20,6 +20,7 @@
 - **ADR-010 (Cgroup v2 Block I/O Throttling & Multi-Layer OCI Image Layout):** [ADR-010: Cgroup v2 Block I/O Throttling and Multi-Layer OCI Image Layout](docs/adr/010-cgroup-io-max-and-oci-image-layout.md)
 - **ADR-011 (Cgroup v2 PSI Telemetry, POSIX Rlimits & Deterministic Benchmark Suite):** [ADR-011: Cgroup v2 PSI Telemetry, POSIX Rlimits, and Deterministic Benchmark Suite](docs/adr/011-psi-telemetry-rlimits-and-benchmark-suite.md)
 - **ADR-012 (Declarative Bind Mounts & Seccomp Profile Management):** [ADR-012: Declarative Bind Mounts and Seccomp Profile Management](docs/adr/012-bind-mounts-and-seccomp-profile-management.md)
+- **ADR-013 (Ephemeral `tmpfs` Scratch Mounts & Per-Run Process Overrides):** [ADR-013: Ephemeral Size-Bounded tmpfs Mounts and Per-Run Process Overrides](docs/adr/013-ephemeral-tmpfs-mounts-and-process-overrides.md)
 - **Threat Model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)
 - **Design Doc:** [docs/designs/boxlet-v1-oci-runtime.md](docs/designs/boxlet-v1-oci-runtime.md)
 - **Engineering Standards:** [AGENTS.md](AGENTS.md)
@@ -161,7 +162,7 @@ sudo ./target/release/boxlet branch-run \
 
 ### High-Level Policy Execution (`boxlet run`)
 
-`boxlet run` overlays explicit resource and isolation limits (including cgroup v2 `io.max` block I/O bandwidth and IOPS throttling via `--io-max` / `IoMaxRule`, POSIX `setrlimit(2)` file-descriptor caps via `--nofile <N>` / `RLIMIT_NOFILE`, unconditional `RLIMIT_CORE = 0` core-dump suppression, declarative host bind mounts via `--mount <SRC>:<DST>[:ro|rw]` / `BindMountSpec` with read-only default and `MS_NOSUID | MS_NODEV` remount hardening, and custom OCI seccomp profile overrides via `--seccomp-profile <PATH>`) onto an OCI bundle and emits structured execution telemetry (including cgroup v2 Pressure Stall Information `PsiMetrics` in `ResourceUsage` and `boxlet_psi_*_microseconds_total` counters in `boxlet audit --prometheus`):
+`boxlet run` overlays explicit resource and isolation limits (including cgroup v2 `io.max` block I/O bandwidth and IOPS throttling via `--io-max` / `IoMaxRule`, POSIX `setrlimit(2)` file-descriptor caps via `--nofile <N>` / `RLIMIT_NOFILE`, unconditional `RLIMIT_CORE = 0` core-dump suppression, declarative host bind mounts via `--mount <SRC>:<DST>[:ro|rw]` / `BindMountSpec` with read-only default and `MS_NOSUID | MS_NODEV` remount hardening, ephemeral size-bounded `tmpfs` scratch mounts via `--tmpfs <DST>[:size=<BYTES>,mode=<OCTAL>,noexec|exec]` / `TmpfsMountSpec`, per-run process overrides via `--cmd <SHELL_CMD>`, `-e` / `--env <KEY=VALUE>`, and `--cwd <DIR>`, and custom OCI seccomp profile overrides via `--seccomp-profile <PATH>`) onto an OCI bundle and emits structured execution telemetry (including cgroup v2 Pressure Stall Information `PsiMetrics` in `ResourceUsage` and `boxlet_psi_*_microseconds_total` counters in `boxlet audit --prometheus`):
 
 ```bash
 sudo ./target/release/boxlet run \
@@ -171,11 +172,40 @@ sudo ./target/release/boxlet run \
   --io-max "8:0 rbps=10485760 wbps=5242880 riops=1000 wiops=500" \
   --nofile 256 \
   --mount /var/lib/datasets:/mnt/data:ro \
+  --tmpfs /tmp:size=16m,mode=1777,noexec \
+  -e "AGENT_ROLE=verifier" \
+  --cwd /tmp \
+  --cmd "pwd && echo \$AGENT_ROLE" \
   --seccomp-profile ./custom-seccomp.json \
   --network none \
   --timeout 30 \
   --json \
   ./bundle
+```
+
+### Ephemeral Size-Bounded `tmpfs` Scratch Mounts & Per-Run Process Overrides (`--tmpfs`, `--cmd`, `-e`/`--env`, `--cwd`)
+
+Provision ephemeral in-memory `tmpfs` scratch mounts (`--tmpfs <DST>[:size=<BYTES>,mode=<OCTAL>,noexec|exec]` / `TmpfsMountSpec`, defaulting to `size=64m,mode=1777,noexec` with `MS_NOSUID | MS_NODEV | MS_NOEXEC` hardening) inside read-only rootfs sandboxes, and override process entrypoint commands (`--cmd <SHELL_CMD>`), environment variables (`-e` / `--env <KEY=VALUE>`), and working directory (`--cwd <DIR>`) per run so immutable base bundles can be reused across diverse agent workloads without rewriting `config.json`:
+
+```bash
+# Scaffold an immutable read-only base bundle once
+./target/release/boxlet init-bundle \
+  --busybox /bin/busybox \
+  --readonly \
+  --cmd "true" \
+  --json \
+  ./ro-base-bundle
+
+# Run a workload with an ephemeral 16 MiB /tmp tmpfs mount and per-run process overrides
+sudo ./target/release/boxlet run \
+  --tmpfs "/tmp:size=16m" \
+  -e "AGENT_ROLE=verifier" \
+  -e "RUN_STAGE=v10" \
+  --cwd "/tmp" \
+  --cmd "echo scratch-ok > /tmp/scratch.txt && pwd && echo \$AGENT_ROLE:\$RUN_STAGE" \
+  --network none \
+  --json \
+  ./ro-base-bundle
 ```
 
 ### Declarative Host Bind Mounts & Seccomp Profile Management (`--mount`, `boxlet seccomp-export`, `--seccomp-profile`)
@@ -315,9 +345,9 @@ Synthesize deterministic **AWS Firecracker** (`FirecrackerVmSpec`) or **`libkrun
   ./bundle
 ```
 
-### Run the End-to-End 26-Check V1–V9 Demo Script
+### Run the End-to-End 28-Check V1–V10 Demo Script
 
-On a Linux 5.15+ host with `busybox` (`busybox-static`) and `python3` installed, run the self-contained 26/26 check verification demo covering normal execution, `memory.max` OOM-kill telemetry (`oom_killed: true`), fail-closed seccomp/capability enforcement, zero-leak cleanup, V2 workspace snapshots/diffs, parallel multi-agent branch execution, winner promotion/rollback, OCI bundle scaffolding, container inventory/garbage collection (`list`/`prune`), JSONL audit log analytics (`audit --file`), host readiness diagnostics (`doctor`), declarative rubric evaluation (`eval --spec`), OCI rootfs tar archive export/import round-trip (`image-export`/`image-import`), Firecracker/`libkrun` MicroVM specification synthesis (`microvm-config`), bounded worker-pool concurrency (`branch-run --max-concurrency`) + rootless user-namespace bundle scaffolding (`init-bundle --rootless`), tamper-evident hash-chained audit verification + Prometheus metrics export (`audit --file ... --prometheus`), multi-layer OCI Image Layout packing/unpacking with `.wh.` whiteouts (`image-pack`/`image-unpack`), fail-closed cgroup v2 `io.max` block I/O policy validation (`run --io-max`), POSIX `RLIMIT_NOFILE` file-descriptor enforcement (`run --nofile 128`), the built-in deterministic latency/throughput benchmark suite (`bench --json` / `bench --markdown`), declarative read-only host bind mounts with `MS_NOSUID | MS_NODEV` hardening (`run --mount <src>:<dst>:ro`), and baseline OCI seccomp profile export + custom seccomp profile execution (`seccomp-export --out` + `run --seccomp-profile`):
+On a Linux 5.15+ host with `busybox` (`busybox-static`) and `python3` installed, run the self-contained 28/28 check verification demo covering normal execution, `memory.max` OOM-kill telemetry (`oom_killed: true`), fail-closed seccomp/capability enforcement, zero-leak cleanup, V2 workspace snapshots/diffs, parallel multi-agent branch execution, winner promotion/rollback, OCI bundle scaffolding, container inventory/garbage collection (`list`/`prune`), JSONL audit log analytics (`audit --file`), host readiness diagnostics (`doctor`), declarative rubric evaluation (`eval --spec`), OCI rootfs tar archive export/import round-trip (`image-export`/`image-import`), Firecracker/`libkrun` MicroVM specification synthesis (`microvm-config`), bounded worker-pool concurrency (`branch-run --max-concurrency`) + rootless user-namespace bundle scaffolding (`init-bundle --rootless`), tamper-evident hash-chained audit verification + Prometheus metrics export (`audit --file ... --prometheus`), multi-layer OCI Image Layout packing/unpacking with `.wh.` whiteouts (`image-pack`/`image-unpack`), fail-closed cgroup v2 `io.max` block I/O policy validation (`run --io-max`), POSIX `RLIMIT_NOFILE` file-descriptor enforcement (`run --nofile 128`), the built-in deterministic latency/throughput benchmark suite (`bench --json` / `bench --markdown`), declarative read-only host bind mounts with `MS_NOSUID | MS_NODEV` hardening (`run --mount <src>:<dst>:ro`), baseline OCI seccomp profile export + custom seccomp profile execution (`seccomp-export --out` + `run --seccomp-profile`), ephemeral size-bounded `tmpfs` scratch mounts inside a read-only rootfs (`run --tmpfs /tmp:size=16m`), and per-run process overrides (`run --cmd ... -e ... --cwd /tmp`):
 
 ```bash
 sudo ./scripts/demo-v1.sh ./target/release/boxlet
@@ -583,6 +613,8 @@ For the full trust-boundary diagram, threat matrix, and residual risk analysis, 
 | **Milestone 16 (V8)** | Built-in deterministic latency & throughput benchmark suite (`boxlet bench --iterations <N> --markdown \| --json`, `Engine::run_benchmark`, `BenchmarkConfig`, `BenchmarkReport`, `LatencySummary`) ([ADR-011](docs/adr/011-psi-telemetry-rlimits-and-benchmark-suite.md)) | **Shipped** |
 | **Milestone 17 (V9)** | Declarative host bind mounts (`--mount <SRC>:<DST>[:ro\|rw]`, `BindMountSpec`, `ExecutionPolicy::bind_mounts`, `OciMount`) with read-only default, path-traversal & reserved-destination rejection, and `MS_NOSUID \| MS_NODEV` remount hardening ([ADR-012](docs/adr/012-bind-mounts-and-seccomp-profile-management.md)) | **Shipped** |
 | **Milestone 18 (V9)** | Baseline OCI seccomp profile export (`boxlet seccomp-export [--out <PATH>]`, `build_default_seccomp_profile`) and custom seccomp profile loading & enforcement (`--seccomp-profile <PATH>`, `ExecutionPolicy::seccomp_profile_path`, `load_seccomp_profile`) ([ADR-012](docs/adr/012-bind-mounts-and-seccomp-profile-management.md)) | **Shipped** |
+| **Milestone 19 (V10)** | Ephemeral size-bounded `tmpfs` scratch mounts (`--tmpfs <DST>[:size=<BYTES>,mode=<OCTAL>,noexec\|exec]`, `TmpfsMountSpec`, `ExecutionPolicy::tmpfs_mounts`) with `MS_NOSUID \| MS_NODEV \| MS_NOEXEC` default hardening inside read-only rootfs sandboxes ([ADR-013](docs/adr/013-ephemeral-tmpfs-mounts-and-process-overrides.md)) | **Shipped** |
+| **Milestone 20 (V10)** | Per-run process overrides (`--cmd <SHELL_CMD>`, `-e` / `--env <KEY=VALUE>`, `--cwd <DIR>`, `ExecutionPolicy::args_override`, `env_overrides`, `cwd_override`) for reusable immutable base bundles ([ADR-013](docs/adr/013-ephemeral-tmpfs-mounts-and-process-overrides.md)) | **Shipped** |
 
 ---
 
@@ -606,6 +638,10 @@ For the full trust-boundary diagram, threat matrix, and residual risk analysis, 
 | `io_max` | `--io-max "<MAJ>:<MIN> rbps=... wbps=... riops=... wiops=..."` | `[]` (bundle default) | Cgroup v2 `io.max` per-device bandwidth (`rbps`/`wbps`) and IOPS (`riops`/`wiops`) limits (`IoMaxRule`) |
 | `nofile_limit` | `--nofile <N>` | `None` (bundle default) | POSIX `RLIMIT_NOFILE` soft/hard open file-descriptor limit applied before `execve` (plus unconditional `RLIMIT_CORE = 0`) |
 | `bind_mounts` | `--mount <SRC>:<DST>[:ro\|rw]` | `[]` (bundle default) | Declarative host-to-container bind mounts (`BindMountSpec`) applied prior to `pivot_root` with `ro` default and `MS_NOSUID \| MS_NODEV` hardening |
+| `tmpfs_mounts` | `--tmpfs <DST>[:size=<BYTES>,mode=<OCTAL>,noexec\|exec]` | `[]` (bundle default) | Ephemeral size-bounded `tmpfs` mounts (`TmpfsMountSpec`) provisioned prior to `pivot_root` with `size=64m,mode=1777,noexec` default and `MS_NOSUID \| MS_NODEV` hardening |
+| `args_override` | `--cmd <SHELL_CMD>` | `None` (bundle default) | Per-run process argument vector override (`["/bin/sh", "-c", "<SHELL_CMD>"]`) |
+| `env_overrides` | `-e` / `--env <KEY=VALUE>` | `[]` (bundle default) | Per-run environment variable overrides merged by key into `process.env` |
+| `cwd_override` | `--cwd <DIR>` | `None` (bundle default) | Per-run container working directory override (`process.cwd`, must be an absolute path) |
 | `seccomp_profile_path` | `--seccomp-profile <PATH>` | `None` (default allowlist) | Path to a custom OCI `LinuxSeccomp` JSON profile loaded via `load_seccomp_profile` |
 | `network` | `--network <none\|isolated\|host>` | `isolated` (`run`) | Network namespace isolation mode (fails closed on unknown modes) |
 | `timeout` | `--timeout <SECONDS>` | `None` | Wall-clock execution timeout before `cgroup.kill` teardown |

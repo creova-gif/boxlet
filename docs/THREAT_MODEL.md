@@ -107,7 +107,17 @@
 
 ---
 
-## 8. Residual Risks & Explicit Non-Goals (V1)
+## 8. V10 Ephemeral `tmpfs` Scratch Isolation & Per-Run Process Override Validation
+
+1. **Size-Bounded Ephemeral `tmpfs` Scratch Mounts (`--tmpfs <DST>[:size=<BYTES>,mode=<OCTAL>,noexec|exec]` / `TmpfsMountSpec`):**
+   - `TmpfsMountSpec::parse()` requires an absolute container destination starting with `/`, rejects any `..` path-traversal components or reserved destinations (`/`, `/proc`, `/sys`, `/dev`, or subpaths under `/proc/`, `/sys/`, `/dev/`), rejects `size=0` or octal modes `> 0o7777`, and defaults to `size=64m` (`67108864` bytes), `mode=01777`, and `noexec=true` ([ADR-013](adr/013-ephemeral-tmpfs-mounts-and-process-overrides.md)).
+   - Inside the container's private mount namespace prior to `pivot_root`, `setup_rootfs()` mounts `tmpfs` with `MS_NOSUID | MS_NODEV` (plus `MS_NOEXEC` by default) and `size=<bytes>,mode=<octal>`. Because `tmpfs` allocation is charged against the container's cgroup v2 `memory.max` budget and lives purely in kernel memory inside `CLONE_NEWNS`, writes inside `/tmp` never persist to the host disk and cannot bypass a read-only rootfs (`root.readonly: true`) or exhaust host RAM beyond `memory.max`.
+2. **Fail-Closed Per-Run Process Overrides (`--cmd`, `-e` / `--env`, `--cwd`):**
+   - `ExecutionPolicy::validate()` rejects empty `args_override`, any `env_overrides` entry missing `=`, starting with `=`, or containing NUL (`\0`) bytes, and any `cwd_override` that is not an absolute path starting with `/` or contains `..` traversal components with `BoxletError::InvalidPolicy` before any container process is spawned.
+
+---
+
+## 9. Residual Risks & Explicit Non-Goals (V1)
 
 1. **Shared host kernel exploits (residual risk):** A Linux kernel vulnerability triggered by an allowed syscall can break out of namespaces and seccomp. V1 accepts this boundary for single-host dev/test environments; hostile multi-tenant isolation is deferred to a future microVM `RuntimeBackend` (Firecracker / `libkrun`).
 2. **Root execution requirement (non-goal in V1):** V1 requires `root` on a dedicated Linux 5.15+ host/VM. Rootless user-namespace containers are explicitly excluded from V1 to avoid premature complexity and false security claims.

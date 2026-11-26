@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Boxlet V1–V9 End-to-End 26-Check Verification & Demo Suite
+# Boxlet V1–V10 End-to-End 28-Check Verification & Demo Suite
 # Runs on any privileged Linux 5.15+ host with unified cgroup v2 and busybox-static.
 set -euo pipefail
 
@@ -739,7 +739,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 18: MicroVM Specification Synthesis (boxlet microvm-config for Firecracker & libkrun)
 # ------------------------------------------------------------------------------
-echo "==> [Check 18] [18/26] MicroVM Specification Synthesis (boxlet microvm-config for Firecracker & libkrun)"
+echo "==> [Check 18] [18/28] MicroVM Specification Synthesis (boxlet microvm-config for Firecracker & libkrun)"
 "$BOXLET_BIN" microvm-config \
   --driver firecracker \
   --id vm-fc-1 \
@@ -777,7 +777,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 19: Bounded Worker-Pool Concurrency & Rootless Bundle Scaffolding
 # ------------------------------------------------------------------------------
-echo "==> [Check 19] [19/26] Bounded Worker-Pool Concurrency (--max-concurrency 1) & Rootless Bundle Scaffolding (init-bundle --rootless)"
+echo "==> [Check 19] [19/28] Bounded Worker-Pool Concurrency (--max-concurrency 1) & Rootless Bundle Scaffolding (init-bundle --rootless)"
 sudo "$BOXLET_BIN" branch-run \
   --root "$STATE_ROOT" \
   --cgroup-parent "$CGROUP_PARENT" \
@@ -822,7 +822,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 20: Tamper-Evident Hash-Chained Audit Ledger & Prometheus Metrics
 # ------------------------------------------------------------------------------
-echo "==> [Check 20] [20/26] Tamper-Evident Hash-Chained Audit Ledger & Prometheus Metrics (boxlet audit --file ... --json / --prometheus)"
+echo "==> [Check 20] [20/28] Tamper-Evident Hash-Chained Audit Ledger & Prometheus Metrics (boxlet audit --file ... --json / --prometheus)"
 sudo "$BOXLET_BIN" audit --file "$AUDIT_LOG" --json > "$WORK_DIR/check20-audit.json"
 sudo "$BOXLET_BIN" audit --file "$AUDIT_LOG" --prometheus > "$WORK_DIR/check20-audit.prom"
 
@@ -846,7 +846,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 21: Multi-Layer OCI Image Layout Packing & Unpacking with Whiteout (.wh.) Support
 # ------------------------------------------------------------------------------
-echo "==> [Check 21] [21/26] Multi-Layer OCI Image Layout Packing & Unpacking with Whiteout (.wh.) Support (boxlet image-pack + boxlet image-unpack)"
+echo "==> [Check 21] [21/28] Multi-Layer OCI Image Layout Packing & Unpacking with Whiteout (.wh.) Support (boxlet image-pack + boxlet image-unpack)"
 mkdir -p "$WORK_DIR/oci-layer-base/etc" "$WORK_DIR/oci-layer-upper/etc"
 cp -a "$BUNDLE_DIR/rootfs/bin" "$WORK_DIR/oci-layer-base/bin"
 echo "keep-base-v1" > "$WORK_DIR/oci-layer-base/etc/keep.txt"
@@ -890,7 +890,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 22: Cgroup v2 io.max Block I/O Policy Validation
 # ------------------------------------------------------------------------------
-echo "==> [Check 22] [22/26] Cgroup v2 io.max Block I/O Policy Validation (boxlet run --io-max)"
+echo "==> [Check 22] [22/28] Cgroup v2 io.max Block I/O Policy Validation (boxlet run --io-max)"
 "$BOXLET_BIN" run --help | grep -q -- "--io-max"
 IO_ERR_OUT="$WORK_DIR/check22-iomax-err.txt"
 if "$BOXLET_BIN" run --io-max "8:0 rbps=0" "$BUNDLE_DIR" >"$IO_ERR_OUT" 2>&1; then
@@ -903,7 +903,7 @@ echo "    cgroup v2 io.max validation verified: $(tr '\n' ' ' < "$IO_ERR_OUT")"
 # ------------------------------------------------------------------------------
 # Check 23: POSIX RLIMIT_NOFILE Enforcement (--nofile)
 # ------------------------------------------------------------------------------
-echo "==> [Check 23] [23/26] POSIX RLIMIT_NOFILE Enforcement (boxlet run --nofile 128)"
+echo "==> [Check 23] [23/28] POSIX RLIMIT_NOFILE Enforcement (boxlet run --nofile 128)"
 "$BOXLET_BIN" init-bundle \
   --busybox "$BUSYBOX_BIN" \
   --cmd "ulimit -n" \
@@ -928,7 +928,7 @@ echo "    POSIX RLIMIT_NOFILE verified: ulimit -n = $NOFILE_TRIMMED"
 # ------------------------------------------------------------------------------
 # Check 24: Built-In Deterministic Benchmark Suite (boxlet bench)
 # ------------------------------------------------------------------------------
-echo "==> [Check 24] [24/26] Built-In Deterministic Benchmark Suite (boxlet bench --json / --markdown)"
+echo "==> [Check 24] [24/28] Built-In Deterministic Benchmark Suite (boxlet bench --json / --markdown)"
 write_bundle_config "true"
 sudo "$BOXLET_BIN" \
   --root "$STATE_ROOT" \
@@ -973,7 +973,7 @@ echo "    bench Markdown verified: $(grep 'sandbox_run' "$WORK_DIR/check24-bench
 # ------------------------------------------------------------------------------
 # Check 25: Declarative Bind Mounts (--mount <src>:<dst>:ro with MS_NOSUID | MS_NODEV)
 # ------------------------------------------------------------------------------
-echo "==> [Check 25] [25/26] Declarative Bind Mounts (boxlet run --mount <src>:<dst>:ro)"
+echo "==> [Check 25] [25/28] Declarative Bind Mounts (boxlet run --mount <src>:<dst>:ro)"
 mkdir -p "$WORK_DIR/host-data"
 printf 'mounted-dataset-v9\n' > "$WORK_DIR/host-data/dataset.txt"
 write_bundle_config "cat /mnt/data/dataset.txt && ! sh -c 'echo mutate > /mnt/data/dataset.txt' 2>/dev/null"
@@ -1001,7 +1001,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 26: Baseline Seccomp Profile Export & Custom Profile Execution (boxlet seccomp-export + run --seccomp-profile)
 # ------------------------------------------------------------------------------
-echo "==> [Check 26] [26/26] Baseline Seccomp Profile Export & Custom Profile Execution (boxlet seccomp-export + boxlet run --seccomp-profile)"
+echo "==> [Check 26] [26/28] Baseline Seccomp Profile Export & Custom Profile Execution (boxlet seccomp-export + boxlet run --seccomp-profile)"
 "$BOXLET_BIN" seccomp-export --out "$WORK_DIR/exported-seccomp.json"
 write_bundle_config "echo seccomp-custom-ok"
 sudo "$BOXLET_BIN" \
@@ -1025,4 +1025,67 @@ assert data["cleanup"]["status"] == "clean", f"expected clean status, got {data[
 print(f"    seccomp-export & custom --seccomp-profile verified: exit_code={data['exit_code']}, stdout={stdout.strip()!r}")
 PY
 
-echo "==> ALL 26/26 BOXLET V1+V2+V3+V4+V5+V6+V7+V8+V9 CHECKS PASSED"
+# ------------------------------------------------------------------------------
+# Check 27: Ephemeral Size-Bounded tmpfs Scratch Mount inside a Read-Only Rootfs (--tmpfs /tmp:size=16m)
+# ------------------------------------------------------------------------------
+echo "==> [Check 27] [27/28] Ephemeral Size-Bounded tmpfs Scratch Mount inside a Read-Only Rootfs (boxlet run --tmpfs /tmp:size=16m)"
+"$BOXLET_BIN" init-bundle \
+  --busybox "$BUSYBOX_BIN" \
+  --readonly \
+  --cmd "true" \
+  --json \
+  "$WORK_DIR/ro-tmpfs-bundle" > "$WORK_DIR/check27-init.json"
+
+sudo "$BOXLET_BIN" \
+  --root "$STATE_ROOT" \
+  --cgroup-parent "$CGROUP_PARENT" \
+  run \
+  --tmpfs "/tmp:size=16m" \
+  --cmd "echo scratch-v10-ok > /tmp/scratch.txt && cat /tmp/scratch.txt && ! sh -c 'echo fail > /etc/ro.txt' 2>/dev/null" \
+  --json \
+  "$WORK_DIR/ro-tmpfs-bundle" > "$WORK_DIR/check27-tmpfs.json"
+
+python3 - "$WORK_DIR/check27-tmpfs.json" "$WORK_DIR/ro-tmpfs-bundle/rootfs/tmp/scratch.txt" <<'PY'
+import json, os, sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+
+stdout = bytes(data["stdout"]).decode("utf-8", errors="replace")
+assert data["exit_code"] == 0, f"expected exit_code 0, got {data['exit_code']}"
+assert stdout == "scratch-v10-ok\n", f"expected stdout=='scratch-v10-ok\\n', got {stdout!r}"
+assert not os.path.exists(sys.argv[2]), f"expected {sys.argv[2]} not to exist on disk"
+assert data["cleanup"]["status"] == "clean", f"expected clean status, got {data['cleanup']}"
+print(f"    ephemeral tmpfs verified: exit_code={data['exit_code']}, stdout={stdout.strip()!r}, host_disk_clean=True")
+PY
+
+# ------------------------------------------------------------------------------
+# Check 28: Per-Run Process Overrides (--cmd, -e / --env, --cwd)
+# ------------------------------------------------------------------------------
+echo "==> [Check 28] [28/28] Per-Run Process Overrides (boxlet run --cmd / -e / --cwd)"
+sudo "$BOXLET_BIN" \
+  --root "$STATE_ROOT" \
+  --cgroup-parent "$CGROUP_PARENT" \
+  run \
+  --tmpfs "/tmp:size=8m" \
+  -e "AGENT_ROLE=verifier" \
+  -e "RUN_STAGE=v10" \
+  --cwd "/tmp" \
+  --cmd "pwd && echo \$AGENT_ROLE:\$RUN_STAGE" \
+  --json \
+  "$WORK_DIR/ro-tmpfs-bundle" > "$WORK_DIR/check28-overrides.json"
+
+python3 - "$WORK_DIR/check28-overrides.json" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+
+stdout = bytes(data["stdout"]).decode("utf-8", errors="replace")
+assert data["exit_code"] == 0, f"expected exit_code 0, got {data['exit_code']}"
+assert stdout == "/tmp\nverifier:v10\n", f"expected stdout=='/tmp\\nverifier:v10\\n', got {stdout!r}"
+assert data["cleanup"]["status"] == "clean", f"expected clean status, got {data['cleanup']}"
+print(f"    per-run process overrides verified: exit_code={data['exit_code']}, stdout={stdout.strip().replace(chr(10), ' | ')!r}")
+PY
+
+echo "==> ALL 28/28 BOXLET V1+V2+V3+V4+V5+V6+V7+V8+V9+V10 CHECKS PASSED"

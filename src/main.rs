@@ -154,6 +154,18 @@ enum Commands {
         /// Bind-mount a host path into the container (`<src>:<dst>[:ro|rw]`, repeatable; defaults to `:ro`).
         #[arg(long = "mount")]
         mounts: Vec<String>,
+        /// Mount an ephemeral size-bounded tmpfs inside the container (`<dst>[:size=64m,mode=1777,noexec|exec]`, repeatable).
+        #[arg(long = "tmpfs")]
+        tmpfs_mounts: Vec<String>,
+        /// Override container entrypoint with `/bin/sh -c <CMD>`.
+        #[arg(long)]
+        cmd: Option<String>,
+        /// Set or override an environment variable (`KEY=VALUE`, repeatable).
+        #[arg(short = 'e', long = "env")]
+        envs: Vec<String>,
+        /// Override the working directory inside the container (must start with `/`).
+        #[arg(long)]
+        cwd: Option<String>,
         /// Path to a custom OCI LinuxSeccomp JSON profile file.
         #[arg(long)]
         seccomp_profile: Option<PathBuf>,
@@ -242,6 +254,15 @@ enum Commands {
         /// Bind-mount a host path into the container (`<src>:<dst>[:ro|rw]`, repeatable; defaults to `:ro`).
         #[arg(long = "mount")]
         mounts: Vec<String>,
+        /// Mount an ephemeral size-bounded tmpfs inside each branch container (`<dst>[:size=64m,mode=1777,noexec|exec]`, repeatable).
+        #[arg(long = "tmpfs")]
+        tmpfs_mounts: Vec<String>,
+        /// Set or override an environment variable in each branch (`KEY=VALUE`, repeatable).
+        #[arg(short = 'e', long = "env")]
+        envs: Vec<String>,
+        /// Override the working directory inside each branch container (must start with `/`).
+        #[arg(long)]
+        cwd: Option<String>,
         /// Path to a custom OCI LinuxSeccomp JSON profile file.
         #[arg(long)]
         seccomp_profile: Option<PathBuf>,
@@ -824,6 +845,10 @@ fn dispatch_platform(
             io_max,
             nofile,
             mounts,
+            tmpfs_mounts,
+            cmd,
+            envs,
+            cwd,
             seccomp_profile,
             network,
             timeout,
@@ -839,6 +864,10 @@ fn dispatch_platform(
                 &io_max,
                 nofile,
                 &mounts,
+                &tmpfs_mounts,
+                cmd,
+                envs,
+                cwd,
                 seccomp_profile.as_deref(),
                 network.as_deref(),
                 timeout,
@@ -870,6 +899,9 @@ fn dispatch_platform(
             io_max,
             nofile,
             mounts,
+            tmpfs_mounts,
+            envs,
+            cwd,
             seccomp_profile,
             network,
             timeout,
@@ -886,12 +918,17 @@ fn dispatch_platform(
                 &io_max,
                 nofile,
                 &mounts,
+                &tmpfs_mounts,
+                None,
+                envs,
+                cwd,
                 seccomp_profile.as_deref(),
                 network.as_deref(),
                 timeout,
                 max_output_bytes,
             )?;
             policy.max_concurrency = max_concurrency;
+            policy.validate()?;
             let prefix = generate_container_id();
             let specs: Vec<BranchSpec> = cmds
                 .into_iter()
@@ -1062,6 +1099,10 @@ fn build_execution_policy(
     io_max_raw: &[String],
     nofile: Option<u64>,
     mounts_raw: &[String],
+    tmpfs_raw: &[String],
+    cmd: Option<String>,
+    envs: Vec<String>,
+    cwd: Option<String>,
     seccomp_profile: Option<&Path>,
     network: Option<&str>,
     timeout: Option<u64>,
@@ -1077,6 +1118,10 @@ fn build_execution_policy(
     for raw in mounts_raw {
         parsed_mounts.push(raw.parse::<boxlet::BindMountSpec>()?);
     }
+    let mut parsed_tmpfs = Vec::with_capacity(tmpfs_raw.len());
+    for raw in tmpfs_raw {
+        parsed_tmpfs.push(raw.parse::<boxlet::TmpfsMountSpec>()?);
+    }
     let mut policy = ExecutionPolicy {
         memory_bytes,
         cpus,
@@ -1088,6 +1133,15 @@ fn build_execution_policy(
         } else {
             Some(parsed_mounts)
         },
+        tmpfs_mounts: if parsed_tmpfs.is_empty() {
+            None
+        } else {
+            Some(parsed_tmpfs)
+        },
+        args_override: cmd
+            .map(|shell_cmd| vec!["/bin/sh".to_string(), "-c".to_string(), shell_cmd]),
+        env_overrides: if envs.is_empty() { None } else { Some(envs) },
+        cwd_override: cwd,
         network: network_mode,
         timeout: timeout.map(Duration::from_secs),
         max_output_bytes,
@@ -1097,6 +1151,7 @@ fn build_execution_policy(
         let prof = boxlet::load_seccomp_profile(path)?;
         policy.seccomp = Some(boxlet::policy::SeccompPolicy::Custom(Box::new(prof)));
     }
+    policy.validate()?;
     Ok(policy)
 }
 
@@ -1650,6 +1705,100 @@ mod tests {
                 ..
             } if mounts.len() == 2
         ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn cli_run_and_branch_run_parse_tmpfs_and_process_overrides() -> Result<()> {
+        let run_cli = Cli::try_parse_from([
+            "boxlet",
+            "run",
+            "--tmpfs",
+            "/tmp:size=16m",
+            "-e",
+            "AGENT_MODE=verify",
+            "--cwd",
+            "/tmp",
+            "--cmd",
+            "echo ok",
+            "/tmp/bundle",
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+
+        match run_cli.command {
+            Commands::Run {
+                tmpfs_mounts,
+                cmd,
+                envs,
+                cwd,
+                bundle,
+                ..
+            } => {
+                assert_eq!(tmpfs_mounts, vec!["/tmp:size=16m".to_string()]);
+                assert_eq!(cmd.as_deref(), Some("echo ok"));
+                assert_eq!(envs, vec!["AGENT_MODE=verify".to_string()]);
+                assert_eq!(cwd.as_deref(), Some("/tmp"));
+                assert_eq!(bundle, PathBuf::from("/tmp/bundle"));
+                let parsed_tmpfs: boxlet::TmpfsMountSpec = tmpfs_mounts[0].parse()?;
+                assert_eq!(parsed_tmpfs.destination, PathBuf::from("/tmp"));
+                assert_eq!(parsed_tmpfs.size_bytes, 16 * 1024 * 1024);
+                assert_eq!(parsed_tmpfs.mode, 0o1777);
+                assert!(parsed_tmpfs.noexec);
+            }
+            other => {
+                return Err(BoxletError::InvalidPolicy {
+                    reason: format!("expected Commands::Run, got {other:?}"),
+                });
+            }
+        }
+
+        let branch_cli = Cli::try_parse_from([
+            "boxlet",
+            "branch-run",
+            "--cmd",
+            "echo branch-1",
+            "--tmpfs",
+            "/run:size=8m,mode=0755,exec",
+            "--env",
+            "BRANCH_ENV=1",
+            "--cwd",
+            "/workspace",
+            "/tmp/bundle",
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+
+        match branch_cli.command {
+            Commands::BranchRun {
+                cmds,
+                tmpfs_mounts,
+                envs,
+                cwd,
+                ..
+            } => {
+                assert_eq!(cmds, vec!["echo branch-1".to_string()]);
+                assert_eq!(
+                    tmpfs_mounts,
+                    vec!["/run:size=8m,mode=0755,exec".to_string()]
+                );
+                assert_eq!(envs, vec!["BRANCH_ENV=1".to_string()]);
+                assert_eq!(cwd.as_deref(), Some("/workspace"));
+                let parsed_tmpfs: boxlet::TmpfsMountSpec = tmpfs_mounts[0].parse()?;
+                assert_eq!(parsed_tmpfs.destination, PathBuf::from("/run"));
+                assert_eq!(parsed_tmpfs.size_bytes, 8 * 1024 * 1024);
+                assert_eq!(parsed_tmpfs.mode, 0o755);
+                assert!(!parsed_tmpfs.noexec);
+            }
+            other => {
+                return Err(BoxletError::InvalidPolicy {
+                    reason: format!("expected Commands::BranchRun, got {other:?}"),
+                });
+            }
+        }
 
         Ok(())
     }

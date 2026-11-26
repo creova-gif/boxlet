@@ -523,6 +523,14 @@ impl RuntimeBackend for MicroVmBackend {
             } else {
                 Some(resolved.bind_mounts.clone())
             },
+            tmpfs_mounts: if resolved.tmpfs_mounts.is_empty() {
+                None
+            } else {
+                Some(resolved.tmpfs_mounts.clone())
+            },
+            args_override: None,
+            env_overrides: None,
+            cwd_override: None,
         };
 
         self.create(id, bundle, &resolved.oci_spec)?;
