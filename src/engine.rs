@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use oci_spec::runtime::Spec;
 use serde::{Deserialize, Serialize};
 
+use crate::audit::{AuditEvent, JsonlAuditLogger};
 use crate::error::{BoxletError, Result};
 use crate::oci::state::ContainerState;
 use crate::oci::{load_bundle_spec, validate_container_id};
@@ -169,25 +170,55 @@ struct PreparedBranch {
 #[derive(Debug, Clone)]
 pub struct Engine<B: RuntimeBackend> {
     backend: B,
+    audit_logger: Option<JsonlAuditLogger>,
 }
 
 impl<B: RuntimeBackend> Engine<B> {
     /// Constructs a new [`Engine`] backed by `backend`.
     pub fn new(backend: B) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            audit_logger: None,
+        }
+    }
+
+    /// Attaches an append-only [`JsonlAuditLogger`] to this [`Engine`].
+    pub fn with_audit_logger(mut self, logger: JsonlAuditLogger) -> Self {
+        self.audit_logger = Some(logger);
+        self
+    }
+
+    /// Attaches an optional append-only [`JsonlAuditLogger`] to this [`Engine`].
+    pub fn with_optional_audit_logger(mut self, logger: Option<JsonlAuditLogger>) -> Self {
+        self.audit_logger = logger;
+        self
     }
 
     /// Creates a container from `<bundle>/config.json` **verbatim** (no `boxlet run` defaults injected).
     pub fn create(&self, id: &str, bundle: &Path) -> Result<ContainerState> {
         validate_container_id(id)?;
         let spec = load_bundle_spec(bundle)?;
-        self.backend.create(id, bundle, &spec)
+        let state = self.backend.create(id, bundle, &spec)?;
+        if let Some(ref logger) = self.audit_logger {
+            logger.record(AuditEvent::ContainerCreated {
+                container_id: id.to_string(),
+                bundle: bundle.to_path_buf(),
+            })?;
+        }
+        Ok(state)
     }
 
     /// Starts a previously created container (`Created -> Running`).
     pub fn start(&self, id: &str) -> Result<ContainerState> {
         validate_container_id(id)?;
-        self.backend.start(id)
+        let state = self.backend.start(id)?;
+        if let Some(ref logger) = self.audit_logger {
+            logger.record(AuditEvent::ContainerStarted {
+                container_id: id.to_string(),
+                pid: state.pid,
+            })?;
+        }
+        Ok(state)
     }
 
     /// Queries the current OCI state of container `id`.
@@ -199,13 +230,27 @@ impl<B: RuntimeBackend> Engine<B> {
     /// Sends OS signal `signal` to container `id`.
     pub fn kill(&self, id: &str, signal: i32) -> Result<()> {
         validate_container_id(id)?;
-        self.backend.kill(id, signal)
+        self.backend.kill(id, signal)?;
+        if let Some(ref logger) = self.audit_logger {
+            logger.record(AuditEvent::ContainerKilled {
+                container_id: id.to_string(),
+                signal,
+            })?;
+        }
+        Ok(())
     }
 
     /// Deletes container `id` (requires `Stopped` unless `force` is true).
     pub fn delete(&self, id: &str, force: bool) -> Result<()> {
         validate_container_id(id)?;
-        self.backend.delete(id, force)
+        self.backend.delete(id, force)?;
+        if let Some(ref logger) = self.audit_logger {
+            logger.record(AuditEvent::ContainerDeleted {
+                container_id: id.to_string(),
+                force,
+            })?;
+        }
+        Ok(())
     }
 
     /// Runs a container end-to-end by overlaying `policy` onto `<bundle>/config.json`
@@ -219,7 +264,19 @@ impl<B: RuntimeBackend> Engine<B> {
         validate_container_id(id)?;
         let base_spec = load_bundle_spec(bundle)?;
         let resolved = merge_policy_with_spec(&base_spec, policy)?;
-        self.backend.run(id, bundle, &resolved)
+        let result = self.backend.run(id, bundle, &resolved)?;
+        if let Some(ref logger) = self.audit_logger {
+            logger.record(AuditEvent::ContainerRunCompleted {
+                container_id: result.container_id.clone(),
+                exit_code: result.exit_code,
+                duration_ms: u64::try_from(result.usage.duration.as_millis()).unwrap_or(u64::MAX),
+                memory_peak_bytes: result.usage.memory_peak_bytes,
+                cpu_usage_usec: result.usage.cpu_usage_usec,
+                violations: result.violations.clone(),
+                cleanup: result.cleanup.clone(),
+            })?;
+        }
+        Ok(result)
     }
 
     /// Snapshots `<bundle>` once, fans out `branches` concurrently in isolated workspace
@@ -348,6 +405,15 @@ impl<B: RuntimeBackend> Engine<B> {
             Ok(out)
         })?;
 
+        let succeeded_count = results
+            .iter()
+            .filter(|res| {
+                res.execution.exit_code == Some(0)
+                    && !res.execution.violations.timed_out
+                    && !res.execution.violations.oom_killed
+            })
+            .count();
+
         let mut promoted_branch_id = None;
         let mut promoted_diff = None;
         if promote_winner {
@@ -369,6 +435,15 @@ impl<B: RuntimeBackend> Engine<B> {
                 promoted_branch_id = Some(winner_res.branch_id.clone());
                 promoted_diff = Some(applied_diff);
             }
+        }
+
+        if let Some(ref logger) = self.audit_logger {
+            logger.record(AuditEvent::BranchBatchCompleted {
+                branch_count: results.len(),
+                succeeded_count,
+                promoted_branch_id: promoted_branch_id.clone(),
+                promoted_changes: promoted_diff.as_ref().map(FsDiff::total_changes),
+            })?;
         }
 
         Ok(BranchBatchReport {
@@ -761,6 +836,49 @@ mod tests {
             report.promoted_diff.as_ref().map(|d| d.added.clone()),
             Some(vec![PathBuf::from("winner.txt")])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn engine_with_audit_logger_records_run_and_branch_events() -> Result<()> {
+        let bundle = make_bundle()?;
+        let log_dir = tempfile::tempdir().map_err(|source| BoxletError::StateStore {
+            path: PathBuf::from("tempdir"),
+            source,
+        })?;
+        let logger = JsonlAuditLogger::new(log_dir.path().join("audit.jsonl"));
+        let engine = Engine::new(MockBackend::default()).with_audit_logger(logger.clone());
+        let policy = ExecutionPolicy::default();
+
+        let run_res = engine.run("audit-run-1", bundle.path(), &policy)?;
+        assert_eq!(run_res.exit_code, Some(0));
+
+        let specs = vec![
+            BranchSpec::new("branch-1").with_args(vec!["branch-fail-action".to_string()]),
+            BranchSpec::new("branch-2").with_args(vec!["branch-win-action".to_string()]),
+        ];
+        let report = engine.run_branches_with_promotion(bundle.path(), &specs, &policy, true)?;
+        assert_eq!(report.promoted_branch_id, Some("branch-2".to_string()));
+
+        let records = logger.read_all()?;
+        assert_eq!(records.len(), 2);
+        assert!(matches!(
+            &records[0].event,
+            AuditEvent::ContainerRunCompleted {
+                container_id,
+                exit_code: Some(0),
+                ..
+            } if container_id == "audit-run-1"
+        ));
+        assert!(matches!(
+            &records[1].event,
+            AuditEvent::BranchBatchCompleted {
+                branch_count: 2,
+                succeeded_count: 1,
+                promoted_branch_id: Some(winner),
+                promoted_changes: Some(1),
+            } if winner == "branch-2"
+        ));
         Ok(())
     }
 }

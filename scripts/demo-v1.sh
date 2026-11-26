@@ -28,7 +28,7 @@ BUNDLE_DIR="$WORK_DIR/bundle"
 STATE_ROOT="$WORK_DIR/state"
 
 cleanup() {
-  for id in ci-check-1 ci-check-2 ci-check-3 ci-check-4 ci-check-5 ci-check-6 ci-oci-lifecycle-1; do
+  for id in ci-check-1 ci-check-2 ci-check-3 ci-check-4 ci-check-5 ci-check-6 ci-oci-lifecycle-1 ci-check-11 ci-check-12; do
     if [[ -d "$CGROUP_PARENT/$id" ]]; then
       echo 1 | sudo tee "$CGROUP_PARENT/$id/cgroup.kill" >/dev/null 2>&1 || true
       sudo rmdir "$CGROUP_PARENT/$id" >/dev/null 2>&1 || true
@@ -445,4 +445,82 @@ assert post_diff.get("deleted") == [], f"expected empty deleted after restore, g
 print(f"    restored cleanly (reverted={restore_diff}, post_restore_diff={post_diff})")
 PY
 
-echo "==> All 10 Boxlet V1 & V2 end-to-end checks passed with zero leaked cgroups or state directories!"
+# ------------------------------------------------------------------------------
+# Check 11: Zero-Config OCI Bundle Scaffolding (boxlet init-bundle + boxlet run)
+# ------------------------------------------------------------------------------
+echo "==> [Check 11] Zero-Config OCI Bundle Scaffolding (boxlet init-bundle + boxlet run)"
+"$BOXLET_BIN" init-bundle \
+  --cmd "echo init-bundle-ok && uname -s" \
+  --busybox "$BUSYBOX_SRC" \
+  --hostname "boxlet-scaffold" \
+  --json \
+  "$WORK_DIR/scaffolded-bundle" > "$WORK_DIR/check11-init.json"
+
+sudo "$BOXLET_BIN" run \
+  --root "$STATE_ROOT" \
+  --cgroup-parent "$CGROUP_PARENT" \
+  --id ci-check-11 \
+  --memory 64m \
+  --network none \
+  --json \
+  "$WORK_DIR/scaffolded-bundle" > "$WORK_DIR/check11-run.json"
+
+python3 - "$WORK_DIR/check11-init.json" "$WORK_DIR/check11-run.json" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    init_meta = json.load(f)
+with open(sys.argv[2]) as f:
+    run_data = json.load(f)
+
+stdout = bytes(run_data["stdout"]).decode("utf-8", errors="replace")
+assert run_data["exit_code"] == 0, f"expected exit_code 0, got {run_data['exit_code']}"
+assert "init-bundle-ok" in stdout, f"missing init-bundle-ok in stdout: {stdout!r}"
+assert run_data["cleanup"]["status"] == "clean", f"expected clean status, got {run_data['cleanup']}"
+print(f"    scaffolded bundle={init_meta.get('bundle_dir', 'ok')}, stdout={stdout.strip().replace(chr(10), ' | ')}")
+PY
+assert_zero_leaks "ci-check-11"
+
+# ------------------------------------------------------------------------------
+# Check 12: Structured JSONL Audit Trail (--audit-log)
+# ------------------------------------------------------------------------------
+echo "==> [Check 12] Structured JSONL Audit Trail (--audit-log)"
+sudo "$BOXLET_BIN" --audit-log "$WORK_DIR/audit.jsonl" run \
+  --root "$STATE_ROOT" \
+  --cgroup-parent "$CGROUP_PARENT" \
+  --id ci-check-12 \
+  --memory 64m \
+  --network none \
+  --json \
+  "$WORK_DIR/scaffolded-bundle" > "$WORK_DIR/check12-run.json"
+
+sudo "$BOXLET_BIN" --audit-log "$WORK_DIR/audit.jsonl" branch-run \
+  --root "$STATE_ROOT" \
+  --cgroup-parent "$CGROUP_PARENT" \
+  --memory 64m \
+  --network none \
+  --cmd "echo audit-branch-1" \
+  --json \
+  "$WORK_DIR/scaffolded-bundle" > "$WORK_DIR/check12-branch.json"
+
+sudo python3 - "$WORK_DIR/audit.jsonl" <<'PY'
+import json, os, sys
+
+path = sys.argv[1]
+assert os.path.exists(path), f"expected audit log at {path}"
+mode = os.stat(path).st_mode & 0o777
+assert mode == 0o600, f"expected 0o600 permissions on audit log, got {oct(mode)}"
+
+with open(path) as f:
+    lines = [json.loads(line) for line in f if line.strip()]
+
+assert len(lines) == 2, f"expected 2 JSONL audit records, got {len(lines)}: {lines}"
+assert lines[0].get("event") == "container_run_completed", f"unexpected event[0]: {lines[0]}"
+assert lines[0].get("container_id") == "ci-check-12", f"unexpected container_id[0]: {lines[0]}"
+assert lines[1].get("event") == "branch_batch_completed", f"unexpected event[1]: {lines[1]}"
+assert lines[1].get("branch_count") == 1, f"unexpected branch_count[1]: {lines[1]}"
+print(f"    audit.jsonl verified: mode={oct(mode)}, events={[r['event'] for r in lines]}")
+PY
+assert_zero_leaks "ci-check-12"
+
+echo "==> All 12 Boxlet V1 & V2 end-to-end checks passed with zero leaked cgroups or state directories!"
