@@ -17,12 +17,17 @@ use std::path::{Path, PathBuf};
 
 use nix::sched::CloneFlags;
 use nix::unistd::{chdir, execvpe, fork, ForkResult};
-use oci_spec::runtime::Spec;
+use oci_spec::runtime::{PosixRlimitType, Spec};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{BoxletError, Result};
 use crate::linux::{caps, namespaces, rootfs, seccomp};
 use crate::policy::{NetworkMode, SeccompPolicy};
+
+#[cfg(target_env = "gnu")]
+type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(not(target_env = "gnu"))]
+type RlimitResource = libc::c_int;
 
 /// Handshake config written by parent `LinuxBackend` to `<state_dir>/init.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +39,8 @@ pub(crate) struct InitConfig {
     pub no_new_privs: bool,
     pub capabilities_override: Option<Vec<String>>,
     pub seccomp_policy: Option<SeccompPolicy>,
+    #[serde(default)]
+    pub nofile_limit: Option<u64>,
     pub wait_for_start_fifo: Option<PathBuf>,
     pub pid_pipe_write_fd: RawFd,
     pub ack_pipe_read_fd: RawFd,
@@ -162,6 +169,9 @@ fn container_pid1_main(
         drop(fifo);
     }
 
+    // Enforce POSIX resource limits (RLIMIT_CORE = 0 default + OCI process.rlimits + nofile_limit).
+    apply_rlimits(&cfg.spec, cfg.nofile_limit)?;
+
     // 8. Drop Linux capabilities and enforce PR_SET_NO_NEW_PRIVS.
     let oci_caps = cfg
         .spec
@@ -261,6 +271,56 @@ fn extract_exec_params(spec: &Spec) -> Result<(CString, Vec<CString>, Vec<CStrin
 
     let program = args[0].clone();
     Ok((program, args, env))
+}
+
+fn apply_rlimits(spec: &Spec, nofile_override: Option<u64>) -> Result<()> {
+    // Default-disable core dumps (RLIMIT_CORE = 0) so untrusted sandbox crashes
+    // never dump core files to disk unless explicitly enabled by process.rlimits.
+    set_single_rlimit(libc::RLIMIT_CORE, 0, 0)?;
+
+    if let Some(rlimits) = spec.process().as_ref().and_then(|p| p.rlimits().as_ref()) {
+        for rlimit in rlimits {
+            let res = match rlimit.typ() {
+                PosixRlimitType::RlimitNofile => Some(libc::RLIMIT_NOFILE),
+                PosixRlimitType::RlimitCore => Some(libc::RLIMIT_CORE),
+                PosixRlimitType::RlimitNproc => Some(libc::RLIMIT_NPROC),
+                PosixRlimitType::RlimitAs => Some(libc::RLIMIT_AS),
+                PosixRlimitType::RlimitFsize => Some(libc::RLIMIT_FSIZE),
+                PosixRlimitType::RlimitStack => Some(libc::RLIMIT_STACK),
+                PosixRlimitType::RlimitCpu => Some(libc::RLIMIT_CPU),
+                PosixRlimitType::RlimitMemlock => Some(libc::RLIMIT_MEMLOCK),
+                _ => None,
+            };
+            if let Some(resource) = res {
+                set_single_rlimit(resource, rlimit.soft(), rlimit.hard())?;
+            }
+        }
+    }
+
+    if let Some(nofile) = nofile_override {
+        set_single_rlimit(libc::RLIMIT_NOFILE, nofile, nofile)?;
+    }
+
+    Ok(())
+}
+
+fn set_single_rlimit(resource: RlimitResource, soft: u64, hard: u64) -> Result<()> {
+    let lim = libc::rlimit {
+        rlim_cur: soft as libc::rlim_t,
+        rlim_max: hard as libc::rlim_t,
+    };
+    // SAFETY: `setrlimit` is a standard POSIX syscall taking a valid `rlimit` struct pointer.
+    let rc = unsafe { libc::setrlimit(resource, &lim) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(BoxletError::Runtime {
+            subsystem: "init",
+            message: format!(
+                "setrlimit(resource={resource}, soft={soft}, hard={hard}) failed: {err}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn set_pdeathsig_sigkill() -> Result<()> {

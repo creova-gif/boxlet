@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{BoxletError, Result};
-use crate::policy::{CleanupStatus, PolicyViolations};
+use crate::policy::{CleanupStatus, PolicyViolations, PsiMetrics};
 
 /// 64-bit FNV-1a offset basis constant.
 pub const FNV1A_64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -71,6 +71,9 @@ pub enum AuditEvent {
         memory_peak_bytes: Option<u64>,
         /// Total CPU usage in microseconds (`cpu.stat`).
         cpu_usage_usec: Option<u64>,
+        /// Optional cgroup v2 Pressure Stall Information (`*.pressure`) stall durations.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        psi: Option<PsiMetrics>,
         /// Policy violation flags.
         violations: PolicyViolations,
         /// Cleanup outcome.
@@ -123,6 +126,15 @@ pub struct AuditSummary {
     pub total_duration_ms: u64,
     /// Maximum `memory_peak_bytes` observed across all `container_run_completed` events.
     pub max_memory_peak_bytes: Option<u64>,
+    /// Sum of `cpu_some_total_usec` across all runs reporting PSI telemetry.
+    #[serde(default)]
+    pub total_psi_cpu_some_usec: u64,
+    /// Sum of `memory_some_total_usec` across all runs reporting PSI telemetry.
+    #[serde(default)]
+    pub total_psi_memory_some_usec: u64,
+    /// Sum of `io_some_total_usec` across all runs reporting PSI telemetry.
+    #[serde(default)]
+    pub total_psi_io_some_usec: u64,
     /// True when all `timestamp_unix_ms` values are non-decreasing in file order.
     pub chronological_valid: bool,
     /// True when every record's sequence number, previous hash link, and FNV-1a payload hash are valid.
@@ -205,6 +217,27 @@ impl AuditSummary {
              # TYPE boxlet_memory_peak_bytes_max gauge\n\
              boxlet_memory_peak_bytes_max {}",
             self.max_memory_peak_bytes.unwrap_or(0)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP boxlet_psi_cpu_some_microseconds_total Cumulative cgroup v2 cpu.pressure some stall time in microseconds.\n\
+             # TYPE boxlet_psi_cpu_some_microseconds_total counter\n\
+             boxlet_psi_cpu_some_microseconds_total {}",
+            self.total_psi_cpu_some_usec
+        );
+        let _ = writeln!(
+            out,
+            "# HELP boxlet_psi_memory_some_microseconds_total Cumulative cgroup v2 memory.pressure some stall time in microseconds.\n\
+             # TYPE boxlet_psi_memory_some_microseconds_total counter\n\
+             boxlet_psi_memory_some_microseconds_total {}",
+            self.total_psi_memory_some_usec
+        );
+        let _ = writeln!(
+            out,
+            "# HELP boxlet_psi_io_some_microseconds_total Cumulative cgroup v2 io.pressure some stall time in microseconds.\n\
+             # TYPE boxlet_psi_io_some_microseconds_total counter\n\
+             boxlet_psi_io_some_microseconds_total {}",
+            self.total_psi_io_some_usec
         );
         let _ = writeln!(
             out,
@@ -496,6 +529,7 @@ impl JsonlAuditLogger {
                     exit_code,
                     duration_ms,
                     memory_peak_bytes,
+                    psi,
                     violations,
                     ..
                 } => {
@@ -522,6 +556,20 @@ impl JsonlAuditLogger {
                                 .max_memory_peak_bytes
                                 .map_or(peak, |cur| cur.max(peak)),
                         );
+                    }
+                    if let Some(ref p) = psi {
+                        if let Some(cpu_some) = p.cpu_some_total_usec {
+                            summary.total_psi_cpu_some_usec =
+                                summary.total_psi_cpu_some_usec.saturating_add(cpu_some);
+                        }
+                        if let Some(mem_some) = p.memory_some_total_usec {
+                            summary.total_psi_memory_some_usec =
+                                summary.total_psi_memory_some_usec.saturating_add(mem_some);
+                        }
+                        if let Some(io_some) = p.io_some_total_usec {
+                            summary.total_psi_io_some_usec =
+                                summary.total_psi_io_some_usec.saturating_add(io_some);
+                        }
                     }
                 }
                 AuditEvent::BranchBatchCompleted {
@@ -572,6 +620,7 @@ mod tests {
             duration_ms: 42,
             memory_peak_bytes: Some(1024 * 1024),
             cpu_usage_usec: Some(15_000),
+            psi: None,
             violations: PolicyViolations::default(),
             cleanup: CleanupStatus::Clean,
         };
@@ -632,6 +681,13 @@ mod tests {
             duration_ms: 30,
             memory_peak_bytes: Some(2_000_000),
             cpu_usage_usec: Some(10_000),
+            psi: Some(PsiMetrics {
+                cpu_some_total_usec: Some(250),
+                memory_some_total_usec: Some(50),
+                memory_full_total_usec: Some(0),
+                io_some_total_usec: Some(100),
+                io_full_total_usec: Some(10),
+            }),
             violations: PolicyViolations::default(),
             cleanup: CleanupStatus::Clean,
         })?;
@@ -642,6 +698,13 @@ mod tests {
             duration_ms: 120,
             memory_peak_bytes: Some(8_000_000),
             cpu_usage_usec: Some(50_000),
+            psi: Some(PsiMetrics {
+                cpu_some_total_usec: Some(750),
+                memory_some_total_usec: Some(450),
+                memory_full_total_usec: Some(120),
+                io_some_total_usec: Some(300),
+                io_full_total_usec: Some(20),
+            }),
             violations: PolicyViolations {
                 timed_out: true,
                 oom_killed: true,
@@ -675,6 +738,9 @@ mod tests {
         assert_eq!(summary.promoted_winners, vec!["candidate-a".to_string()]);
         assert_eq!(summary.total_duration_ms, 150);
         assert_eq!(summary.max_memory_peak_bytes, Some(8_000_000));
+        assert_eq!(summary.total_psi_cpu_some_usec, 1000);
+        assert_eq!(summary.total_psi_memory_some_usec, 500);
+        assert_eq!(summary.total_psi_io_some_usec, 400);
         assert!(summary.chronological_valid);
         assert!(summary.hash_chain_valid);
         assert_eq!(summary.head_hash_fnv1a64, last_rec.record_hash_fnv1a64);
@@ -691,6 +757,9 @@ mod tests {
         assert!(prom.contains("boxlet_branches_evaluated_total 3"));
         assert!(prom.contains("boxlet_run_duration_milliseconds_total 150"));
         assert!(prom.contains("boxlet_memory_peak_bytes_max 8000000"));
+        assert!(prom.contains("boxlet_psi_cpu_some_microseconds_total 1000"));
+        assert!(prom.contains("boxlet_psi_memory_some_microseconds_total 500"));
+        assert!(prom.contains("boxlet_psi_io_some_microseconds_total 400"));
         assert!(prom.contains("boxlet_audit_chronological_valid 1"));
         assert!(prom.contains("boxlet_audit_hash_chain_valid 1"));
 

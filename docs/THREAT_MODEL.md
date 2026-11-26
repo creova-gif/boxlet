@@ -85,7 +85,18 @@
 
 ---
 
-## 6. Residual Risks & Explicit Non-Goals (V1)
+## 6. V8 Resource Exhaustion & Core-Dump Leak Prevention (`setrlimit(2)` & PSI Telemetry)
+
+1. **Unconditional Core-Dump Suppression (`RLIMIT_CORE = 0`):**
+   - Prior to dropping capabilities and invoking `execve`, the container init stage unconditionally sets `RLIMIT_CORE` (`soft = 0, hard = 0`) via `setrlimit(2)` unless explicitly overridden by a trusted OCI `process.rlimits` entry. This prevents crashing container workloads from writing memory dumps containing sensitive secrets or tokens to the container rootfs or host core-pattern handlers ([ADR-011](adr/011-psi-telemetry-rlimits-and-benchmark-suite.md)).
+2. **File-Descriptor Exhaustion Defense (`RLIMIT_NOFILE` / `--nofile <N>`):**
+   - `ExecutionPolicy::nofile_limit` (`boxlet run --nofile <N>` / `boxlet branch-run --nofile <N>`) and OCI `process.rlimits` (`RLIMIT_NOFILE`) cap the maximum number of open file descriptors per process inside the sandbox via `setrlimit(2)`, preventing an untrusted workload from exhausting the host kernel file table. Setting `--nofile 0` or `soft > hard` fails closed with `BoxletError::InvalidPolicy` before spawning.
+3. **Cgroup v2 Pressure Stall Information (`*.pressure` PSI) Contention Telemetry:**
+   - Before cgroup directory deletion, `CgroupV2::read_usage()` harvests `cpu.pressure`, `memory.pressure`, and `io.pressure` (`PsiMetrics`) and aggregates stall microseconds into tamper-evident audit summaries and Prometheus metrics (`boxlet_psi_*_microseconds_total`), enabling early detection of noisy-neighbor resource contention or DoS thrashing.
+
+---
+
+## 7. Residual Risks & Explicit Non-Goals (V1)
 
 1. **Shared host kernel exploits (residual risk):** A Linux kernel vulnerability triggered by an allowed syscall can break out of namespaces and seccomp. V1 accepts this boundary for single-host dev/test environments; hostile multi-tenant isolation is deferred to a future microVM `RuntimeBackend` (Firecracker / `libkrun`).
 2. **Root execution requirement (non-goal in V1):** V1 requires `root` on a dedicated Linux 5.15+ host/VM. Rootless user-namespace containers are explicitly excluded from V1 to avoid premature complexity and false security claims.

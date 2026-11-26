@@ -193,6 +193,37 @@ impl FromStr for IoMaxRule {
     }
 }
 
+/// Linux cgroup v2 Pressure Stall Information (`*.pressure`) cumulative stall durations in microseconds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PsiMetrics {
+    /// Cumulative `some` stall time (microseconds) from `cpu.pressure`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_some_total_usec: Option<u64>,
+    /// Cumulative `some` stall time (microseconds) from `memory.pressure`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_some_total_usec: Option<u64>,
+    /// Cumulative `full` stall time (microseconds) from `memory.pressure`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_full_total_usec: Option<u64>,
+    /// Cumulative `some` stall time (microseconds) from `io.pressure`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_some_total_usec: Option<u64>,
+    /// Cumulative `full` stall time (microseconds) from `io.pressure`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_full_total_usec: Option<u64>,
+}
+
+impl PsiMetrics {
+    /// Returns true when no PSI metrics were recorded.
+    pub fn is_empty(&self) -> bool {
+        self.cpu_some_total_usec.is_none()
+            && self.memory_some_total_usec.is_none()
+            && self.memory_full_total_usec.is_none()
+            && self.io_some_total_usec.is_none()
+            && self.io_full_total_usec.is_none()
+    }
+}
+
 /// First-class execution policy overlaid onto an OCI bundle by `boxlet run`.
 ///
 /// Fields set to `None` defer to the bundle's `config.json`, falling back to
@@ -223,6 +254,9 @@ pub struct ExecutionPolicy {
     /// Maximum number of concurrent sandbox branches or eval candidates executed in parallel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrency: Option<usize>,
+    /// Optional open file descriptor limit (`RLIMIT_NOFILE`) enforced before `execve`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nofile_limit: Option<u64>,
 }
 
 impl ExecutionPolicy {
@@ -260,6 +294,11 @@ impl ExecutionPolicy {
         if let Some(0) = self.max_concurrency {
             return Err(BoxletError::InvalidPolicy {
                 reason: "max_concurrency must be at least 1".to_string(),
+            });
+        }
+        if let Some(0) = self.nofile_limit {
+            return Err(BoxletError::InvalidPolicy {
+                reason: "nofile_limit must be greater than 0".to_string(),
             });
         }
         Ok(())
@@ -301,6 +340,8 @@ pub struct ResolvedRunSpec {
     pub timeout: Option<Duration>,
     /// Maximum bytes captured per stream (`stdout` and `stderr`).
     pub max_output_bytes: usize,
+    /// Optional open file descriptor limit (`RLIMIT_NOFILE`).
+    pub nofile_limit: Option<u64>,
 }
 
 /// Merges an OCI `Spec` with an [`ExecutionPolicy`] using Boxlet V1 precedence rules:
@@ -381,6 +422,7 @@ pub fn merge_policy_with_spec(base: &Spec, policy: &ExecutionPolicy) -> Result<R
         seccomp,
         timeout: policy.timeout,
         max_output_bytes,
+        nofile_limit: policy.nofile_limit,
     })
 }
 
@@ -393,6 +435,9 @@ pub struct ResourceUsage {
     pub memory_peak_bytes: Option<u64>,
     /// Total cgroup v2 CPU time in microseconds (`cpu.stat` `usage_usec`), when available.
     pub cpu_usage_usec: Option<u64>,
+    /// Optional cgroup v2 Pressure Stall Information (`*.pressure`) cumulative stall durations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psi: Option<PsiMetrics>,
 }
 
 /// Observable policy-violation signals captured by the runtime.
@@ -551,6 +596,23 @@ mod tests {
             empty_io_max.validate(),
             Err(BoxletError::InvalidPolicy { .. })
         ));
+
+        let zero_nofile = ExecutionPolicy {
+            nofile_limit: Some(0),
+            ..ExecutionPolicy::default()
+        };
+        assert!(matches!(
+            zero_nofile.validate(),
+            Err(BoxletError::InvalidPolicy { .. })
+        ));
+    }
+
+    #[test]
+    fn psi_metrics_is_empty_reflects_recorded_stall_fields() {
+        let mut psi = PsiMetrics::default();
+        assert!(psi.is_empty());
+        psi.cpu_some_total_usec = Some(1200);
+        assert!(!psi.is_empty());
     }
 
     #[test]
@@ -617,6 +679,7 @@ mod tests {
             timeout: Some(Duration::from_secs(30)),
             max_output_bytes: Some(4096),
             max_concurrency: Some(4),
+            nofile_limit: Some(1024),
         };
 
         let resolved = merge_policy_with_spec(&spec, &policy)?;
@@ -628,6 +691,7 @@ mod tests {
         assert_eq!(resolved.seccomp, SeccompPolicy::Disabled);
         assert_eq!(resolved.timeout, Some(Duration::from_secs(30)));
         assert_eq!(resolved.max_output_bytes, 4096);
+        assert_eq!(resolved.nofile_limit, Some(1024));
         Ok(())
     }
 

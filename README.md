@@ -5,6 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust: 1.80+](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![OCI Runtime Spec: v1.0.2](https://img.shields.io/badge/OCI%20Runtime-v1.0.2-2ea44f.svg)](https://github.com/opencontainers/runtime-spec)
+[![Live Linux Demo: 24/24 Checks](https://img.shields.io/badge/Live%20Linux%20Demo-24%2F24%20Checks-brightgreen.svg)](scripts/demo-v1.sh)
 
 - **Spec Doc:** [Boxlet: Minimal OCI-Compatible Container Runtime](https://docs.google.com/document/d/1XDaWCxQUGEH9LMqC95nJ4WZy_ut_YOQJ5_yChSJrlvA/edit?usp=drivesdk&ouid=110227624285917376281)
 - **ADR-001 (V1 Architecture & Isolation Seams):** [docs/adr/001-v1-architecture-and-seams.md](docs/adr/001-v1-architecture-and-seams.md)
@@ -17,6 +18,7 @@
 - **ADR-008 (MicroVM Backend & OCI Rootfs Tar Archives):** [ADR-008: MicroVM Backend and OCI Rootfs Tar Archives](docs/adr/008-microvm-backend-and-oci-image-archives.md)
 - **ADR-009 (Enterprise Hardening, Tamper-Evident Audit & Rootless Support):** [ADR-009: Enterprise Audit Hash Chaining, Worker Pool, and Rootless User Namespaces](docs/adr/009-enterprise-audit-hash-chaining-worker-pool-and-rootless.md)
 - **ADR-010 (Cgroup v2 Block I/O Throttling & Multi-Layer OCI Image Layout):** [ADR-010: Cgroup v2 Block I/O Throttling and Multi-Layer OCI Image Layout](docs/adr/010-cgroup-io-max-and-oci-image-layout.md)
+- **ADR-011 (Cgroup v2 PSI Telemetry, POSIX Rlimits & Deterministic Benchmark Suite):** [ADR-011: Cgroup v2 PSI Telemetry, POSIX Rlimits, and Deterministic Benchmark Suite](docs/adr/011-psi-telemetry-rlimits-and-benchmark-suite.md)
 - **Threat Model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)
 - **Design Doc:** [docs/designs/boxlet-v1-oci-runtime.md](docs/designs/boxlet-v1-oci-runtime.md)
 - **Engineering Standards:** [AGENTS.md](AGENTS.md)
@@ -158,7 +160,7 @@ sudo ./target/release/boxlet branch-run \
 
 ### High-Level Policy Execution (`boxlet run`)
 
-`boxlet run` overlays explicit resource and isolation limits (including cgroup v2 `io.max` block I/O bandwidth and IOPS throttling via `--io-max` / `IoMaxRule`) onto an OCI bundle and emits structured execution telemetry:
+`boxlet run` overlays explicit resource and isolation limits (including cgroup v2 `io.max` block I/O bandwidth and IOPS throttling via `--io-max` / `IoMaxRule`, POSIX `setrlimit(2)` file-descriptor caps via `--nofile <N>` / `RLIMIT_NOFILE`, and unconditional `RLIMIT_CORE = 0` core-dump suppression) onto an OCI bundle and emits structured execution telemetry (including cgroup v2 Pressure Stall Information `PsiMetrics` in `ResourceUsage` and `boxlet_psi_*_microseconds_total` counters in `boxlet audit --prometheus`):
 
 ```bash
 sudo ./target/release/boxlet run \
@@ -166,9 +168,32 @@ sudo ./target/release/boxlet run \
   --cpus 0.5 \
   --pids 64 \
   --io-max "8:0 rbps=10485760 wbps=5242880 riops=1000 wiops=500" \
+  --nofile 256 \
   --network none \
   --timeout 30 \
   --json \
+  ./bundle
+```
+
+### Deterministic Latency & Throughput Benchmark Suite (`boxlet bench`)
+
+Run the built-in deterministic benchmark harness (`boxlet bench` / `Engine::run_benchmark` with `BenchmarkConfig`, `BenchmarkReport`, and `LatencySummary`) to measure end-to-end `sandbox_run`, `workspace_snapshot_diff`, and `parallel_branch_batch` latency percentiles (`min_us`, `p50_us`, `p95_us`, `p99_us`, `max_us`, `mean_us`) and throughput (`runs_per_sec`, `branches_per_sec`) in JSON or Markdown table format:
+
+```bash
+# Emit structured BenchmarkReport JSON
+sudo ./target/release/boxlet bench \
+  --iterations 5 \
+  --warmup 1 \
+  --branches 4 \
+  --json \
+  ./bundle
+
+# Emit a Markdown latency & throughput report table
+sudo ./target/release/boxlet bench \
+  --iterations 5 \
+  --warmup 1 \
+  --branches 4 \
+  --markdown \
   ./bundle
 ```
 
@@ -270,9 +295,9 @@ Synthesize deterministic **AWS Firecracker** (`FirecrackerVmSpec`) or **`libkrun
   ./bundle
 ```
 
-### Run the End-to-End 22-Check V1–V7 Demo Script
+### Run the End-to-End 24-Check V1–V8 Demo Script
 
-On a Linux 5.15+ host with `busybox` (`busybox-static`) and `python3` installed, run the self-contained 22/22 check verification demo covering normal execution, `memory.max` OOM-kill telemetry (`oom_killed: true`), fail-closed seccomp/capability enforcement, zero-leak cleanup, V2 workspace snapshots/diffs, parallel multi-agent branch execution, winner promotion/rollback, OCI bundle scaffolding, container inventory/garbage collection (`list`/`prune`), JSONL audit log analytics (`audit --file`), host readiness diagnostics (`doctor`), declarative rubric evaluation (`eval --spec`), OCI rootfs tar archive export/import round-trip (`image-export`/`image-import`), Firecracker/`libkrun` MicroVM specification synthesis (`microvm-config`), bounded worker-pool concurrency (`branch-run --max-concurrency`) + rootless user-namespace bundle scaffolding (`init-bundle --rootless`), tamper-evident hash-chained audit verification + Prometheus metrics export (`audit --file ... --prometheus`), multi-layer OCI Image Layout packing/unpacking with `.wh.` whiteouts (`image-pack`/`image-unpack`), and fail-closed cgroup v2 `io.max` block I/O policy validation (`run --io-max`):
+On a Linux 5.15+ host with `busybox` (`busybox-static`) and `python3` installed, run the self-contained 24/24 check verification demo covering normal execution, `memory.max` OOM-kill telemetry (`oom_killed: true`), fail-closed seccomp/capability enforcement, zero-leak cleanup, V2 workspace snapshots/diffs, parallel multi-agent branch execution, winner promotion/rollback, OCI bundle scaffolding, container inventory/garbage collection (`list`/`prune`), JSONL audit log analytics (`audit --file`), host readiness diagnostics (`doctor`), declarative rubric evaluation (`eval --spec`), OCI rootfs tar archive export/import round-trip (`image-export`/`image-import`), Firecracker/`libkrun` MicroVM specification synthesis (`microvm-config`), bounded worker-pool concurrency (`branch-run --max-concurrency`) + rootless user-namespace bundle scaffolding (`init-bundle --rootless`), tamper-evident hash-chained audit verification + Prometheus metrics export (`audit --file ... --prometheus`), multi-layer OCI Image Layout packing/unpacking with `.wh.` whiteouts (`image-pack`/`image-unpack`), fail-closed cgroup v2 `io.max` block I/O policy validation (`run --io-max`), POSIX `RLIMIT_NOFILE` file-descriptor enforcement (`run --nofile 128`), and the built-in deterministic latency/throughput benchmark suite (`bench --json` / `bench --markdown`):
 
 ```bash
 sudo ./scripts/demo-v1.sh ./target/release/boxlet
@@ -534,6 +559,8 @@ For the full trust-boundary diagram, threat matrix, and residual risk analysis, 
 | **Milestone 12 (V6)** | Rootless Linux user-namespace scaffolding & runtime mapping (`boxlet init-bundle --rootless`, `BundleBuilder::with_rootless`, `CLONE_NEWUSER`, `/proc/self/setgroups` `"deny"`, `uid_map`/`gid_map`) ([ADR-009](docs/adr/009-enterprise-audit-hash-chaining-worker-pool-and-rootless.md)) | **Shipped** |
 | **Milestone 13 (V7)** | Cgroup v2 block I/O bandwidth & IOPS throttling (`--io-max "<MAJ>:<MIN> rbps=... wbps=... riops=... wiops=..."`, `IoMaxRule`, `ExecutionPolicy::io_max`, `LinuxResources::block_io_max`) ([ADR-010](docs/adr/010-cgroup-io-max-and-oci-image-layout.md)) | **Shipped** |
 | **Milestone 14 (V7)** | Multi-layer OCI Image Layout v1.0 packing & unpacking with whiteout markers (`boxlet image-pack`, `boxlet image-unpack`, `OciImageLayoutReport`, `OciLayerDescriptor`, `.wh.<name>`, `.wh..wh..opq`) ([ADR-010](docs/adr/010-cgroup-io-max-and-oci-image-layout.md)) | **Shipped** |
+| **Milestone 15 (V8)** | Cgroup v2 Pressure Stall Information (`*.pressure` PSI) telemetry (`PsiMetrics` in `ResourceUsage`, `boxlet_psi_*_microseconds_total` in `boxlet audit --prometheus`) and POSIX `setrlimit(2)` enforcement (`--nofile <N>` / `RLIMIT_NOFILE` & default `RLIMIT_CORE = 0`) ([ADR-011](docs/adr/011-psi-telemetry-rlimits-and-benchmark-suite.md)) | **Shipped** |
+| **Milestone 16 (V8)** | Built-in deterministic latency & throughput benchmark suite (`boxlet bench --iterations <N> --markdown \| --json`, `Engine::run_benchmark`, `BenchmarkConfig`, `BenchmarkReport`, `LatencySummary`) ([ADR-011](docs/adr/011-psi-telemetry-rlimits-and-benchmark-suite.md)) | **Shipped** |
 
 ---
 
@@ -555,6 +582,7 @@ For the full trust-boundary diagram, threat matrix, and residual risk analysis, 
 | `cpus` | `--cpus <FLOAT>` | `None` (bundle default) | Cgroup v2 `cpu.max` quota in cores (`0.5` = 50% of 1 core) |
 | `pids_limit` | `--pids <COUNT>` | `None` (bundle default) | Cgroup v2 `pids.max` process/thread cap |
 | `io_max` | `--io-max "<MAJ>:<MIN> rbps=... wbps=... riops=... wiops=..."` | `[]` (bundle default) | Cgroup v2 `io.max` per-device bandwidth (`rbps`/`wbps`) and IOPS (`riops`/`wiops`) limits (`IoMaxRule`) |
+| `nofile_limit` | `--nofile <N>` | `None` (bundle default) | POSIX `RLIMIT_NOFILE` soft/hard open file-descriptor limit applied before `execve` (plus unconditional `RLIMIT_CORE = 0`) |
 | `network` | `--network <none\|isolated\|host>` | `isolated` (`run`) | Network namespace isolation mode (fails closed on unknown modes) |
 | `timeout` | `--timeout <SECONDS>` | `None` | Wall-clock execution timeout before `cgroup.kill` teardown |
 | `max_output_bytes` | `--max-output-bytes <BYTES>` | `1048576` (1 MiB) | Maximum captured bytes per stream (`stdout` / `stderr`) |
