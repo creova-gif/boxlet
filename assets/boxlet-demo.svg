@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="420" viewBox="0 0 880 420" role="img" aria-label="Boxlet Terminal Demo">
+  <defs>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#161b22"/>
+    </linearGradient>
+    <filter id="shadow" x="-2%" y="-2%" width="104%" height="104%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#000000" flood-opacity="0.55"/>
+    </filter>
+  </defs>
+
+  <!-- Terminal Window Frame -->
+  <rect x="12" y="12" width="856" height="396" rx="12" ry="12" fill="url(#bg-grad)" stroke="#30363d" stroke-width="1.5" filter="url(#shadow)"/>
+  <rect x="12" y="12" width="856" height="38" rx="12" ry="12" fill="#161b22"/>
+  <rect x="12" y="38" width="856" height="12" fill="#161b22"/>
+  <line x1="12" y1="50" x2="868" y2="50" stroke="#30363d" stroke-width="1"/>
+
+  <!-- Window Controls -->
+  <circle cx="34" cy="31" r="6.5" fill="#ff5f56"/>
+  <circle cx="54" cy="31" r="6.5" fill="#ffbd2e"/>
+  <circle cx="74" cy="31" r="6.5" fill="#27c93f"/>
+  <text x="440" y="36" text-anchor="middle" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="12.5" font-weight="600">boxlet — OCI Container &amp; MicroVM Execution Engine (v0.1.0)</text>
+
+  <!-- Terminal Body -->
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13">
+    <!-- Command 1: boxlet doctor -->
+    <text x="32" y="82" fill="#7ee787" font-weight="bold">$</text>
+    <text x="48" y="82" fill="#e6edf3">sudo boxlet doctor --json</text>
+    <text x="32" y="106" fill="#8b949e">{</text>
+    <text x="48" y="126" fill="#79c0ff">"overall_ready"</text>
+    <text x="168" y="126" fill="#e6edf3">: </text>
+    <text x="182" y="126" fill="#7ee787" font-weight="bold">true</text>
+    <text x="216" y="126" fill="#8b949e">, // linux 6.8, cgroup_v2: memory,cpu,pids, seccomp_arch: x86_64</text>
+    <text x="48" y="146" fill="#79c0ff">"checks"</text>
+    <text x="112" y="146" fill="#e6edf3">: [</text>
+    <text x="132" y="146" fill="#7ee787">"host_os:pass"</text>
+    <text x="244" y="146" fill="#8b949e">, </text>
+    <text x="256" y="146" fill="#7ee787">"kernel_version:pass"</text>
+    <text x="416" y="146" fill="#8b949e">, </text>
+    <text x="428" y="146" fill="#7ee787">"cgroup_v2:pass"</text>
+    <text x="556" y="146" fill="#8b949e">, </text>
+    <text x="568" y="146" fill="#7ee787">"seccomp_arch:pass"</text>
+    <text x="720" y="146" fill="#e6edf3">]</text>
+    <text x="32" y="166" fill="#8b949e">}</text>
+
+    <!-- Command 2: boxlet eval -->
+    <text x="32" y="202" fill="#7ee787" font-weight="bold">$</text>
+    <text x="48" y="202" fill="#e6edf3">sudo boxlet eval --spec eval-spec.json --promote-winner ./bundle</text>
+    <text x="32" y="226" fill="#ff7b72">[FAIL]</text>
+    <text x="86" y="226" fill="#e6edf3">eval-cand-tamper</text>
+    <text x="230" y="226" fill="#8b949e">exit=0  score=0     reason="forbidden path modified: etc/hostname"</text>
+    <text x="32" y="248" fill="#ff7b72">[FAIL]</text>
+    <text x="86" y="248" fill="#e6edf3">eval-cand-fail</text>
+    <text x="230" y="248" fill="#8b949e">exit=1  score=0     reason="exit_code 1 != 0"</text>
+    <text x="32" y="270" fill="#7ee787" font-weight="bold">[PASS]</text>
+    <text x="86" y="270" fill="#e6edf3" font-weight="bold">eval-cand-clean</text>
+    <text x="230" y="270" fill="#79c0ff">exit=0  score=9978  added=["tmp/eval_solution.txt"] -&gt; PROMOTED</text>
+
+    <!-- Command 3: boxlet image-export & microvm-config -->
+    <text x="32" y="308" fill="#7ee787" font-weight="bold">$</text>
+    <text x="48" y="308" fill="#e6edf3">boxlet image-export --rootfs ./bundle/rootfs --out rootfs.tar --json</text>
+    <text x="32" y="332" fill="#8b949e">{ "archive_path": "rootfs.tar", "entry_count": </text>
+    <text x="404" y="332" fill="#d2a8ff">29</text>
+    <text x="422" y="332" fill="#8b949e">, "archive_fnv1a64": </text>
+    <text x="582" y="332" fill="#79c0ff">"0x8f3c2b91e4a07d15"</text>
+    <text x="742" y="332" fill="#8b949e"> }</text>
+
+    <text x="32" y="366" fill="#7ee787" font-weight="bold">$</text>
+    <text x="48" y="366" fill="#e6edf3">boxlet microvm-config --driver firecracker --id vm-fc-1 --mem-mib 256 --vcpus 2 ./bundle</text>
+    <text x="32" y="388" fill="#8b949e">{ "driver": "firecracker", "sandbox_id": "vm-fc-1", "vcpu_count": 2, "mem_size_mib": 256, "smt": false }</text>
+  </g>
+</svg>

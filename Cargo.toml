@@ -2,7 +2,13 @@
 name = "boxlet"
 version = "0.1.0"
 edition = "2021"
-description = "Minimal Linux OCI-compatible container runtime and programmable execution core"
+rust-version = "1.89"
+description = "Minimal Linux OCI-compatible container runtime and programmable AI sandbox execution engine"
+license = "MIT"
+repository = "https://github.com/creova-gif/boxlet"
+readme = "README.md"
+keywords = ["containers", "oci", "sandbox", "linux", "agents"]
+categories = ["command-line-utilities", "os::linux-apis", "virtualization"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

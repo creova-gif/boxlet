@@ -5,8 +5,10 @@ pub mod doctor;
 pub mod engine;
 pub mod error;
 pub mod eval;
+pub mod image;
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
+pub mod microvm;
 pub mod oci;
 pub mod policy;
 pub mod snapshot;
@@ -16,8 +18,12 @@ pub use audit::{AuditEvent, AuditRecord, AuditSummary, JsonlAuditLogger};
 pub use doctor::{run_doctor, DoctorCheck, DoctorReport, DoctorStatus};
 pub use engine::{BranchBatchReport, BranchExecutionResult, BranchSpec, Engine, PruneReport};
 pub use eval::{CandidateVerdict, EvalReport, EvalRubric, EvalSpec};
+pub use image::{export_rootfs_tar, import_rootfs_tar, RootfsArchiveReport};
+#[cfg(target_os = "linux")]
+pub use linux::overlay::{inspect_upper_diff, OverlayDirs, OverlayRootfsProvider};
 #[cfg(target_os = "linux")]
 pub use linux::LinuxBackend;
+pub use microvm::{FirecrackerVmSpec, LibkrunVmSpec, MicroVmBackend, MicroVmConfig, VmmDriver};
 pub use oci::BundleBuilder;
 
 /// Executes the internal self-re-exec container init stage (`boxlet __init <config>`).

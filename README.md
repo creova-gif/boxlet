@@ -1,5 +1,11 @@
 # Boxlet: Minimal OCI-Compatible Container Runtime & Programmable Execution Engine
 
+[![CI](https://github.com/creova-gif/boxlet/actions/workflows/ci.yml/badge.svg)](https://github.com/creova-gif/boxlet/actions/workflows/ci.yml)
+[![Release](https://github.com/creova-gif/boxlet/actions/workflows/release.yml/badge.svg)](https://github.com/creova-gif/boxlet/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust: 1.80+](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
+[![OCI Runtime Spec: v1.0.2](https://img.shields.io/badge/OCI%20Runtime-v1.0.2-2ea44f.svg)](https://github.com/opencontainers/runtime-spec)
+
 - **Spec Doc:** [Boxlet: Minimal OCI-Compatible Container Runtime](https://docs.google.com/document/d/1XDaWCxQUGEH9LMqC95nJ4WZy_ut_YOQJ5_yChSJrlvA/edit?usp=drivesdk&ouid=110227624285917376281)
 - **ADR-001 (V1 Architecture & Isolation Seams):** [docs/adr/001-v1-architecture-and-seams.md](docs/adr/001-v1-architecture-and-seams.md)
 - **ADR-002 (Filesystem Snapshots & Deterministic Diffing):** [docs/adr/002-filesystem-snapshots-and-diffing.md](docs/adr/002-filesystem-snapshots-and-diffing.md)
@@ -8,6 +14,7 @@
 - **ADR-005 (Structured Audit Trail & OCI Bundle Scaffolding):** [ADR-005: Structured Audit Trail and OCI Bundle Scaffolding](docs/adr/005-audit-trail-and-bundle-scaffolding.md)
 - **ADR-006 (Container Inventory, Garbage Collection & Audit Analytics):** [ADR-006: Container Inventory, Garbage Collection, and Audit Analytics](docs/adr/006-container-inventory-prune-and-audit-analytics.md)
 - **ADR-007 (Host Readiness Diagnostics & Declarative Evaluation Rubrics):** [ADR-007: Host Readiness Diagnostics and Declarative Evaluation Rubrics](docs/adr/007-doctor-diagnostics-and-declarative-eval-rubrics.md)
+- **ADR-008 (MicroVM Backend & OCI Rootfs Tar Archives):** [ADR-008: MicroVM Backend and OCI Rootfs Tar Archives](docs/adr/008-microvm-backend-and-oci-image-archives.md)
 - **Threat Model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)
 - **Design Doc:** [docs/designs/boxlet-v1-oci-runtime.md](docs/designs/boxlet-v1-oci-runtime.md)
 - **Engineering Standards:** [AGENTS.md](AGENTS.md)
@@ -15,6 +22,8 @@
 ---
 
 ## Overview
+
+![Boxlet Terminal Demo](assets/boxlet-demo.svg)
 
 **Boxlet** is an AI-native, minimal Linux OCI-compatible container runtime and embeddable Rust execution engine designed for autonomous software engineering agents and developer infrastructure.
 
@@ -174,9 +183,50 @@ sudo ./target/release/boxlet eval \
   ./bundle
 ```
 
-### Run the End-to-End 16-Check V1–V4 Demo Script
+### Portable OCI Rootfs Tar Archive Export & Import (`boxlet image-export` / `boxlet image-import`)
 
-On a Linux 5.15+ host with `busybox` (`busybox-static`) and `python3` installed, run the self-contained 16-check verification demo covering normal execution, `memory.max` OOM-kill telemetry (`oom_killed: true`), fail-closed seccomp/capability enforcement, zero-leak cleanup, V2 workspace snapshots/diffs, parallel multi-agent branch execution, winner promotion/rollback, OCI bundle scaffolding, container inventory/garbage collection (`list`/`prune`), JSONL audit log analytics (`audit --file`), host readiness diagnostics (`doctor`), and declarative rubric evaluation (`eval --spec`):
+Export any OCI bundle `rootfs` directory into a deterministic, bit-reproducible USTAR `.tar` archive (sorted paths, normalized `mtime=0`/`uid=0`/`gid=0`, and 64-bit FNV-1a archive digest) and import `.tar` archives back into a clean rootfs directory with fail-closed path-traversal protection:
+
+```bash
+# Export a rootfs directory to a deterministic tar archive
+./target/release/boxlet image-export \
+  --rootfs ./bundle/rootfs \
+  --out ./rootfs.tar \
+  --json
+
+# Import a rootfs tar archive into a destination directory
+./target/release/boxlet image-import \
+  --archive ./rootfs.tar \
+  --out ./imported-rootfs \
+  --json
+```
+
+### Hardware-Virtualized MicroVM Specification Synthesis (`boxlet microvm-config`)
+
+Synthesize deterministic **AWS Firecracker** (`FirecrackerVmSpec`) or **`libkrun`** (`LibkrunVmSpec`) microVM configurations directly from an OCI bundle and policy overrides:
+
+```bash
+# Generate an AWS Firecracker microVM specification
+./target/release/boxlet microvm-config \
+  --driver firecracker \
+  --id vm-fc-1 \
+  --kernel /var/lib/boxlet/vmlinux \
+  --mem-mib 256 \
+  --vcpus 2 \
+  ./bundle
+
+# Generate a libkrun microVM specification
+./target/release/boxlet microvm-config \
+  --driver libkrun \
+  --id vm-krun-1 \
+  --mem-mib 256 \
+  --vcpus 2 \
+  ./bundle
+```
+
+### Run the End-to-End 18-Check V1–V5 Demo Script
+
+On a Linux 5.15+ host with `busybox` (`busybox-static`) and `python3` installed, run the self-contained 18-check verification demo covering normal execution, `memory.max` OOM-kill telemetry (`oom_killed: true`), fail-closed seccomp/capability enforcement, zero-leak cleanup, V2 workspace snapshots/diffs, parallel multi-agent branch execution, winner promotion/rollback, OCI bundle scaffolding, container inventory/garbage collection (`list`/`prune`), JSONL audit log analytics (`audit --file`), host readiness diagnostics (`doctor`), declarative rubric evaluation (`eval --spec`), OCI rootfs tar archive export/import round-trip (`image-export`/`image-import`), and Firecracker/`libkrun` MicroVM specification synthesis (`microvm-config`):
 
 ```bash
 sudo ./scripts/demo-v1.sh ./target/release/boxlet
@@ -432,5 +482,49 @@ For the full trust-boundary diagram, threat matrix, and residual risk analysis, 
 | **Milestone 6 (V3)** | Append-only `0600` JSONL security & execution audit trail (`--audit-log`, `JsonlAuditLogger`) and zero-config OCI bundle scaffolding (`boxlet init-bundle`, `BundleBuilder`) ([ADR-005](docs/adr/005-audit-trail-and-bundle-scaffolding.md)) | **Shipped** |
 | **Milestone 7 (V3)** | Container inventory (`boxlet list`), stale resource garbage collection (`boxlet prune [--force]`), and audit analytics (`boxlet audit --file`) ([ADR-006](docs/adr/006-container-inventory-prune-and-audit-analytics.md)) | **Shipped** |
 | **Milestone 8 (V4)** | Host kernel/environment readiness diagnostics (`boxlet doctor`) and declarative multi-agent evaluation specs with forbidden-path guardrails & rubric scoring (`boxlet eval --spec`) ([ADR-007](docs/adr/007-doctor-diagnostics-and-declarative-eval-rubrics.md)) | **Shipped** |
-| **Milestone 9 (V5)** | Hardware-virtualized MicroVM `RuntimeBackend` adapters (`FirecrackerBackend` / `LibkrunBackend`) for hostile multi-tenant workloads | Planned |
-| **Milestone 10 (V5)** | Content-addressed OCI image registry pull & layer unpacking into `OverlayRootfsProvider` lowerdirs | Planned |
+| **Milestone 9 (V5)** | Hardware-virtualized MicroVM `RuntimeBackend` adapters (`MicroVmBackend`, `FirecrackerVmSpec`, `LibkrunVmSpec`, `boxlet microvm-config`) for hostile multi-tenant workloads ([ADR-008](docs/adr/008-microvm-backend-and-oci-image-archives.md)) | **Shipped** |
+| **Milestone 10 (V5)** | Deterministic OCI rootfs tar archive export & fail-closed import (`export_rootfs_tar`, `import_rootfs_tar`, `RootfsArchiveReport`, `boxlet image-export`, `boxlet image-import`) ([ADR-008](docs/adr/008-microvm-backend-and-oci-image-archives.md)) | **Shipped** |
+
+---
+
+## Configuration Reference
+
+### Global CLI Flags
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `--audit-log <PATH>` | *(disabled)* | Append structured `0600` JSONL audit events (`AuditEvent`) for every lifecycle operation |
+| `--root <DIR>` | `/run/boxlet` | OCI container state root directory |
+| `--cgroup-parent <PATH>` | `/sys/fs/cgroup/boxlet.slice` | Unified cgroup v2 parent slice directory |
+
+### `ExecutionPolicy` Fields (`boxlet run` / `EvalSpec.policy`)
+
+| Field | CLI Flag | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `memory_bytes` | `--memory <BYTES\|k\|m\|g>` | `None` (bundle default) | Cgroup v2 `memory.max` hard limit in bytes |
+| `cpus` | `--cpus <FLOAT>` | `None` (bundle default) | Cgroup v2 `cpu.max` quota in cores (`0.5` = 50% of 1 core) |
+| `pids_limit` | `--pids <COUNT>` | `None` (bundle default) | Cgroup v2 `pids.max` process/thread cap |
+| `network` | `--network <none\|isolated\|host>` | `isolated` (`run`) | Network namespace isolation mode (fails closed on unknown modes) |
+| `timeout` | `--timeout <SECONDS>` | `None` | Wall-clock execution timeout before `cgroup.kill` teardown |
+| `max_output_bytes` | `--max-output-bytes <BYTES>` | `1048576` (1 MiB) | Maximum captured bytes per stream (`stdout` / `stderr`) |
+| `no_new_privileges` | *(enabled in `run`)* | `true` | Enforces `PR_SET_NO_NEW_PRIVS` before `execve` |
+
+### `EvalRubric` Fields (`boxlet eval --spec <FILE>`)
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `require_exit_zero` | `bool` | `true` | Require `exit_code == Some(0)` and zero policy violations |
+| `required_stdout_contains` | `Vec<String>` | `[]` | Substrings that must appear in UTF-8 decoded `stdout` |
+| `forbidden_stderr_contains` | `Vec<String>` | `[]` | Substrings that must **not** appear in UTF-8 decoded `stderr` |
+| `required_added_paths` | `Vec<String>` | `[]` | Relative paths that must appear in `fs_diff.added` |
+| `forbidden_modified_paths` | `Vec<String>` | `[]` | Relative paths that must **not** be added, modified, or deleted |
+| `max_changed_files` | `Option<usize>` | `None` | Optional ceiling on total filesystem changes (`added + modified + deleted`) |
+
+---
+
+## Contributing & License
+
+- **Contributing Guide:** [CONTRIBUTING.md](CONTRIBUTING.md)
+- **Changelog:** [CHANGELOG.md](CHANGELOG.md)
+- **Security Policy:** [SECURITY.md](SECURITY.md)
+- **License:** Licensed under the [MIT License](LICENSE).
