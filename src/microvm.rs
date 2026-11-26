@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Instant;
@@ -395,10 +397,11 @@ impl MicroVmBackend {
         let spec_path = container_dir.join("microvm.json");
         let tmp_path = container_dir.join("microvm.json.tmp");
 
-        let mut tmp_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
+        let mut opts = OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut tmp_file = opts
             .open(&tmp_path)
             .map_err(|source| BoxletError::StateStore {
                 path: tmp_path.clone(),

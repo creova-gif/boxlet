@@ -3,7 +3,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,9 @@ const TAR_BLOCK_SIZE: usize = 512;
 
 /// Maximum byte length of `name` and `linkname` fields in a base POSIX USTAR header.
 const USTAR_MAX_NAME_LEN: usize = 100;
+
+/// Maximum byte length of the `prefix` field in a POSIX USTAR header (`block[345..500]`).
+const USTAR_MAX_PREFIX_LEN: usize = 155;
 
 /// 64-bit FNV-1a offset basis.
 const FNV1A_64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -94,106 +97,143 @@ pub fn export_rootfs_tar(rootfs_dir: &Path, archive_path: &Path) -> Result<Rootf
         }
     }
 
-    let raw_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(archive_path)
-        .map_err(|source| BoxletError::StateStore {
-            path: archive_path.to_path_buf(),
-            source,
-        })?;
-    let mut writer = HashingWriter::new(raw_file);
-    let mut total_file_bytes: u64 = 0;
+    ensure_archive_not_inside_rootfs(rootfs_dir, archive_path)?;
+    let stage_path = staged_sibling_path(archive_path)?;
 
-    for (rel_path, meta) in &manifest.entries {
-        let name_str = normalize_rel_path_for_tar(rel_path, archive_path)?;
-        let src_path = rootfs_dir.join(rel_path);
+    let write_res = (|| -> Result<u64> {
+        let mut opts = OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let raw_file = opts
+            .open(&stage_path)
+            .map_err(|source| BoxletError::StateStore {
+                path: stage_path.clone(),
+                source,
+            })?;
+        let mut writer = HashingWriter::new(raw_file);
 
-        let (typeflag, payload_size, linkname) = match meta.kind {
-            EntryKind::File => (b'0', meta.size, String::new()),
-            EntryKind::Directory => (b'5', 0u64, String::new()),
-            EntryKind::Symlink => {
-                let target =
-                    fs::read_link(&src_path).map_err(|source| BoxletError::StateStore {
+        for (rel_path, meta) in &manifest.entries {
+            let name_str = normalize_rel_path_for_tar(rel_path, archive_path)?;
+            let src_path = rootfs_dir.join(rel_path);
+
+            let (typeflag, payload_size, linkname) = match meta.kind {
+                EntryKind::File => (b'0', meta.size, String::new()),
+                EntryKind::Directory => (b'5', 0u64, String::new()),
+                EntryKind::Symlink => {
+                    let target =
+                        fs::read_link(&src_path).map_err(|source| BoxletError::StateStore {
+                            path: src_path.clone(),
+                            source,
+                        })?;
+                    let target_str = target.to_str().ok_or_else(|| BoxletError::StateStore {
                         path: src_path.clone(),
-                        source,
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "symlink target is not valid UTF-8 for POSIX USTAR header",
+                        ),
                     })?;
-                let target_str = target.to_str().ok_or_else(|| BoxletError::StateStore {
+                    if target_str.is_empty()
+                        || target_str.len() > USTAR_MAX_NAME_LEN
+                        || target_str.as_bytes().contains(&0)
+                    {
+                        return Err(BoxletError::StateStore {
+                            path: src_path,
+                            source: std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "symlink target exceeds 100-byte POSIX USTAR linkname limit",
+                            ),
+                        });
+                    }
+                    (b'2', 0u64, target_str.to_string())
+                }
+            };
+
+            let header = build_ustar_header(
+                &name_str,
+                meta.mode & 0o0777,
+                payload_size,
+                typeflag,
+                &linkname,
+                archive_path,
+            )?;
+            writer.write_all_hashed(&header, archive_path)?;
+
+            if meta.kind == EntryKind::File {
+                let mut file = File::open(&src_path).map_err(|source| BoxletError::StateStore {
                     path: src_path.clone(),
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "symlink target is not valid UTF-8 for POSIX USTAR header",
-                    ),
+                    source,
                 })?;
-                if target_str.is_empty()
-                    || target_str.len() > USTAR_MAX_NAME_LEN
-                    || target_str.as_bytes().contains(&0)
-                {
+                let mut copied: u64 = 0;
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = file
+                        .read(&mut buf)
+                        .map_err(|source| BoxletError::StateStore {
+                            path: src_path.clone(),
+                            source,
+                        })?;
+                    if n == 0 {
+                        break;
+                    }
+                    let remaining_expected = payload_size.saturating_sub(copied);
+                    if (n as u64) > remaining_expected {
+                        return Err(BoxletError::StateStore {
+                            path: src_path,
+                            source: std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "file size changed while exporting rootfs tar archive",
+                            ),
+                        });
+                    }
+                    writer.write_all_hashed(&buf[..n], archive_path)?;
+                    copied = copied.saturating_add(n as u64);
+                }
+                if copied != payload_size {
                     return Err(BoxletError::StateStore {
                         path: src_path,
                         source: std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "symlink target exceeds 100-byte POSIX USTAR linkname limit",
+                            std::io::ErrorKind::UnexpectedEof,
+                            "file size changed while exporting rootfs tar archive",
                         ),
                     });
                 }
-                (b'2', 0u64, target_str.to_string())
-            }
-        };
-
-        let header = build_ustar_header(
-            &name_str,
-            meta.mode & 0o7777,
-            payload_size,
-            typeflag,
-            &linkname,
-            archive_path,
-        )?;
-        writer.write_all_hashed(&header, archive_path)?;
-
-        if meta.kind == EntryKind::File {
-            let mut file = File::open(&src_path).map_err(|source| BoxletError::StateStore {
-                path: src_path.clone(),
-                source,
-            })?;
-            let mut copied: u64 = 0;
-            let mut buf = [0u8; 8192];
-            loop {
-                let n = file
-                    .read(&mut buf)
-                    .map_err(|source| BoxletError::StateStore {
-                        path: src_path.clone(),
-                        source,
-                    })?;
-                if n == 0 {
-                    break;
+                let rem = (copied as usize) % TAR_BLOCK_SIZE;
+                if rem != 0 {
+                    let pad = [0u8; TAR_BLOCK_SIZE];
+                    writer.write_all_hashed(&pad[..TAR_BLOCK_SIZE - rem], archive_path)?;
                 }
-                writer.write_all_hashed(&buf[..n], archive_path)?;
-                copied = copied.saturating_add(n as u64);
             }
-            if copied != payload_size {
-                return Err(BoxletError::StateStore {
-                    path: src_path,
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "file size changed while exporting rootfs tar archive",
-                    ),
-                });
-            }
-            let rem = (copied as usize) % TAR_BLOCK_SIZE;
-            if rem != 0 {
-                let pad = [0u8; TAR_BLOCK_SIZE];
-                writer.write_all_hashed(&pad[..TAR_BLOCK_SIZE - rem], archive_path)?;
-            }
-            total_file_bytes = total_file_bytes.saturating_add(copied);
         }
+
+        // Write two 512-byte zero end-of-archive blocks.
+        let eof_blocks = [0u8; TAR_BLOCK_SIZE * 2];
+        writer.write_all_hashed(&eof_blocks, archive_path)?;
+        writer.finish(archive_path)
+    })();
+
+    let archive_fnv1a64 = match write_res {
+        Ok(digest) => digest,
+        Err(err) => {
+            let _ = fs::remove_file(&stage_path);
+            return Err(err);
+        }
+    };
+
+    if let Err(source) = fs::rename(&stage_path, archive_path) {
+        let _ = fs::remove_file(&stage_path);
+        return Err(BoxletError::StateStore {
+            path: archive_path.to_path_buf(),
+            source,
+        });
     }
 
-    // Write two 512-byte zero end-of-archive blocks.
-    let eof_blocks = [0u8; TAR_BLOCK_SIZE * 2];
-    writer.write_all_hashed(&eof_blocks, archive_path)?;
-    let archive_fnv1a64 = writer.finish(archive_path)?;
+    let total_file_bytes = manifest
+        .entries
+        .values()
+        .filter(|m| m.kind == EntryKind::File)
+        .map(|m| m.size)
+        .fold(0u64, u64::saturating_add);
 
     Ok(RootfsArchiveReport {
         archive_path: archive_path.to_path_buf(),
@@ -220,10 +260,23 @@ pub fn import_rootfs_tar(archive_path: &Path, target_rootfs: &Path) -> Result<Ro
         });
     }
 
-    fs::create_dir_all(target_rootfs).map_err(|source| BoxletError::StateStore {
-        path: target_rootfs.to_path_buf(),
-        source,
-    })?;
+    if let Ok(meta) = fs::symlink_metadata(target_rootfs) {
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+            return Err(BoxletError::StateStore {
+                path: target_rootfs.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "target rootfs path must not be a symlink or non-directory",
+                ),
+            });
+        }
+    } else {
+        fs::create_dir_all(target_rootfs).map_err(|source| BoxletError::StateStore {
+            path: target_rootfs.to_path_buf(),
+            source,
+        })?;
+    }
+    make_dir_writable(target_rootfs)?;
 
     let mut file = File::open(archive_path).map_err(|source| BoxletError::StateStore {
         path: archive_path.to_path_buf(),
@@ -263,8 +316,16 @@ pub fn import_rootfs_tar(archive_path: &Path, target_rootfs: &Path) -> Result<Ro
 
         verify_ustar_header(&block, archive_path)?;
         let raw_name = parse_ustar_string(&block[0..100], archive_path)?;
-        let rel_path = validate_safe_tar_rel_path(raw_name, archive_path)?;
-        let mode = parse_ustar_octal(&block[100..108], archive_path)? as u32 & 0o7777;
+        let raw_prefix = parse_ustar_string(&block[345..500], archive_path)?;
+        let combined_name = if raw_prefix.is_empty() {
+            raw_name.to_string()
+        } else {
+            let _ = validate_safe_tar_rel_path(raw_prefix, archive_path)?;
+            let _ = validate_safe_tar_rel_path(raw_name, archive_path)?;
+            format!("{}/{}", raw_prefix.trim_end_matches('/'), raw_name)
+        };
+        let rel_path = validate_safe_tar_rel_path(&combined_name, archive_path)?;
+        let mode = parse_ustar_octal(&block[100..108], archive_path)? as u32 & 0o0777;
         let size = parse_ustar_octal(&block[124..136], archive_path)?;
         let typeflag = block[156];
         let linkname = parse_ustar_string(&block[157..257], archive_path)?.to_string();
@@ -304,35 +365,46 @@ pub fn import_rootfs_tar(archive_path: &Path, target_rootfs: &Path) -> Result<Ro
                 entry_count += 1;
             }
             b'0' | b'\0' => {
-                remove_existing_non_dir(&dst_path)?;
-                let mut out_file = OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&dst_path)
-                    .map_err(|source| BoxletError::StateStore {
+                let stage_path = staged_sibling_path(&dst_path)?;
+                let extract_res = (|| -> Result<()> {
+                    let mut out_file = OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&stage_path)
+                        .map_err(|source| BoxletError::StateStore {
+                            path: stage_path.clone(),
+                            source,
+                        })?;
+
+                    let mut remaining = size;
+                    while remaining > 0 {
+                        read_exact_block(&mut file, &mut block, archive_path)?;
+                        for &b in &block {
+                            hash ^= u64::from(b);
+                            hash = hash.wrapping_mul(FNV1A_64_PRIME);
+                        }
+                        let to_write = (remaining as usize).min(TAR_BLOCK_SIZE);
+                        out_file.write_all(&block[..to_write]).map_err(|source| {
+                            BoxletError::StateStore {
+                                path: stage_path.clone(),
+                                source,
+                            }
+                        })?;
+                        remaining -= to_write as u64;
+                    }
+                    drop(out_file);
+                    set_mode_permissions(&stage_path, mode)?;
+                    remove_existing_non_dir(&dst_path)?;
+                    fs::rename(&stage_path, &dst_path).map_err(|source| BoxletError::StateStore {
                         path: dst_path.clone(),
                         source,
-                    })?;
-
-                let mut remaining = size;
-                while remaining > 0 {
-                    read_exact_block(&mut file, &mut block, archive_path)?;
-                    for &b in &block {
-                        hash ^= u64::from(b);
-                        hash = hash.wrapping_mul(FNV1A_64_PRIME);
-                    }
-                    let to_write = (remaining as usize).min(TAR_BLOCK_SIZE);
-                    out_file.write_all(&block[..to_write]).map_err(|source| {
-                        BoxletError::StateStore {
-                            path: dst_path.clone(),
-                            source,
-                        }
-                    })?;
-                    remaining -= to_write as u64;
+                    })
+                })();
+                if let Err(err) = extract_res {
+                    let _ = fs::remove_file(&stage_path);
+                    return Err(err);
                 }
-                drop(out_file);
-                set_mode_permissions(&dst_path, mode)?;
                 total_file_bytes = total_file_bytes.saturating_add(size);
                 entry_count += 1;
             }
@@ -362,6 +434,16 @@ pub fn import_rootfs_tar(archive_path: &Path, target_rootfs: &Path) -> Result<Ro
         }
     }
 
+    if !reached_eof_marker {
+        return Err(BoxletError::StateStore {
+            path: archive_path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated tar archive: missing zero end-of-archive block",
+            ),
+        });
+    }
+
     dir_modes.sort_by(|(a, _), (b, _)| {
         b.components()
             .count()
@@ -380,6 +462,54 @@ pub fn import_rootfs_tar(archive_path: &Path, target_rootfs: &Path) -> Result<Ro
         total_file_bytes,
         archive_fnv1a64: hash,
     })
+}
+
+fn ensure_archive_not_inside_rootfs(rootfs_dir: &Path, archive_path: &Path) -> Result<()> {
+    let abs_rootfs = fs::canonicalize(rootfs_dir).map_err(|source| BoxletError::StateStore {
+        path: rootfs_dir.to_path_buf(),
+        source,
+    })?;
+    let archive_parent = match archive_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let abs_parent =
+        fs::canonicalize(archive_parent).map_err(|source| BoxletError::StateStore {
+            path: archive_parent.to_path_buf(),
+            source,
+        })?;
+    let file_name = archive_path
+        .file_name()
+        .ok_or_else(|| BoxletError::StateStore {
+            path: archive_path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "archive path must include a file name",
+            ),
+        })?;
+    let abs_archive = abs_parent.join(file_name);
+    if abs_archive.starts_with(&abs_rootfs) {
+        return Err(BoxletError::StateStore {
+            path: archive_path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "archive_path must not be located inside rootfs_dir",
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn staged_sibling_path(dst: &Path) -> Result<PathBuf> {
+    let parent = match dst.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let name = dst
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "archive".to_string());
+    Ok(parent.join(format!(".{name}.boxlet-stage-{}", std::process::id())))
 }
 
 fn normalize_rel_path_for_tar(rel_path: &Path, archive_path: &Path) -> Result<String> {
@@ -417,35 +547,57 @@ fn normalize_rel_path_for_tar(rel_path: &Path, archive_path: &Path) -> Result<St
         }
     }
     let joined = parts.join("/");
-    if joined.is_empty() || joined.len() > USTAR_MAX_NAME_LEN {
+    let _ = split_ustar_name_and_prefix(&joined, archive_path)?;
+    Ok(joined)
+}
+
+fn split_ustar_name_and_prefix<'a>(
+    full_path: &'a str,
+    archive_path: &Path,
+) -> Result<(&'a str, &'a str)> {
+    if full_path.is_empty() {
         return Err(BoxletError::StateStore {
             path: archive_path.to_path_buf(),
             source: std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "rootfs relative path exceeds 100-byte POSIX USTAR name limit",
+                "tar entry name must not be empty",
             ),
         });
     }
-    Ok(joined)
+    if full_path.len() <= USTAR_MAX_NAME_LEN {
+        return Ok(("", full_path));
+    }
+    for (idx, ch) in full_path.char_indices() {
+        if ch == '/' {
+            let prefix = &full_path[..idx];
+            let name = &full_path[idx + 1..];
+            if !prefix.is_empty()
+                && prefix.len() <= USTAR_MAX_PREFIX_LEN
+                && !name.is_empty()
+                && name.len() <= USTAR_MAX_NAME_LEN
+            {
+                return Ok((prefix, name));
+            }
+        }
+    }
+    Err(BoxletError::StateStore {
+        path: archive_path.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tar entry name exceeds POSIX USTAR 100-byte name + 155-byte prefix limit",
+        ),
+    })
 }
 
 fn build_ustar_header(
-    name: &str,
+    full_name: &str,
     mode: u32,
     size: u64,
     typeflag: u8,
     linkname: &str,
     archive_path: &Path,
 ) -> Result<[u8; TAR_BLOCK_SIZE]> {
-    if name.is_empty() || name.len() > USTAR_MAX_NAME_LEN {
-        return Err(BoxletError::StateStore {
-            path: archive_path.to_path_buf(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "tar entry name exceeds 100-byte POSIX USTAR limit",
-            ),
-        });
-    }
+    let (prefix, name) = split_ustar_name_and_prefix(full_name, archive_path)?;
     if linkname.len() > USTAR_MAX_NAME_LEN {
         return Err(BoxletError::StateStore {
             path: archive_path.to_path_buf(),
@@ -458,8 +610,11 @@ fn build_ustar_header(
 
     let mut header = [0u8; TAR_BLOCK_SIZE];
     header[..name.len()].copy_from_slice(name.as_bytes());
+    if !prefix.is_empty() {
+        header[345..345 + prefix.len()].copy_from_slice(prefix.as_bytes());
+    }
 
-    let mode_str = format!("{:07o}\0", mode & 0o7777);
+    let mode_str = format!("{:07o}\0", mode & 0o0777);
     header[100..108].copy_from_slice(mode_str.as_bytes());
     header[108..116].copy_from_slice(b"0000000\0");
     header[116..124].copy_from_slice(b"0000000\0");
@@ -759,7 +914,7 @@ fn make_dir_writable(path: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn set_mode_permissions(path: &Path, mode: u32) -> Result<()> {
-    fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777)).map_err(|source| {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o0777)).map_err(|source| {
         BoxletError::StateStore {
             path: path.to_path_buf(),
             source,
@@ -921,6 +1076,32 @@ mod tests {
                 if source.kind() == std::io::ErrorKind::InvalidInput
         ));
         assert!(!escape_file.exists());
+
+        // Also reject nested archive inside rootfs_dir and truncated archive missing EOF zero block
+        let nested_rootfs = tmp.path().join("nested-rootfs");
+        fs::create_dir_all(&nested_rootfs).map_err(|source| BoxletError::StateStore {
+            path: nested_rootfs.clone(),
+            source,
+        })?;
+        assert!(export_rootfs_tar(&nested_rootfs, &nested_rootfs.join("inside.tar")).is_err());
+
+        let truncated_archive = tmp.path().join("truncated.tar");
+        let valid_header = build_ustar_header(
+            "etc/ok.txt",
+            0o644,
+            payload.len() as u64,
+            b'0',
+            "",
+            &truncated_archive,
+        )?;
+        let mut trunc_bytes = Vec::new();
+        trunc_bytes.extend_from_slice(&valid_header);
+        trunc_bytes.extend_from_slice(&block);
+        fs::write(&truncated_archive, &trunc_bytes).map_err(|source| BoxletError::StateStore {
+            path: truncated_archive.clone(),
+            source,
+        })?;
+        assert!(import_rootfs_tar(&truncated_archive, &target_rootfs).is_err());
 
         Ok(())
     }
