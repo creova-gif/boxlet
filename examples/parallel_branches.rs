@@ -25,7 +25,9 @@ fn main() {
     }
 
     let bundle = args
-        .get(1)
+        .iter()
+        .skip(1)
+        .find(|arg| !arg.starts_with("--"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("./bundle"));
     let promote_winner = args.iter().any(|arg| arg == "--promote-winner");

@@ -359,7 +359,13 @@ impl<B: RuntimeBackend> Engine<B> {
                 })
             {
                 let applied_diff =
-                    snapshot.promote_branch(&winner_prepared.rootfs_dir, &source_rootfs)?;
+                    match snapshot.promote_branch(&winner_prepared.rootfs_dir, &source_rootfs) {
+                        Ok(diff) => diff,
+                        Err(err) => {
+                            let _ = snapshot.restore(&source_rootfs);
+                            return Err(err);
+                        }
+                    };
                 promoted_branch_id = Some(winner_res.branch_id.clone());
                 promoted_diff = Some(applied_diff);
             }
