@@ -518,6 +518,11 @@ impl RuntimeBackend for MicroVmBackend {
             max_output_bytes: Some(resolved.max_output_bytes),
             max_concurrency: None,
             nofile_limit: resolved.nofile_limit,
+            bind_mounts: if resolved.bind_mounts.is_empty() {
+                None
+            } else {
+                Some(resolved.bind_mounts.clone())
+            },
         };
 
         self.create(id, bundle, &resolved.oci_spec)?;

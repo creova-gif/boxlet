@@ -30,7 +30,9 @@ pub use linux::overlay::{inspect_upper_diff, OverlayDirs, OverlayRootfsProvider}
 pub use linux::LinuxBackend;
 pub use microvm::{FirecrackerVmSpec, LibkrunVmSpec, MicroVmBackend, MicroVmConfig, VmmDriver};
 pub use oci::BundleBuilder;
-pub use policy::{IoMaxRule, PsiMetrics};
+pub use policy::{
+    build_default_seccomp_profile, load_seccomp_profile, BindMountSpec, IoMaxRule, PsiMetrics,
+};
 
 /// Executes the internal self-re-exec container init stage (`boxlet __init <config>`).
 #[cfg(target_os = "linux")]

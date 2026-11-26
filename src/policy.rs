@@ -1,9 +1,13 @@
 //! Execution policies, structured results, bounded output capture, and OCI merge logic.
 
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-use oci_spec::runtime::{LinuxSeccomp, Spec};
+use oci_spec::runtime::{
+    LinuxSeccomp, LinuxSeccompAction, LinuxSeccompBuilder, LinuxSyscallBuilder, Spec,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{BoxletError, Result};
@@ -224,6 +228,329 @@ impl PsiMetrics {
     }
 }
 
+fn default_bind_mount_readonly() -> bool {
+    true
+}
+
+/// Declarative host-to-container bind mount specification (`--mount <src>:<dst>[:ro|rw]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindMountSpec {
+    /// Source path on the host filesystem.
+    pub source: PathBuf,
+    /// Absolute destination path inside the container rootfs (must start with `/`).
+    pub destination: PathBuf,
+    /// Whether the bind mount is remounted read-only (`MS_RDONLY`, default `true`).
+    #[serde(default = "default_bind_mount_readonly")]
+    pub readonly: bool,
+}
+
+impl BindMountSpec {
+    /// Validates that `source` and `destination` are free of traversal components and
+    /// `destination` is an allowed absolute path inside the container rootfs.
+    pub fn validate(&self) -> Result<()> {
+        if self.source.as_os_str().is_empty() {
+            return Err(BoxletError::InvalidPolicy {
+                reason: "bind mount source path must not be empty".to_string(),
+            });
+        }
+        if self
+            .source
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+        {
+            return Err(BoxletError::InvalidPolicy {
+                reason: "bind mount source path must not contain '..' traversal".to_string(),
+            });
+        }
+        let dst_str = self.destination.to_string_lossy();
+        if dst_str.is_empty() || !dst_str.starts_with('/') {
+            return Err(BoxletError::InvalidPolicy {
+                reason: format!(
+                    "bind mount destination '{}' must be an absolute path starting with '/'",
+                    self.destination.display()
+                ),
+            });
+        }
+        if self
+            .destination
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        {
+            return Err(BoxletError::InvalidPolicy {
+                reason: "bind mount destination must not contain '.' or '..' components"
+                    .to_string(),
+            });
+        }
+        let trimmed = dst_str.trim_end_matches('/');
+        if trimmed.is_empty()
+            || trimmed == "/proc"
+            || trimmed.starts_with("/proc/")
+            || trimmed == "/dev"
+            || trimmed.starts_with("/dev/")
+            || trimmed == "/.boxlet_old_root"
+            || trimmed.starts_with("/.boxlet_old_root/")
+        {
+            return Err(BoxletError::InvalidPolicy {
+                reason: format!(
+                    "bind mount destination '{}' targets a reserved container filesystem path",
+                    self.destination.display()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for BindMountSpec {
+    type Err = BoxletError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let parts: Vec<&str> = s.split(':').collect();
+        let (src_str, dst_str, readonly) = match parts.as_slice() {
+            [src, dst] => (*src, *dst, true),
+            [src, dst, mode] => {
+                let ro = match mode.trim().to_ascii_lowercase().as_str() {
+                    "ro" => true,
+                    "rw" => false,
+                    other => {
+                        return Err(BoxletError::InvalidPolicy {
+                            reason: format!(
+                                "invalid bind mount mode '{other}' in '{s}' (expected 'ro' or 'rw')"
+                            ),
+                        });
+                    }
+                };
+                (*src, *dst, ro)
+            }
+            _ => {
+                return Err(BoxletError::InvalidPolicy {
+                    reason: format!(
+                        "invalid bind mount specification '{s}' (expected '<src>:<dst>[:ro|rw]')"
+                    ),
+                });
+            }
+        };
+
+        let spec = Self {
+            source: PathBuf::from(src_str.trim()),
+            destination: PathBuf::from(dst_str.trim()),
+            readonly,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+}
+
+/// Builds Boxlet's portable baseline default-deny OCI [`LinuxSeccomp`] profile (`SCMP_ACT_ERRNO(EPERM)`).
+pub fn build_default_seccomp_profile() -> Result<LinuxSeccomp> {
+    let syscalls: Vec<String> = [
+        "accept",
+        "accept4",
+        "access",
+        "arch_prctl",
+        "bind",
+        "brk",
+        "capget",
+        "capset",
+        "chdir",
+        "chmod",
+        "chown",
+        "clock_getres",
+        "clock_gettime",
+        "clock_nanosleep",
+        "clone",
+        "clone3",
+        "close",
+        "close_range",
+        "connect",
+        "dup",
+        "dup2",
+        "dup3",
+        "epoll_create",
+        "epoll_create1",
+        "epoll_ctl",
+        "epoll_pwait",
+        "epoll_wait",
+        "eventfd",
+        "eventfd2",
+        "execve",
+        "execveat",
+        "exit",
+        "exit_group",
+        "faccessat",
+        "faccessat2",
+        "fadvise64",
+        "fallocate",
+        "fchdir",
+        "fchmod",
+        "fchmodat",
+        "fchown",
+        "fchownat",
+        "fcntl",
+        "fdatasync",
+        "fgetxattr",
+        "flistxattr",
+        "flock",
+        "fork",
+        "fstat",
+        "fstatfs",
+        "fsync",
+        "ftruncate",
+        "futex",
+        "getcwd",
+        "getdents",
+        "getdents64",
+        "getegid",
+        "geteuid",
+        "getgid",
+        "getgroups",
+        "getpeername",
+        "getpgid",
+        "getpgrp",
+        "getpid",
+        "getppid",
+        "getpriority",
+        "getrandom",
+        "getresgid",
+        "getresuid",
+        "getrlimit",
+        "getrusage",
+        "getsid",
+        "getsockname",
+        "getsockopt",
+        "gettid",
+        "gettimeofday",
+        "getuid",
+        "ioctl",
+        "kill",
+        "link",
+        "linkat",
+        "listen",
+        "lseek",
+        "lstat",
+        "madvise",
+        "mkdir",
+        "mkdirat",
+        "mmap",
+        "mprotect",
+        "mremap",
+        "munmap",
+        "nanosleep",
+        "newfstatat",
+        "open",
+        "openat",
+        "openat2",
+        "pause",
+        "pipe",
+        "pipe2",
+        "poll",
+        "ppoll",
+        "prctl",
+        "pread64",
+        "prlimit64",
+        "pselect6",
+        "pwrite64",
+        "read",
+        "readlink",
+        "readlinkat",
+        "readv",
+        "recvfrom",
+        "recvmmsg",
+        "recvmsg",
+        "rename",
+        "renameat",
+        "renameat2",
+        "restart_syscall",
+        "rmdir",
+        "rseq",
+        "rt_sigaction",
+        "rt_sigpending",
+        "rt_sigprocmask",
+        "rt_sigqueueinfo",
+        "rt_sigreturn",
+        "rt_sigsuspend",
+        "rt_sigtimedwait",
+        "sched_getaffinity",
+        "sched_yield",
+        "select",
+        "sendfile",
+        "sendmmsg",
+        "sendmsg",
+        "sendto",
+        "set_robust_list",
+        "set_tid_address",
+        "setgid",
+        "setgroups",
+        "setpgid",
+        "setresgid",
+        "setresuid",
+        "setsid",
+        "setsockopt",
+        "setuid",
+        "shutdown",
+        "sigaltstack",
+        "socket",
+        "socketpair",
+        "stat",
+        "statfs",
+        "statx",
+        "symlink",
+        "symlinkat",
+        "sysinfo",
+        "tgkill",
+        "time",
+        "tkill",
+        "truncate",
+        "umask",
+        "uname",
+        "unlink",
+        "unlinkat",
+        "utimensat",
+        "vfork",
+        "wait4",
+        "waitid",
+        "write",
+        "writev",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+
+    let allow_rule = LinuxSyscallBuilder::default()
+        .names(syscalls)
+        .action(LinuxSeccompAction::ScmpActAllow)
+        .build()
+        .map_err(|err| BoxletError::UnsupportedSeccompRule {
+            reason: format!("failed to build default allow rule: {err}"),
+        })?;
+
+    LinuxSeccompBuilder::default()
+        .default_action(LinuxSeccompAction::ScmpActErrno)
+        .default_errno_ret(1u32)
+        .syscalls(vec![allow_rule])
+        .build()
+        .map_err(|err| BoxletError::UnsupportedSeccompRule {
+            reason: format!("failed to build default seccomp profile: {err}"),
+        })
+}
+
+/// Loads and validates an OCI [`LinuxSeccomp`] profile from a JSON file on disk.
+pub fn load_seccomp_profile(path: &Path) -> Result<LinuxSeccomp> {
+    let raw = fs::read_to_string(path).map_err(|source| BoxletError::StateStore {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let profile: LinuxSeccomp = serde_json::from_str(&raw)?;
+    if let Some(flags) = profile.flags() {
+        if !flags.is_empty() {
+            return Err(BoxletError::UnsupportedSeccompRule {
+                reason: format!("OCI seccomp flags are not supported: {flags:?}"),
+            });
+        }
+    }
+    Ok(profile)
+}
+
 /// First-class execution policy overlaid onto an OCI bundle by `boxlet run`.
 ///
 /// Fields set to `None` defer to the bundle's `config.json`, falling back to
@@ -257,6 +584,9 @@ pub struct ExecutionPolicy {
     /// Optional open file descriptor limit (`RLIMIT_NOFILE`) enforced before `execve`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nofile_limit: Option<u64>,
+    /// Optional declarative host-to-container bind mounts (`--mount <src>:<dst>[:ro|rw]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_mounts: Option<Vec<BindMountSpec>>,
 }
 
 impl ExecutionPolicy {
@@ -301,6 +631,11 @@ impl ExecutionPolicy {
                 reason: "nofile_limit must be greater than 0".to_string(),
             });
         }
+        if let Some(ref mounts) = self.bind_mounts {
+            for mount_spec in mounts {
+                mount_spec.validate()?;
+            }
+        }
         Ok(())
     }
 }
@@ -342,6 +677,8 @@ pub struct ResolvedRunSpec {
     pub max_output_bytes: usize,
     /// Optional open file descriptor limit (`RLIMIT_NOFILE`).
     pub nofile_limit: Option<u64>,
+    /// Effective declarative host-to-container bind mounts.
+    pub bind_mounts: Vec<BindMountSpec>,
 }
 
 /// Merges an OCI `Spec` with an [`ExecutionPolicy`] using Boxlet V1 precedence rules:
@@ -406,6 +743,7 @@ pub fn merge_policy_with_spec(base: &Spec, policy: &ExecutionPolicy) -> Result<R
 
     let max_output_bytes = policy.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES);
     let io_max = policy.io_max.clone().unwrap_or_default();
+    let bind_mounts = policy.bind_mounts.clone().unwrap_or_default();
 
     Ok(ResolvedRunSpec {
         oci_spec: base.clone(),
@@ -423,6 +761,7 @@ pub fn merge_policy_with_spec(base: &Spec, policy: &ExecutionPolicy) -> Result<R
         timeout: policy.timeout,
         max_output_bytes,
         nofile_limit: policy.nofile_limit,
+        bind_mounts,
     })
 }
 
@@ -680,6 +1019,7 @@ mod tests {
             max_output_bytes: Some(4096),
             max_concurrency: Some(4),
             nofile_limit: Some(1024),
+            bind_mounts: Some(vec!["/host/models:/mnt/models:ro".parse()?]),
         };
 
         let resolved = merge_policy_with_spec(&spec, &policy)?;
@@ -692,6 +1032,13 @@ mod tests {
         assert_eq!(resolved.timeout, Some(Duration::from_secs(30)));
         assert_eq!(resolved.max_output_bytes, 4096);
         assert_eq!(resolved.nofile_limit, Some(1024));
+        assert_eq!(resolved.bind_mounts.len(), 1);
+        assert!(resolved.bind_mounts[0].readonly);
+        assert!("/host/data:/proc/kcore:ro"
+            .parse::<BindMountSpec>()
+            .is_err());
+        let default_seccomp = build_default_seccomp_profile()?;
+        assert!(default_seccomp.syscalls().is_some());
         Ok(())
     }
 

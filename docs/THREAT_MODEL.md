@@ -96,7 +96,18 @@
 
 ---
 
-## 7. Residual Risks & Explicit Non-Goals (V1)
+## 7. V9 Declarative Bind-Mount Hardening & Custom Seccomp Profile Validation
+
+1. **Fail-Closed Bind-Mount Validation & `MS_NOSUID | MS_NODEV` Remount Hardening (`src/policy.rs`, `src/linux/rootfs.rs`):**
+   - `BindMountSpec::parse()` (`--mount <SRC>:<DST>[:ro|rw]`) defaults to read-only (`ro`), requires both `source` and `destination` to be absolute paths starting with `/`, rejects any `..` path-traversal components, and forbids mounting over reserved container kernel filesystems (`/`, `/proc`, `/sys`, `/dev`, or subpaths under `/proc/`, `/sys/`, `/dev/`) with `BoxletError::InvalidPolicy` before any container process is spawned ([ADR-012](adr/012-bind-mounts-and-seccomp-profile-management.md)).
+   - Inside the isolated mount namespace prior to `pivot_root`, `setup_rootfs()` bind-mounts each source onto `<new_root>/<destination>` with `MS_BIND | MS_REC` and immediately issues a second `mount(2)` with `MS_REMOUNT | MS_BIND | MS_NOSUID | MS_NODEV` (plus `MS_RDONLY` when read-only) so Linux enforces `ro`, `nosuid`, and `nodev` on the bind mountpoint.
+2. **Baseline Seccomp Profile Auditing & Fail-Closed Custom Profile Loading (`boxlet seccomp-export`, `--seccomp-profile <PATH>`):**
+   - Operators can inspect and audit Boxlet's exact default syscall allowlist via `boxlet seccomp-export [--out <PATH>]` (`build_default_seccomp_profile()`) and supply a hardened workload-specific OCI `LinuxSeccomp` JSON profile via `--seccomp-profile <PATH>` (`load_seccomp_profile()`).
+   - `load_seccomp_profile()` validates that `defaultAction` is non-empty and rejects malformed JSON or empty syscall lists inside any rule with `BoxletError::InvalidPolicy` prior to container creation, preserving pure-Rust `seccompiler` fail-closed cBPF compilation.
+
+---
+
+## 8. Residual Risks & Explicit Non-Goals (V1)
 
 1. **Shared host kernel exploits (residual risk):** A Linux kernel vulnerability triggered by an allowed syscall can break out of namespaces and seccomp. V1 accepts this boundary for single-host dev/test environments; hostile multi-tenant isolation is deferred to a future microVM `RuntimeBackend` (Firecracker / `libkrun`).
 2. **Root execution requirement (non-goal in V1):** V1 requires `root` on a dedicated Linux 5.15+ host/VM. Rootless user-namespace containers are explicitly excluded from V1 to avoid premature complexity and false security claims.
