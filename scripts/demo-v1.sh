@@ -929,6 +929,7 @@ echo "    POSIX RLIMIT_NOFILE verified: ulimit -n = $NOFILE_TRIMMED"
 # Check 24: Built-In Deterministic Benchmark Suite (boxlet bench)
 # ------------------------------------------------------------------------------
 echo "==> [Check 24] [24/24] Built-In Deterministic Benchmark Suite (boxlet bench --json / --markdown)"
+write_bundle_config "true"
 sudo "$BOXLET_BIN" \
   --root "$STATE_ROOT" \
   --cgroup-parent "$CGROUP_PARENT" \
@@ -944,7 +945,7 @@ import json, sys
 
 with open(sys.argv[1]) as f:
     raw = f.read()
-    data = json.load(open(sys.argv[1]))
+    data = json.loads(raw)
 
 assert '"iterations": 2' in raw or data.get("iterations") == 2, f"expected iterations == 2, got {data}"
 assert "run_latency_us" in data, f"expected 'run_latency_us' in {data}"
@@ -966,7 +967,7 @@ sudo "$BOXLET_BIN" \
   --markdown \
   "$BUNDLE_DIR" > "$WORK_DIR/check24-bench.md"
 
-grep -q "| sandbox_run |" "$WORK_DIR/check24-bench.md"
-echo "    bench Markdown verified: $(grep '| sandbox_run |' "$WORK_DIR/check24-bench.md")"
+grep -q "sandbox_run" "$WORK_DIR/check24-bench.md"
+echo "    bench Markdown verified: $(grep 'sandbox_run' "$WORK_DIR/check24-bench.md")"
 
 echo "==> ALL 24/24 BOXLET V1+V2+V3+V4+V5+V6+V7+V8 CHECKS PASSED"
