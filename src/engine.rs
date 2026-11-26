@@ -74,6 +74,17 @@ pub struct BranchExecutionResult {
     pub fs_diff: FsDiff,
 }
 
+/// Aggregated outcome of a parallel multi-branch evaluation and optional winner promotion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchBatchReport {
+    /// Per-branch execution results and filesystem diffs in the exact input order.
+    pub branches: Vec<BranchExecutionResult>,
+    /// Identifier of the winning branch promoted back to the source bundle rootfs, if any.
+    pub promoted_branch_id: Option<String>,
+    /// Filesystem diff applied to the source bundle rootfs when a winner was promoted.
+    pub promoted_diff: Option<FsDiff>,
+}
+
 /// RAII guard that removes the temporary workspace directory created by [`Engine::run_branches`].
 struct TempWorkspaceGuard {
     path: PathBuf,
@@ -220,6 +231,20 @@ impl<B: RuntimeBackend> Engine<B> {
         branches: &[BranchSpec],
         policy: &ExecutionPolicy,
     ) -> Result<Vec<BranchExecutionResult>> {
+        self.run_branches_with_promotion(bundle, branches, policy, false)
+            .map(|r| r.branches)
+    }
+
+    /// Snapshots `<bundle>` once, fans out `branches` concurrently in isolated workspace
+    /// root filesystems, and optionally promotes the first passing branch (`exit_code == Some(0)`
+    /// with no timeout or OOM violations) back onto the source bundle rootfs.
+    pub fn run_branches_with_promotion(
+        &self,
+        bundle: &Path,
+        branches: &[BranchSpec],
+        policy: &ExecutionPolicy,
+        promote_winner: bool,
+    ) -> Result<BranchBatchReport> {
         policy.validate()?;
 
         let mut seen_ids = BTreeSet::new();
@@ -234,7 +259,11 @@ impl<B: RuntimeBackend> Engine<B> {
 
         let base_spec = load_bundle_spec(bundle)?;
         if branches.is_empty() {
-            return Ok(Vec::new());
+            return Ok(BranchBatchReport {
+                branches: Vec::new(),
+                promoted_branch_id: None,
+                promoted_diff: None,
+            });
         }
 
         let configured_rootfs = base_spec
@@ -319,7 +348,28 @@ impl<B: RuntimeBackend> Engine<B> {
             Ok(out)
         })?;
 
-        Ok(results)
+        let mut promoted_branch_id = None;
+        let mut promoted_diff = None;
+        if promote_winner {
+            if let Some((winner_res, winner_prepared)) =
+                results.iter().zip(prepared.iter()).find(|(res, _)| {
+                    res.execution.exit_code == Some(0)
+                        && !res.execution.violations.timed_out
+                        && !res.execution.violations.oom_killed
+                })
+            {
+                let applied_diff =
+                    snapshot.promote_branch(&winner_prepared.rootfs_dir, &source_rootfs)?;
+                promoted_branch_id = Some(winner_res.branch_id.clone());
+                promoted_diff = Some(applied_diff);
+            }
+        }
+
+        Ok(BranchBatchReport {
+            branches: results,
+            promoted_branch_id,
+            promoted_diff,
+        })
     }
 }
 
@@ -446,6 +496,7 @@ mod tests {
                 .and_then(|p| p.args().clone())
                 .unwrap_or_default();
 
+            let mut exit_code = 0;
             if let Some(action) = args.first().map(String::as_str) {
                 match action {
                     "branch-a-action" => {
@@ -480,13 +531,33 @@ mod tests {
                             }
                         })?;
                     }
+                    "branch-fail-action" => {
+                        let failed = rootfs.join("failed.txt");
+                        fs::write(&failed, b"broken attempt\n").map_err(|source| {
+                            BoxletError::StateStore {
+                                path: failed,
+                                source,
+                            }
+                        })?;
+                        exit_code = 1;
+                    }
+                    "branch-win-action" => {
+                        let winner = rootfs.join("winner.txt");
+                        fs::write(&winner, b"winning patch\n").map_err(|source| {
+                            BoxletError::StateStore {
+                                path: winner,
+                                source,
+                            }
+                        })?;
+                        exit_code = 0;
+                    }
                     _ => {}
                 }
             }
 
             Ok(ExecutionResult {
                 container_id: id.to_string(),
-                exit_code: Some(0),
+                exit_code: Some(exit_code),
                 stdout: format!("ran {id}\n").into_bytes(),
                 stderr: Vec::new(),
                 stdout_truncated: false,
@@ -660,6 +731,30 @@ mod tests {
             .run_branches(bundle.path(), &bad_specs, &policy)
             .unwrap_err();
         assert!(matches!(bad_err, BoxletError::InvalidContainerId { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn engine_run_branches_with_promotion_promotes_first_passing_branch() -> Result<()> {
+        let bundle = make_bundle()?;
+        let engine = Engine::new(MockBackend::default());
+        let specs = vec![
+            BranchSpec::new("branch-1").with_args(vec!["branch-fail-action".to_string()]),
+            BranchSpec::new("branch-2").with_args(vec!["branch-win-action".to_string()]),
+        ];
+        let policy = ExecutionPolicy::default();
+
+        let report = engine.run_branches_with_promotion(bundle.path(), &specs, &policy, true)?;
+        assert_eq!(report.branches.len(), 2);
+        assert_eq!(report.branches[0].execution.exit_code, Some(1));
+        assert_eq!(report.branches[1].execution.exit_code, Some(0));
+        assert_eq!(report.promoted_branch_id, Some("branch-2".to_string()));
+        assert!(bundle.path().join("rootfs/winner.txt").exists());
+        assert!(!bundle.path().join("rootfs/failed.txt").exists());
+        assert_eq!(
+            report.promoted_diff.as_ref().map(|d| d.added.clone()),
+            Some(vec![PathBuf::from("winner.txt")])
+        );
         Ok(())
     }
 }

@@ -376,4 +376,73 @@ PY
 test -e "$BUNDLE_DIR/rootfs/bin/wc"
 test ! -e "$BUNDLE_DIR/rootfs/tmp/candidate_a.txt"
 
-echo "==> All 9 Boxlet V1 & V2 end-to-end checks passed with zero leaked cgroups or state directories!"
+# ------------------------------------------------------------------------------
+# Check 10: V2 Candidate Evaluation, Winner Promotion & Snapshot Rollback
+# ------------------------------------------------------------------------------
+echo "==> [Check 10] V2 Candidate Evaluation, Winner Promotion & Snapshot Rollback (boxlet branch-run --promote-winner + boxlet restore)"
+sudo "$BOXLET_BIN" branch-run \
+  --root "$STATE_ROOT" \
+  --cgroup-parent "$CGROUP_PARENT" \
+  --memory 128m \
+  --network none \
+  --promote-winner \
+  --cmd "echo broken-patch > /tmp/failed_attempt.txt && exit 1" \
+  --cmd "echo verified-fix > /tmp/winning_patch.txt && echo winner-ok" \
+  --json \
+  "$BUNDLE_DIR" > "$WORK_DIR/check10-promote.json"
+
+python3 - "$WORK_DIR/check10-promote.json" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+
+promoted_id = data.get("promoted_branch_id")
+assert isinstance(promoted_id, str) and promoted_id.endswith("-branch-2"), (
+    f"expected promoted_branch_id ending with '-branch-2', got {promoted_id!r}"
+)
+promoted_diff = data.get("promoted_diff", {})
+assert "tmp/winning_patch.txt" in promoted_diff.get("added", []), (
+    f"expected tmp/winning_patch.txt in promoted_diff.added, got {promoted_diff}"
+)
+branches = data.get("branches", [])
+assert len(branches) == 2, f"expected 2 branches, got {len(branches)}"
+assert branches[0]["execution"]["exit_code"] == 1, (
+    f"expected branch 0 exit_code 1, got {branches[0]['execution']['exit_code']}"
+)
+assert branches[1]["execution"]["exit_code"] == 0, (
+    f"expected branch 1 exit_code 0, got {branches[1]['execution']['exit_code']}"
+)
+print(f"    promoted_branch_id={promoted_id}, promoted_diff.added={promoted_diff['added']}")
+PY
+
+test -f "$BUNDLE_DIR/rootfs/tmp/winning_patch.txt"
+test ! -e "$BUNDLE_DIR/rootfs/tmp/failed_attempt.txt"
+
+sudo "$BOXLET_BIN" restore \
+  --snapshot "$WORK_DIR/snapshots/snap-ci-1" \
+  --target "$BUNDLE_DIR/rootfs" \
+  --json > "$WORK_DIR/check10-restore.json"
+
+test ! -e "$BUNDLE_DIR/rootfs/tmp/winning_patch.txt"
+
+"$BOXLET_BIN" diff \
+  --json \
+  "$WORK_DIR/snapshots/snap-ci-1" \
+  "$BUNDLE_DIR/rootfs" > "$WORK_DIR/check10-post-restore-diff.json"
+
+python3 - "$WORK_DIR/check10-restore.json" "$WORK_DIR/check10-post-restore-diff.json" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    restore_diff = json.load(f)
+with open(sys.argv[2]) as f:
+    post_diff = json.load(f)
+
+assert post_diff.get("added") == [], f"expected empty added after restore, got {post_diff}"
+assert post_diff.get("modified") == [], f"expected empty modified after restore, got {post_diff}"
+assert post_diff.get("deleted") == [], f"expected empty deleted after restore, got {post_diff}"
+print(f"    restored cleanly (reverted={restore_diff}, post_restore_diff={post_diff})")
+PY
+
+echo "==> All 10 Boxlet V1 & V2 end-to-end checks passed with zero leaked cgroups or state directories!"
