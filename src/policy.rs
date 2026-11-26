@@ -74,6 +74,9 @@ pub struct ExecutionPolicy {
     pub timeout: Option<Duration>,
     /// Maximum bytes captured per stream (`stdout` and `stderr` independently).
     pub max_output_bytes: Option<usize>,
+    /// Maximum number of concurrent sandbox branches or eval candidates executed in parallel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<usize>,
 }
 
 impl ExecutionPolicy {
@@ -97,6 +100,11 @@ impl ExecutionPolicy {
                     reason: format!("pids_limit must be > 0 (got {pids})"),
                 });
             }
+        }
+        if let Some(0) = self.max_concurrency {
+            return Err(BoxletError::InvalidPolicy {
+                reason: "max_concurrency must be at least 1".to_string(),
+            });
         }
         Ok(())
     }
@@ -364,6 +372,15 @@ mod tests {
             zero_pids.validate(),
             Err(BoxletError::InvalidPolicy { .. })
         ));
+
+        let zero_concurrency = ExecutionPolicy {
+            max_concurrency: Some(0),
+            ..ExecutionPolicy::default()
+        };
+        assert!(matches!(
+            zero_concurrency.validate(),
+            Err(BoxletError::InvalidPolicy { .. })
+        ));
     }
 
     #[test]
@@ -393,6 +410,7 @@ mod tests {
             seccomp: Some(SeccompPolicy::Disabled),
             timeout: Some(Duration::from_secs(30)),
             max_output_bytes: Some(4096),
+            max_concurrency: Some(4),
         };
 
         let resolved = merge_policy_with_spec(&spec, &policy)?;

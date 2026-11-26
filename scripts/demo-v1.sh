@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Boxlet V1 End-to-End Verification & Demo Suite
+# Boxlet V1–V6 End-to-End 20-Check Verification & Demo Suite
 # Runs on any privileged Linux 5.15+ host with unified cgroup v2 and busybox-static.
 set -euo pipefail
 
@@ -22,9 +22,12 @@ if [[ -z "$BUSYBOX_SRC" ]]; then
   echo "error: busybox binary not found in /bin/busybox or /usr/bin/busybox" >&2
   exit 1
 fi
+BUSYBOX_BIN="$BUSYBOX_SRC"
 
 WORK_DIR="$(mktemp -d /tmp/boxlet-demo.XXXXXX)"
 BUNDLE_DIR="$WORK_DIR/bundle"
+BRANCH_BUNDLE="$WORK_DIR/scaffolded-bundle"
+AUDIT_LOG="$WORK_DIR/audit.jsonl"
 STATE_ROOT="$WORK_DIR/state"
 
 cleanup() {
@@ -736,7 +739,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 18: MicroVM Specification Synthesis (boxlet microvm-config for Firecracker & libkrun)
 # ------------------------------------------------------------------------------
-echo "==> [Check 18] MicroVM Specification Synthesis (boxlet microvm-config for Firecracker & libkrun)"
+echo "==> [Check 18] [18/20] MicroVM Specification Synthesis (boxlet microvm-config for Firecracker & libkrun)"
 "$BOXLET_BIN" microvm-config \
   --driver firecracker \
   --id vm-fc-1 \
@@ -771,4 +774,73 @@ print(
 )
 PY
 
-echo "==> All 18 Boxlet V1–V5 end-to-end checks passed with zero leaked cgroups or state directories!"
+# ------------------------------------------------------------------------------
+# Check 19: Bounded Worker-Pool Concurrency & Rootless Bundle Scaffolding
+# ------------------------------------------------------------------------------
+echo "==> [Check 19] [19/20] Bounded Worker-Pool Concurrency (--max-concurrency 1) & Rootless Bundle Scaffolding (init-bundle --rootless)"
+sudo "$BOXLET_BIN" branch-run \
+  --root "$STATE_ROOT" \
+  --cgroup-parent "$CGROUP_PARENT" \
+  --memory 64m \
+  --network none \
+  --max-concurrency 1 \
+  --cmd "echo b1 > /b1.txt" \
+  --cmd "echo b2 > /b2.txt" \
+  --json \
+  "$BRANCH_BUNDLE" > "$WORK_DIR/check19-branches.json"
+
+"$BOXLET_BIN" init-bundle \
+  --rootless \
+  --busybox "$BUSYBOX_BIN" \
+  --cmd "id -u" \
+  --json \
+  "$WORK_DIR/rootless-bundle" > "$WORK_DIR/check19-rootless-init.json"
+
+python3 - "$WORK_DIR/check19-branches.json" "$WORK_DIR/rootless-bundle/config.json" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    branches = json.load(f)
+with open(sys.argv[2]) as f:
+    raw_cfg = f.read()
+    cfg = json.loads(raw_cfg)
+
+assert isinstance(branches, list) and len(branches) == 2, f"expected 2 branches, got {branches}"
+assert "b1.txt" in branches[0]["fs_diff"]["added"], f"expected b1.txt in branch 0 added, got {branches[0]}"
+assert "b2.txt" in branches[1]["fs_diff"]["added"], f"expected b2.txt in branch 1 added, got {branches[1]}"
+
+assert '"type": "user"' in raw_cfg or any(ns.get("type") == "user" for ns in cfg.get("linux", {}).get("namespaces", [])), (
+    f"expected user namespace in rootless config.json, got {cfg.get('linux')}"
+)
+assert "uidMappings" in cfg.get("linux", {}), f"expected uidMappings in rootless config.json, got {cfg.get('linux')}"
+print(
+    f"    bounded concurrency & rootless verified: branches={len(branches)}, "
+    f"uidMappings={cfg['linux']['uidMappings']}"
+)
+PY
+
+# ------------------------------------------------------------------------------
+# Check 20: Tamper-Evident Hash-Chained Audit Ledger & Prometheus Metrics
+# ------------------------------------------------------------------------------
+echo "==> [Check 20] [20/20] Tamper-Evident Hash-Chained Audit Ledger & Prometheus Metrics (boxlet audit --file ... --json / --prometheus)"
+sudo "$BOXLET_BIN" audit --file "$AUDIT_LOG" --json > "$WORK_DIR/check20-audit.json"
+sudo "$BOXLET_BIN" audit --file "$AUDIT_LOG" --prometheus > "$WORK_DIR/check20-audit.prom"
+
+python3 - "$WORK_DIR/check20-audit.json" "$WORK_DIR/check20-audit.prom" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    audit_data = json.load(f)
+with open(sys.argv[2]) as f:
+    prom_text = f.read()
+
+assert audit_data.get("hash_chain_valid") is True, f"expected hash_chain_valid is True, got {audit_data}"
+assert "boxlet_audit_hash_chain_valid 1" in prom_text, f"missing boxlet_audit_hash_chain_valid 1 in:\n{prom_text}"
+assert "boxlet_runs_completed_total" in prom_text, f"missing boxlet_runs_completed_total in:\n{prom_text}"
+print(
+    f"    audit hash-chain & prometheus verified: hash_chain_valid={audit_data['hash_chain_valid']}, "
+    f"total_records={audit_data['total_records']}"
+)
+PY
+
+echo "==> ALL 20/20 BOXLET V1+V2+V3+V4+V5+V6 CHECKS PASSED"

@@ -19,7 +19,7 @@ Preconditions:
 - `control-boxlet doctor --run <RUN_ID>` reported `doctor: OK`.
 
 - **Build and verify docs.** Execute `.agents/skills/verify-boxlet/scripts/control-boxlet drive api-docs --run <RUN_ID>`. Exit code is `0` and stdout prints `doc-verified: healthcheck, Engine, engine, policy, oci, snapshot, audit, doctor, eval, image, microvm, traits, error, BundleBuilder, AuditEvent, JsonlAuditLogger, PruneReport, AuditSummary, DoctorReport, EvalSpec, EvalRubric, EvalReport, RootfsArchiveReport, MicroVmConfig, MicroVmBackend, BranchSpec, BranchExecutionResult, BranchBatchReport present in rustdoc output`.
-- **Inspect proof artifacts.** Read `/tmp/boxlet-verify-evidence/<RUN_ID>/api-docs/stdout.txt`, `exit_code.txt`, and `meta.json`. `exit_code.txt` contains `0` and `stdout.txt` confirms the generated HTML index exists and documents all exported V1, V2, V3, V4, and V5 public modules and symbols.
+- **Inspect proof artifacts.** Read `/tmp/boxlet-verify-evidence/<RUN_ID>/api-docs/stdout.txt`, `exit_code.txt`, and `meta.json`. `exit_code.txt` contains `0` and `stdout.txt` confirms the generated HTML index exists and documents all exported V1, V2, V3, V4, V5, and V6 (ADR-009: tamper-evident hash-chained `AuditRecord` / `AuditSummary::to_prometheus_text`, `ExecutionPolicy::max_concurrency`, and `BundleBuilder::with_rootless`) public modules and symbols.
 
 ## Gotchas
 

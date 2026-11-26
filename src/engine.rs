@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -433,49 +433,12 @@ impl<B: RuntimeBackend> Engine<B> {
             });
         }
 
-        let results = thread::scope(|scope| -> Result<Vec<BranchExecutionResult>> {
-            let mut handles = Vec::with_capacity(prepared.len());
-            for item in &prepared {
-                let backend = &self.backend;
-                let base_manifest = &snapshot.manifest;
-                handles.push(scope.spawn(move || -> Result<BranchExecutionResult> {
-                    let execution =
-                        backend.run(&item.branch_id, &item.bundle_dir, &item.resolved)?;
-                    let after_manifest = TreeManifest::capture(&item.rootfs_dir)?;
-                    let fs_diff = base_manifest.diff(&after_manifest);
-                    Ok(BranchExecutionResult {
-                        branch_id: item.branch_id.clone(),
-                        execution,
-                        fs_diff,
-                    })
-                }));
-            }
-
-            let mut out = Vec::with_capacity(handles.len());
-            let mut first_err: Option<BoxletError> = None;
-            for handle in handles {
-                match handle.join() {
-                    Ok(Ok(branch_res)) => out.push(branch_res),
-                    Ok(Err(err)) => {
-                        if first_err.is_none() {
-                            first_err = Some(err);
-                        }
-                    }
-                    Err(_) => {
-                        if first_err.is_none() {
-                            first_err = Some(BoxletError::Runtime {
-                                subsystem: "engine",
-                                message: "branch execution worker thread panicked".to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-            if let Some(err) = first_err {
-                return Err(err);
-            }
-            Ok(out)
-        })?;
+        let results = execute_prepared_branches_bounded(
+            &self.backend,
+            &snapshot.manifest,
+            &prepared,
+            policy.max_concurrency,
+        )?;
 
         let succeeded_count = results
             .iter()
@@ -592,50 +555,12 @@ impl<B: RuntimeBackend> Engine<B> {
             });
         }
 
-        let results = thread::scope(|scope| -> Result<Vec<BranchExecutionResult>> {
-            let mut handles = Vec::with_capacity(prepared.len());
-            for item in &prepared {
-                let backend = &self.backend;
-                let base_manifest = &snapshot.manifest;
-                handles.push(scope.spawn(move || -> Result<BranchExecutionResult> {
-                    let execution =
-                        backend.run(&item.branch_id, &item.bundle_dir, &item.resolved)?;
-                    let after_manifest = TreeManifest::capture(&item.rootfs_dir)?;
-                    let fs_diff = base_manifest.diff(&after_manifest);
-                    Ok(BranchExecutionResult {
-                        branch_id: item.branch_id.clone(),
-                        execution,
-                        fs_diff,
-                    })
-                }));
-            }
-
-            let mut out = Vec::with_capacity(handles.len());
-            let mut first_err: Option<BoxletError> = None;
-            for handle in handles {
-                match handle.join() {
-                    Ok(Ok(branch_res)) => out.push(branch_res),
-                    Ok(Err(err)) => {
-                        if first_err.is_none() {
-                            first_err = Some(err);
-                        }
-                    }
-                    Err(_) => {
-                        if first_err.is_none() {
-                            first_err = Some(BoxletError::Runtime {
-                                subsystem: "engine",
-                                message: "eval candidate execution worker thread panicked"
-                                    .to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-            if let Some(err) = first_err {
-                return Err(err);
-            }
-            Ok(out)
-        })?;
+        let results = execute_prepared_branches_bounded(
+            &self.backend,
+            &snapshot.manifest,
+            &prepared,
+            spec.policy.max_concurrency,
+        )?;
 
         let verdicts: Vec<CandidateVerdict> = results
             .into_iter()
@@ -687,6 +612,90 @@ impl<B: RuntimeBackend> Engine<B> {
             promoted_diff,
         })
     }
+}
+
+fn execute_prepared_branches_bounded<B: RuntimeBackend>(
+    backend: &B,
+    base_manifest: &TreeManifest,
+    prepared: &[PreparedBranch],
+    max_concurrency: Option<usize>,
+) -> Result<Vec<BranchExecutionResult>> {
+    if let Some(0) = max_concurrency {
+        return Err(BoxletError::InvalidPolicy {
+            reason: "max_concurrency must be at least 1".to_string(),
+        });
+    }
+    if prepared.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let worker_count = max_concurrency
+        .unwrap_or(prepared.len())
+        .clamp(1, prepared.len());
+    let next_idx = AtomicUsize::new(0);
+
+    thread::scope(|scope| -> Result<Vec<BranchExecutionResult>> {
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let next_idx_ref = &next_idx;
+            handles.push(
+                scope.spawn(move || -> Vec<(usize, Result<BranchExecutionResult>)> {
+                    let mut local_out = Vec::new();
+                    loop {
+                        let idx = next_idx_ref.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = prepared.get(idx) else {
+                            break;
+                        };
+                        let res = (|| -> Result<BranchExecutionResult> {
+                            let execution =
+                                backend.run(&item.branch_id, &item.bundle_dir, &item.resolved)?;
+                            let after_manifest = TreeManifest::capture(&item.rootfs_dir)?;
+                            let fs_diff = base_manifest.diff(&after_manifest);
+                            Ok(BranchExecutionResult {
+                                branch_id: item.branch_id.clone(),
+                                execution,
+                                fs_diff,
+                            })
+                        })();
+                        local_out.push((idx, res));
+                    }
+                    local_out
+                }),
+            );
+        }
+
+        let mut indexed = Vec::with_capacity(prepared.len());
+        let mut first_err: Option<BoxletError> = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(worker_items) => {
+                    for (idx, item_res) in worker_items {
+                        match item_res {
+                            Ok(branch_res) => indexed.push((idx, branch_res)),
+                            Err(err) => {
+                                if first_err.is_none() {
+                                    first_err = Some(err);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    if first_err.is_none() {
+                        first_err = Some(BoxletError::Runtime {
+                            subsystem: "engine",
+                            message: "branch execution worker thread panicked".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+        indexed.sort_by_key(|(idx, _)| *idx);
+        Ok(indexed.into_iter().map(|(_, res)| res).collect())
+    })
 }
 
 fn is_pre_sync_divergence_error(err: &BoxletError) -> bool {
@@ -757,6 +766,9 @@ mod tests {
         last_created_spec: Mutex<Option<Spec>>,
         last_run_spec: Mutex<Option<ResolvedRunSpec>>,
         containers: Mutex<BTreeMap<String, ContainerState>>,
+        active_runs: AtomicUsize,
+        peak_active_runs: AtomicUsize,
+        simulated_delay: Option<Duration>,
     }
 
     impl MockBackend {
@@ -860,6 +872,13 @@ mod tests {
             bundle: &Path,
             resolved: &ResolvedRunSpec,
         ) -> Result<ExecutionResult> {
+            let current_active = self.active_runs.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_active_runs
+                .fetch_max(current_active, Ordering::SeqCst);
+            if let Some(delay) = self.simulated_delay {
+                thread::sleep(delay);
+            }
+
             if let Ok(mut guard) = self.last_run_spec.lock() {
                 *guard = Some(resolved.clone());
             }
@@ -947,6 +966,8 @@ mod tests {
                     _ => {}
                 }
             }
+
+            self.active_runs.fetch_sub(1, Ordering::SeqCst);
 
             Ok(ExecutionResult {
                 container_id: id.to_string(),
@@ -1330,6 +1351,48 @@ mod tests {
                 promoted_changes: Some(1),
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn engine_run_branches_respects_max_concurrency_limit() -> Result<()> {
+        let bundle = make_bundle()?;
+        let backend = MockBackend {
+            simulated_delay: Some(Duration::from_millis(10)),
+            ..MockBackend::default()
+        };
+        let engine = Engine::new(backend);
+
+        let branches: Vec<BranchSpec> = (0..6)
+            .map(|idx| BranchSpec::new(format!("branch-{idx}")))
+            .collect();
+        let policy = ExecutionPolicy {
+            max_concurrency: Some(2),
+            ..ExecutionPolicy::default()
+        };
+
+        let results = engine.run_branches(bundle.path(), &branches, &policy)?;
+        assert_eq!(results.len(), 6);
+        for (idx, res) in results.iter().enumerate() {
+            assert_eq!(res.branch_id, format!("branch-{idx}"));
+            assert_eq!(res.execution.exit_code, Some(0));
+        }
+
+        let peak = engine.backend.peak_active_runs.load(Ordering::SeqCst);
+        assert!(
+            (1..=2).contains(&peak),
+            "expected peak_active_runs in 1..=2, got {peak}"
+        );
+        assert_eq!(engine.backend.active_runs.load(Ordering::SeqCst), 0);
+
+        let zero_policy = ExecutionPolicy {
+            max_concurrency: Some(0),
+            ..ExecutionPolicy::default()
+        };
+        let err = engine
+            .run_branches(bundle.path(), &branches, &zero_policy)
+            .unwrap_err();
+        assert!(matches!(err, BoxletError::InvalidPolicy { .. }));
         Ok(())
     }
 }

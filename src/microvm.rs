@@ -511,6 +511,7 @@ impl RuntimeBackend for MicroVmBackend {
             seccomp: Some(resolved.seccomp.clone()),
             timeout: resolved.timeout,
             max_output_bytes: Some(resolved.max_output_bytes),
+            max_concurrency: None,
         };
 
         self.create(id, bundle, &resolved.oci_spec)?;

@@ -58,8 +58,11 @@ pub fn run_init_process(config_path: &Path) -> Result<()> {
     // before mutating mount namespaces or entering execve.
     let compiled_bpf = resolve_seccomp_bpf(&cfg)?;
 
+    let host_euid = nix::unistd::geteuid().as_raw();
+    let host_egid = nix::unistd::getegid().as_raw();
     let ns_flags = namespaces::build_unshare_flags(&cfg.spec, cfg.network_override);
     namespaces::unshare_namespaces(ns_flags)?;
+    namespaces::apply_user_namespace_mappings(&cfg.spec, ns_flags, host_euid, host_egid)?;
 
     // SAFETY: `boxlet __init` is a freshly exec'd single-threaded process, so `fork()`
     // is safe here and places the child as PID 1 inside the new PID namespace.

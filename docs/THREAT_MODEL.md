@@ -64,7 +64,18 @@
 
 ---
 
-## 4. Residual Risks & Explicit Non-Goals (V1)
+## 4. Enterprise V6 Hardening Invariants (Audit Hash Chaining & Rootless User Namespaces)
+
+1. **Tamper-Evident Audit Hash Chaining (`src/audit.rs`):**
+   - Every [`AuditRecord`] written by [`JsonlAuditLogger`] acquires an exclusive advisory file lock (`File::lock()`), reads the tail record, assigns a monotonically increasing sequence number (`seq`), records the predecessor's digest (`prev_hash_fnv1a64`), and computes its own deterministic 64-bit FNV-1a digest (`record_hash_fnv1a64`) over `(seq, prev_hash_fnv1a64, timestamp_unix_ms, canonical_event_json)`.
+   - `JsonlAuditLogger::summarize()` (`boxlet audit --file <PATH> [--json|--prometheus]`) recomputes the hash chain from `seq = 1` (`prev_hash_fnv1a64 = 0`) through the final entry and sets `hash_chain_valid = false` if any record is modified, deleted, reordered, or spliced.
+2. **Rootless User Namespace Isolation (`CLONE_NEWUSER`, `uid_map`, `gid_map`, `setgroups`):**
+   - Bundles scaffolded with `boxlet init-bundle --rootless` (`BundleBuilder::with_rootless(true)`) include the `user` namespace (`CLONE_NEWUSER`) and map container UID/GID `0` to the unprivileged calling host UID/GID (`uidMappings` / `gidMappings`).
+   - Before writing `/proc/self/gid_map`, the container init process unconditionally writes `"deny"` to `/proc/self/setgroups` to prevent `setgroups(2)` privilege-escalation attacks (CVE-2014-8989), then writes `uid_map` and `gid_map` before `pivot_root` and `execve`.
+
+---
+
+## 5. Residual Risks & Explicit Non-Goals (V1)
 
 1. **Shared host kernel exploits (residual risk):** A Linux kernel vulnerability triggered by an allowed syscall can break out of namespaces and seccomp. V1 accepts this boundary for single-host dev/test environments; hostile multi-tenant isolation is deferred to a future microVM `RuntimeBackend` (Firecracker / `libkrun`).
 2. **Root execution requirement (non-goal in V1):** V1 requires `root` on a dedicated Linux 5.15+ host/VM. Rootless user-namespace containers are explicitly excluded from V1 to avoid premature complexity and false security claims.
