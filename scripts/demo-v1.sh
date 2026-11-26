@@ -28,7 +28,7 @@ BUNDLE_DIR="$WORK_DIR/bundle"
 STATE_ROOT="$WORK_DIR/state"
 
 cleanup() {
-  for id in ci-check-1 ci-check-2 ci-check-3 ci-check-4 ci-check-5 ci-check-6 ci-oci-lifecycle-1 ci-check-11 ci-check-12; do
+  for id in ci-check-1 ci-check-2 ci-check-3 ci-check-4 ci-check-5 ci-check-6 ci-oci-lifecycle-1 ci-check-11 ci-check-12 ci-list-1 ci-list-2; do
     if [[ -d "$CGROUP_PARENT/$id" ]]; then
       echo 1 | sudo tee "$CGROUP_PARENT/$id/cgroup.kill" >/dev/null 2>&1 || true
       sudo rmdir "$CGROUP_PARENT/$id" >/dev/null 2>&1 || true
@@ -523,4 +523,82 @@ print(f"    audit.jsonl verified: mode={oct(mode)}, events={[r['event'] for r in
 PY
 assert_zero_leaks "ci-check-12"
 
-echo "==> All 12 Boxlet V1 & V2 end-to-end checks passed with zero leaked cgroups or state directories!"
+# ------------------------------------------------------------------------------
+# Check 13: Container Inventory & Garbage Collection (boxlet list + boxlet prune)
+# ------------------------------------------------------------------------------
+echo "==> [Check 13] Container Inventory & Garbage Collection (boxlet list + boxlet prune)"
+write_bundle_config "sleep 30"
+sudo "$BOXLET_BIN" create --root "$STATE_ROOT" --cgroup-parent "$CGROUP_PARENT" --bundle "$BUNDLE_DIR" ci-list-1
+sudo "$BOXLET_BIN" create --root "$STATE_ROOT" --cgroup-parent "$CGROUP_PARENT" --bundle "$BUNDLE_DIR" ci-list-2
+
+sudo "$BOXLET_BIN" list --root "$STATE_ROOT" --cgroup-parent "$CGROUP_PARENT" --json > "$WORK_DIR/check13-list.json"
+python3 - "$WORK_DIR/check13-list.json" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+
+assert [c["id"] for c in data] == ["ci-list-1", "ci-list-2"], f"unexpected container ids: {data}"
+assert all(c["status"] == "created" for c in data), f"expected status=='created' for all: {data}"
+print(f"    list verified: {[ (c['id'], c['status']) for c in data ]}")
+PY
+
+sudo "$BOXLET_BIN" start --root "$STATE_ROOT" --cgroup-parent "$CGROUP_PARENT" ci-list-1
+sudo "$BOXLET_BIN" kill --root "$STATE_ROOT" --cgroup-parent "$CGROUP_PARENT" ci-list-1 SIGKILL
+for _ in {1..20}; do
+  if sudo "$BOXLET_BIN" state --root "$STATE_ROOT" --cgroup-parent "$CGROUP_PARENT" ci-list-1 | grep -q '"status": "stopped"'; then
+    break
+  fi
+  sleep 0.1
+done
+
+sudo "$BOXLET_BIN" --audit-log "$WORK_DIR/audit.jsonl" prune --root "$STATE_ROOT" --cgroup-parent "$CGROUP_PARENT" --json > "$WORK_DIR/check13-prune1.json"
+python3 - "$WORK_DIR/check13-prune1.json" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+
+assert data["removed_containers"] == ["ci-list-1"], f"expected removed_containers==['ci-list-1'], got {data}"
+assert data["skipped_active_containers"] == ["ci-list-2"], f"expected skipped_active_containers==['ci-list-2'], got {data}"
+print(f"    prune (stopped only) verified: removed={data['removed_containers']}, skipped={data['skipped_active_containers']}")
+PY
+
+sudo "$BOXLET_BIN" --audit-log "$WORK_DIR/audit.jsonl" prune --root "$STATE_ROOT" --cgroup-parent "$CGROUP_PARENT" --force --json > "$WORK_DIR/check13-prune2.json"
+python3 - "$WORK_DIR/check13-prune2.json" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+
+assert data["removed_containers"] == ["ci-list-2"], f"expected removed_containers==['ci-list-2'], got {data}"
+print(f"    prune (--force) verified: removed={data['removed_containers']}")
+PY
+assert_zero_leaks "ci-list-1"
+assert_zero_leaks "ci-list-2"
+
+# ------------------------------------------------------------------------------
+# Check 14: Audit Log Telemetry Summary & Integrity Verification (boxlet audit --file)
+# ------------------------------------------------------------------------------
+echo "==> [Check 14] Audit Log Telemetry Summary & Integrity Verification (boxlet audit --file)"
+sudo "$BOXLET_BIN" audit --file "$WORK_DIR/audit.jsonl" --json > "$WORK_DIR/check14-audit.json"
+python3 - "$WORK_DIR/check14-audit.json" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+
+assert data["total_records"] == 4, f"expected total_records==4, got {data}"
+assert data["runs_completed"] == 1 and data["runs_succeeded"] == 1, f"expected runs_completed==1 and runs_succeeded==1, got {data}"
+assert data["branch_batches_completed"] == 1 and data["total_branches_evaluated"] == 1, (
+    f"expected branch_batches_completed==1 and total_branches_evaluated==1, got {data}"
+)
+assert data["chronological_valid"] is True, f"expected chronological_valid is True, got {data}"
+print(
+    f"    audit summary verified: total_records={data['total_records']}, "
+    f"runs_completed={data['runs_completed']}, branch_batches={data['branch_batches_completed']}, "
+    f"chronological_valid={data['chronological_valid']}"
+)
+PY
+
+echo "==> All 14 Boxlet V1, V2 & V3 end-to-end checks passed with zero leaked cgroups or state directories!"

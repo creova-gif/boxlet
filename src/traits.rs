@@ -32,6 +32,11 @@ pub trait RuntimeBackend: Send + Sync {
     /// Deletes a stopped container (or forcefully terminates and removes it when `force` is true).
     fn delete(&self, id: &str, force: bool) -> Result<()>;
 
+    /// Lists all tracked containers in deterministic `id` order, refreshing liveness where supported.
+    fn list(&self) -> Result<Vec<ContainerState>> {
+        Ok(Vec::new())
+    }
+
     /// Runs a container end-to-end with a merged [`ResolvedRunSpec`] and returns structured results.
     fn run(&self, id: &str, bundle: &Path, resolved: &ResolvedRunSpec) -> Result<ExecutionResult>;
 }

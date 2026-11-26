@@ -119,7 +119,7 @@ impl StateStore {
             }
         }
 
-        let _lock = self.acquire_lock(&dir)?;
+        let _lock = self.acquire_lock(&dir, id)?;
         let state = ContainerState {
             oci_version: OCI_RUNTIME_VERSION.to_string(),
             id: id.to_string(),
@@ -138,8 +138,35 @@ impl StateStore {
         if !dir.exists() {
             return Err(BoxletError::ContainerNotFound { id: id.to_string() });
         }
-        let _lock = self.acquire_lock(&dir)?;
+        let _lock = self.acquire_lock(&dir, id)?;
         read_state(&dir, id)
+    }
+
+    /// Atomically checks container `id` under `flock` and transitions `Created` or `Running`
+    /// to `Stopped` if its recorded PID is no longer alive according to `is_pid_alive`.
+    pub fn refresh_if_dead<F>(&self, id: &str, is_pid_alive: F) -> Result<ContainerState>
+    where
+        F: FnOnce(u32) -> bool,
+    {
+        let dir = self.container_dir(id)?;
+        if !dir.exists() {
+            return Err(BoxletError::ContainerNotFound { id: id.to_string() });
+        }
+        let _lock = self.acquire_lock(&dir, id)?;
+        let mut current = read_state(&dir, id)?;
+        if matches!(
+            current.status,
+            ContainerStatus::Created | ContainerStatus::Running
+        ) {
+            if let Some(pid) = current.pid {
+                if !is_pid_alive(pid) {
+                    current.status = ContainerStatus::Stopped;
+                    current.pid = None;
+                    write_state_atomic(&dir, &current)?;
+                }
+            }
+        }
+        Ok(current)
     }
 
     /// Transitions container `id` to `next_status` (optionally updating `pid`) atomically.
@@ -153,7 +180,7 @@ impl StateStore {
         if !dir.exists() {
             return Err(BoxletError::ContainerNotFound { id: id.to_string() });
         }
-        let _lock = self.acquire_lock(&dir)?;
+        let _lock = self.acquire_lock(&dir, id)?;
         let mut current = read_state(&dir, id)?;
 
         if !current.status.can_transition_to(next_status) {
@@ -183,7 +210,7 @@ impl StateStore {
             return Err(BoxletError::ContainerNotFound { id: id.to_string() });
         }
 
-        let lock = self.acquire_lock(&dir)?;
+        let lock = self.acquire_lock(&dir, id)?;
         let current = read_state(&dir, id)?;
         if !force && current.status != ContainerStatus::Stopped {
             return Err(BoxletError::ContainerNotStopped {
@@ -196,7 +223,63 @@ impl StateStore {
         fs::remove_dir_all(&dir).map_err(|source| BoxletError::StateStore { path: dir, source })
     }
 
-    fn acquire_lock(&self, dir: &Path) -> Result<File> {
+    /// Lists all valid container IDs persisted in the state store, sorted lexicographically.
+    pub fn list_ids(&self) -> Result<Vec<String>> {
+        if !self.root.exists() {
+            return Ok(Vec::new());
+        }
+
+        let entries = fs::read_dir(&self.root).map_err(|source| BoxletError::StateStore {
+            path: self.root.clone(),
+            source,
+        })?;
+
+        let mut ids = Vec::new();
+        for entry_res in entries {
+            let entry = entry_res.map_err(|source| BoxletError::StateStore {
+                path: self.root.clone(),
+                source,
+            })?;
+            let file_type = entry
+                .file_type()
+                .map_err(|source| BoxletError::StateStore {
+                    path: entry.path(),
+                    source,
+                })?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            if !entry.path().join("state.json").is_file() {
+                continue;
+            }
+            let Some(id_str) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if validate_container_id(&id_str).is_err() {
+                continue;
+            }
+            ids.push(id_str);
+        }
+
+        ids.sort();
+        Ok(ids)
+    }
+
+    /// Loads all container states persisted in the state store, sorted lexicographically by `id`.
+    pub fn list(&self) -> Result<Vec<ContainerState>> {
+        let ids = self.list_ids()?;
+        let mut states = Vec::with_capacity(ids.len());
+        for id in ids {
+            match self.load(&id) {
+                Ok(state) => states.push(state),
+                Err(BoxletError::ContainerNotFound { .. }) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(states)
+    }
+
+    fn acquire_lock(&self, dir: &Path, id: &str) -> Result<File> {
         let lock_path = dir.join(".lock");
         let file = OpenOptions::new()
             .create(true)
@@ -204,9 +287,15 @@ impl StateStore {
             .write(true)
             .truncate(false)
             .open(&lock_path)
-            .map_err(|source| BoxletError::StateStore {
-                path: lock_path.clone(),
-                source,
+            .map_err(|source| {
+                if source.kind() == std::io::ErrorKind::NotFound {
+                    BoxletError::ContainerNotFound { id: id.to_string() }
+                } else {
+                    BoxletError::StateStore {
+                        path: lock_path.clone(),
+                        source,
+                    }
+                }
             })?;
         file.lock().map_err(|source| BoxletError::StateStore {
             path: lock_path,
@@ -334,6 +423,42 @@ mod tests {
 
         // Force delete works even in Creating state
         store.delete("box-2", true)?;
+        Ok(())
+    }
+
+    #[test]
+    fn list_and_list_ids_return_sorted_containers_and_ignore_non_container_entries() -> Result<()> {
+        let (_tmp, store) = test_store()?;
+        assert!(store.list_ids()?.is_empty());
+        assert!(store.list()?.is_empty());
+
+        store.init_creating("box-b", PathBuf::from("/bundle-b"), BTreeMap::new())?;
+        store.init_creating("box-a", PathBuf::from("/bundle-a"), BTreeMap::new())?;
+        store.transition("box-a", ContainerStatus::Created, Some(100))?;
+
+        // Create an unrelated regular file and an empty directory without state.json
+        fs::write(store.root().join("unrelated.txt"), b"ignore").map_err(|source| {
+            BoxletError::StateStore {
+                path: store.root().join("unrelated.txt"),
+                source,
+            }
+        })?;
+        fs::create_dir_all(store.root().join("empty-dir")).map_err(|source| {
+            BoxletError::StateStore {
+                path: store.root().join("empty-dir"),
+                source,
+            }
+        })?;
+
+        let ids = store.list_ids()?;
+        assert_eq!(ids, vec!["box-a".to_string(), "box-b".to_string()]);
+
+        let states = store.list()?;
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].id, "box-a");
+        assert_eq!(states[0].status, ContainerStatus::Created);
+        assert_eq!(states[1].id, "box-b");
+        assert_eq!(states[1].status, ContainerStatus::Creating);
         Ok(())
     }
 }

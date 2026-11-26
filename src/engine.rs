@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audit::{AuditEvent, JsonlAuditLogger};
 use crate::error::{BoxletError, Result};
-use crate::oci::state::ContainerState;
+use crate::oci::state::{ContainerState, ContainerStatus};
 use crate::oci::{load_bundle_spec, validate_container_id};
 use crate::policy::{merge_policy_with_spec, ExecutionPolicy, ExecutionResult, ResolvedRunSpec};
 use crate::snapshot::{FsDiff, TreeManifest, WorkspaceSnapshot};
@@ -20,6 +20,15 @@ use crate::traits::RuntimeBackend;
 
 /// Monotonic counter used to disambiguate concurrent temporary branch workspaces.
 static WORKSPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Summary of containers removed or skipped during [`Engine::prune`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneReport {
+    /// Container IDs that were deleted.
+    pub removed_containers: Vec<String>,
+    /// Active container IDs (`Creating`, `Created`, `Running`) that were skipped when `force == false`.
+    pub skipped_active_containers: Vec<String>,
+}
 
 /// Per-branch workload overrides for [`Engine::run_branches`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,6 +271,53 @@ impl<B: RuntimeBackend> Engine<B> {
             })?;
         }
         Ok(())
+    }
+
+    /// Lists all tracked containers in deterministic `id` order.
+    pub fn list(&self) -> Result<Vec<ContainerState>> {
+        self.backend.list()
+    }
+
+    /// Removes stopped containers (or all containers when `force` is `true`) and returns a [`PruneReport`].
+    pub fn prune(&self, force: bool) -> Result<PruneReport> {
+        self.preflight_audit()?;
+        let states = self.backend.list()?;
+        let mut removed_containers = Vec::new();
+        let mut skipped_active_containers = Vec::new();
+
+        let mut delete_err: Option<BoxletError> = None;
+        for st in states {
+            if force || st.status == ContainerStatus::Stopped {
+                match self.backend.delete(&st.id, force) {
+                    Ok(()) => removed_containers.push(st.id),
+                    Err(err) => {
+                        delete_err = Some(err);
+                        break;
+                    }
+                }
+            } else {
+                skipped_active_containers.push(st.id);
+            }
+        }
+
+        if let Some(ref logger) = self.audit_logger {
+            if !removed_containers.is_empty() || delete_err.is_none() {
+                let _ = logger.record(AuditEvent::ContainersPruned {
+                    removed_count: removed_containers.len(),
+                    skipped_active_count: skipped_active_containers.len(),
+                    force,
+                });
+            }
+        }
+
+        if let Some(err) = delete_err {
+            return Err(err);
+        }
+
+        Ok(PruneReport {
+            removed_containers,
+            skipped_active_containers,
+        })
     }
 
     /// Runs a container end-to-end by overlaying `policy` onto `<bundle>/config.json`
@@ -525,6 +581,25 @@ mod tests {
     struct MockBackend {
         last_created_spec: Mutex<Option<Spec>>,
         last_run_spec: Mutex<Option<ResolvedRunSpec>>,
+        containers: Mutex<BTreeMap<String, ContainerState>>,
+    }
+
+    impl MockBackend {
+        fn insert_container(&self, id: &str, status: ContainerStatus, pid: Option<u32>) {
+            if let Ok(mut guard) = self.containers.lock() {
+                guard.insert(
+                    id.to_string(),
+                    ContainerState {
+                        oci_version: OCI_RUNTIME_VERSION.to_string(),
+                        id: id.to_string(),
+                        status,
+                        pid,
+                        bundle: PathBuf::from("/bundle"),
+                        annotations: BTreeMap::new(),
+                    },
+                );
+            }
+        }
     }
 
     impl RuntimeBackend for MockBackend {
@@ -532,28 +607,41 @@ mod tests {
             if let Ok(mut guard) = self.last_created_spec.lock() {
                 *guard = Some(spec.clone());
             }
-            Ok(ContainerState {
+            let st = ContainerState {
                 oci_version: OCI_RUNTIME_VERSION.to_string(),
                 id: id.to_string(),
                 status: ContainerStatus::Created,
                 pid: Some(1001),
                 bundle: bundle.to_path_buf(),
                 annotations: BTreeMap::new(),
-            })
+            };
+            if let Ok(mut guard) = self.containers.lock() {
+                guard.insert(id.to_string(), st.clone());
+            }
+            Ok(st)
         }
 
         fn start(&self, id: &str) -> Result<ContainerState> {
-            Ok(ContainerState {
+            let st = ContainerState {
                 oci_version: OCI_RUNTIME_VERSION.to_string(),
                 id: id.to_string(),
                 status: ContainerStatus::Running,
                 pid: Some(1001),
                 bundle: PathBuf::from("/bundle"),
                 annotations: BTreeMap::new(),
-            })
+            };
+            if let Ok(mut guard) = self.containers.lock() {
+                guard.insert(id.to_string(), st.clone());
+            }
+            Ok(st)
         }
 
         fn state(&self, id: &str) -> Result<ContainerState> {
+            if let Ok(guard) = self.containers.lock() {
+                if let Some(st) = guard.get(id) {
+                    return Ok(st.clone());
+                }
+            }
             Ok(ContainerState {
                 oci_version: OCI_RUNTIME_VERSION.to_string(),
                 id: id.to_string(),
@@ -568,8 +656,27 @@ mod tests {
             Ok(())
         }
 
-        fn delete(&self, _id: &str, _force: bool) -> Result<()> {
+        fn delete(&self, id: &str, force: bool) -> Result<()> {
+            if let Ok(mut guard) = self.containers.lock() {
+                if let Some(existing) = guard.get(id) {
+                    if !force && existing.status != ContainerStatus::Stopped {
+                        return Err(BoxletError::ContainerNotStopped {
+                            id: id.to_string(),
+                            status: existing.status,
+                        });
+                    }
+                    guard.remove(id);
+                }
+            }
             Ok(())
+        }
+
+        fn list(&self) -> Result<Vec<ContainerState>> {
+            let guard = self.containers.lock().map_err(|_| BoxletError::Runtime {
+                subsystem: "test",
+                message: "MockBackend mutex poisoned".to_string(),
+            })?;
+            Ok(guard.values().cloned().collect())
         }
 
         fn run(
@@ -892,6 +999,76 @@ mod tests {
                 promoted_changes: Some(1),
             } if winner == "branch-2"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn engine_list_and_prune_remove_stopped_and_respect_force_flag() -> Result<()> {
+        let log_dir = tempfile::tempdir().map_err(|source| BoxletError::StateStore {
+            path: PathBuf::from("tempdir"),
+            source,
+        })?;
+        let logger = JsonlAuditLogger::new(log_dir.path().join("audit.jsonl"));
+        let backend = MockBackend::default();
+        backend.insert_container("box-active", ContainerStatus::Running, Some(2002));
+        backend.insert_container("box-created", ContainerStatus::Created, Some(2001));
+        backend.insert_container("box-stopped-1", ContainerStatus::Stopped, None);
+        backend.insert_container("box-stopped-2", ContainerStatus::Stopped, None);
+
+        let engine = Engine::new(backend).with_audit_logger(logger.clone());
+
+        let initial = engine.list()?;
+        let initial_ids: Vec<&str> = initial.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            initial_ids,
+            vec![
+                "box-active",
+                "box-created",
+                "box-stopped-1",
+                "box-stopped-2"
+            ]
+        );
+
+        let prune_soft = engine.prune(false)?;
+        assert_eq!(
+            prune_soft.removed_containers,
+            vec!["box-stopped-1".to_string(), "box-stopped-2".to_string()]
+        );
+        assert_eq!(
+            prune_soft.skipped_active_containers,
+            vec!["box-active".to_string(), "box-created".to_string()]
+        );
+
+        let after_soft = engine.list()?;
+        let after_soft_ids: Vec<&str> = after_soft.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(after_soft_ids, vec!["box-active", "box-created"]);
+
+        let prune_force = engine.prune(true)?;
+        assert_eq!(
+            prune_force.removed_containers,
+            vec!["box-active".to_string(), "box-created".to_string()]
+        );
+        assert!(prune_force.skipped_active_containers.is_empty());
+        assert!(engine.list()?.is_empty());
+
+        let records = logger.read_all()?;
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0].event,
+            AuditEvent::ContainersPruned {
+                removed_count: 2,
+                skipped_active_count: 2,
+                force: false,
+            }
+        );
+        assert_eq!(
+            records[1].event,
+            AuditEvent::ContainersPruned {
+                removed_count: 2,
+                skipped_active_count: 0,
+                force: true,
+            }
+        );
         Ok(())
     }
 }

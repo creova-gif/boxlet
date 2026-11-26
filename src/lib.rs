@@ -10,8 +10,8 @@ pub mod policy;
 pub mod snapshot;
 pub mod traits;
 
-pub use audit::{AuditEvent, AuditRecord, JsonlAuditLogger};
-pub use engine::{BranchBatchReport, BranchExecutionResult, BranchSpec, Engine};
+pub use audit::{AuditEvent, AuditRecord, AuditSummary, JsonlAuditLogger};
+pub use engine::{BranchBatchReport, BranchExecutionResult, BranchSpec, Engine, PruneReport};
 #[cfg(target_os = "linux")]
 pub use linux::LinuxBackend;
 pub use oci::BundleBuilder;
