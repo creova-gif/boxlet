@@ -115,38 +115,15 @@ impl JsonlAuditLogger {
         &self.path
     }
 
+    /// Verifies that the audit log file can be safely opened for append without following symlinks.
+    pub fn preflight(&self) -> Result<()> {
+        let _file = self.open_log_file()?;
+        Ok(())
+    }
+
     /// Appends `event` as a single timestamped JSON Line to the audit log and returns the written [`AuditRecord`].
     pub fn record(&self, event: AuditEvent) -> Result<AuditRecord> {
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent).map_err(|source| BoxletError::StateStore {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-
-        let mut options = OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        {
-            options.mode(0o600);
-        }
-
-        let mut file = options
-            .open(&self.path)
-            .map_err(|source| BoxletError::StateStore {
-                path: self.path.clone(),
-                source,
-            })?;
-
-        #[cfg(unix)]
-        {
-            fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600)).map_err(
-                |source| BoxletError::StateStore {
-                    path: self.path.clone(),
-                    source,
-                },
-            )?;
-        }
+        let mut file = self.open_log_file()?;
 
         let rec = AuditRecord::new(event);
         let mut line = serde_json::to_string(&rec)?;
@@ -159,6 +136,52 @@ impl JsonlAuditLogger {
             })?;
 
         Ok(rec)
+    }
+
+    fn open_log_file(&self) -> Result<File> {
+        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent).map_err(|source| BoxletError::StateStore {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+
+        if let Ok(meta) = fs::symlink_metadata(&self.path) {
+            if meta.file_type().is_symlink() {
+                return Err(BoxletError::StateStore {
+                    path: self.path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "audit log path must not be a symbolic link",
+                    ),
+                });
+            }
+        }
+
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+
+        let file = options
+            .open(&self.path)
+            .map_err(|source| BoxletError::StateStore {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        #[cfg(unix)]
+        {
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|source| BoxletError::StateStore {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
+        Ok(file)
     }
 
     /// Reads and parses all [`AuditRecord`] entries from the `.jsonl` audit log file in chronological order.

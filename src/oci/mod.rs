@@ -106,15 +106,18 @@ impl BundleBuilder {
                 reason: "bundle process.args must not be empty".to_string(),
             });
         }
-        if self.cwd.trim().is_empty() {
+        if self.cwd.trim().is_empty() || !self.cwd.starts_with('/') {
             return Err(BoxletError::InvalidPolicy {
-                reason: "bundle process.cwd must not be empty".to_string(),
+                reason: "bundle process.cwd must be a non-empty absolute path starting with '/'"
+                    .to_string(),
             });
         }
 
         let rootfs_dir = bundle_dir.join("rootfs");
+        reject_if_symlink(&rootfs_dir)?;
         for subdir in ["bin", "proc", "dev", "tmp", "etc"] {
             let dir_path = rootfs_dir.join(subdir);
+            reject_if_symlink(&dir_path)?;
             fs::create_dir_all(&dir_path).map_err(|source| BoxletError::StateStore {
                 path: dir_path,
                 source,
@@ -122,6 +125,12 @@ impl BundleBuilder {
         }
 
         let hostname_file = rootfs_dir.join("etc").join("hostname");
+        if fs::symlink_metadata(&hostname_file).is_ok() {
+            fs::remove_file(&hostname_file).map_err(|source| BoxletError::StateStore {
+                path: hostname_file.clone(),
+                source,
+            })?;
+        }
         fs::write(&hostname_file, format!("{}\n", self.hostname)).map_err(|source| {
             BoxletError::StateStore {
                 path: hostname_file,
@@ -141,19 +150,33 @@ impl BundleBuilder {
             }
             let bin_dir = rootfs_dir.join("bin");
             let bb_dst = bin_dir.join("busybox");
-            fs::copy(bb_src, &bb_dst).map_err(|source| BoxletError::StateStore {
+            let bb_tmp = bin_dir.join(".busybox.tmp");
+            if fs::symlink_metadata(&bb_tmp).is_ok() {
+                let _ = fs::remove_file(&bb_tmp);
+            }
+            fs::copy(bb_src, &bb_tmp).map_err(|source| BoxletError::StateStore {
                 path: bb_dst.clone(),
                 source,
             })?;
             #[cfg(unix)]
             {
-                fs::set_permissions(&bb_dst, fs::Permissions::from_mode(0o755)).map_err(
-                    |source| BoxletError::StateStore {
-                        path: bb_dst,
-                        source,
+                fs::set_permissions(&bb_tmp, fs::Permissions::from_mode(0o755)).map_err(
+                    |source| {
+                        let _ = fs::remove_file(&bb_tmp);
+                        BoxletError::StateStore {
+                            path: bb_dst.clone(),
+                            source,
+                        }
                     },
                 )?;
             }
+            fs::rename(&bb_tmp, &bb_dst).map_err(|source| {
+                let _ = fs::remove_file(&bb_tmp);
+                BoxletError::StateStore {
+                    path: bb_dst,
+                    source,
+                }
+            })?;
 
             for applet in BUSYBOX_APPLETS {
                 let applet_path = bin_dir.join(applet);
@@ -186,7 +209,7 @@ impl BundleBuilder {
                 source,
             })?;
 
-        let process = ProcessBuilder::default()
+        let mut process = ProcessBuilder::default()
             .terminal(false)
             .user(user)
             .args(self.args.clone())
@@ -198,6 +221,8 @@ impl BundleBuilder {
                 path: config_path.clone(),
                 source,
             })?;
+        process.set_capabilities(None);
+        process.set_rlimits(None);
 
         let namespace_types = [
             LinuxNamespaceType::Pid,
@@ -218,13 +243,15 @@ impl BundleBuilder {
             namespaces.push(ns);
         }
 
-        let linux = LinuxBuilder::default()
+        let mut linux = LinuxBuilder::default()
             .namespaces(namespaces)
             .build()
             .map_err(|source| BoxletError::OciSpec {
                 path: config_path.clone(),
                 source,
             })?;
+        linux.set_masked_paths(None);
+        linux.set_readonly_paths(None);
 
         let spec = SpecBuilder::default()
             .version(OCI_RUNTIME_VERSION)
@@ -246,6 +273,21 @@ impl BundleBuilder {
 
         Ok(spec)
     }
+}
+
+fn reject_if_symlink(path: &Path) -> Result<()> {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(BoxletError::StateStore {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "bundle directory component must not be a symlink",
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

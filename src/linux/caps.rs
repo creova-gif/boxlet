@@ -32,7 +32,7 @@ pub(crate) fn apply_capabilities(
         let names: Vec<String> = spec_caps
             .effective()
             .as_ref()
-            .map(|set| set.iter().map(|c| format!("{c:?}")).collect())
+            .map(|set| set.iter().map(ToString::to_string).collect())
             .unwrap_or_default();
         parse_cap_names(&names)?
     } else {

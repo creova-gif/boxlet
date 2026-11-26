@@ -194,9 +194,17 @@ impl<B: RuntimeBackend> Engine<B> {
         self
     }
 
+    fn preflight_audit(&self) -> Result<()> {
+        if let Some(ref logger) = self.audit_logger {
+            logger.preflight()?;
+        }
+        Ok(())
+    }
+
     /// Creates a container from `<bundle>/config.json` **verbatim** (no `boxlet run` defaults injected).
     pub fn create(&self, id: &str, bundle: &Path) -> Result<ContainerState> {
         validate_container_id(id)?;
+        self.preflight_audit()?;
         let spec = load_bundle_spec(bundle)?;
         let state = self.backend.create(id, bundle, &spec)?;
         if let Some(ref logger) = self.audit_logger {
@@ -211,6 +219,7 @@ impl<B: RuntimeBackend> Engine<B> {
     /// Starts a previously created container (`Created -> Running`).
     pub fn start(&self, id: &str) -> Result<ContainerState> {
         validate_container_id(id)?;
+        self.preflight_audit()?;
         let state = self.backend.start(id)?;
         if let Some(ref logger) = self.audit_logger {
             logger.record(AuditEvent::ContainerStarted {
@@ -230,6 +239,7 @@ impl<B: RuntimeBackend> Engine<B> {
     /// Sends OS signal `signal` to container `id`.
     pub fn kill(&self, id: &str, signal: i32) -> Result<()> {
         validate_container_id(id)?;
+        self.preflight_audit()?;
         self.backend.kill(id, signal)?;
         if let Some(ref logger) = self.audit_logger {
             logger.record(AuditEvent::ContainerKilled {
@@ -243,6 +253,7 @@ impl<B: RuntimeBackend> Engine<B> {
     /// Deletes container `id` (requires `Stopped` unless `force` is true).
     pub fn delete(&self, id: &str, force: bool) -> Result<()> {
         validate_container_id(id)?;
+        self.preflight_audit()?;
         self.backend.delete(id, force)?;
         if let Some(ref logger) = self.audit_logger {
             logger.record(AuditEvent::ContainerDeleted {
@@ -262,6 +273,7 @@ impl<B: RuntimeBackend> Engine<B> {
         policy: &ExecutionPolicy,
     ) -> Result<ExecutionResult> {
         validate_container_id(id)?;
+        self.preflight_audit()?;
         let base_spec = load_bundle_spec(bundle)?;
         let resolved = merge_policy_with_spec(&base_spec, policy)?;
         let result = self.backend.run(id, bundle, &resolved)?;
@@ -303,6 +315,7 @@ impl<B: RuntimeBackend> Engine<B> {
         promote_winner: bool,
     ) -> Result<BranchBatchReport> {
         policy.validate()?;
+        self.preflight_audit()?;
 
         let mut seen_ids = BTreeSet::new();
         for branch in branches {

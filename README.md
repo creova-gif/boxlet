@@ -96,6 +96,7 @@ Scaffold a ready-to-run BusyBox OCI bundle directory (`config.json` + `rootfs/{b
 ```bash
 ./target/release/boxlet init-bundle \
   --cmd "echo boxlet-ready && uname -a" \
+  --busybox /bin/busybox \
   --hostname "boxlet-sandbox" \
   --json \
   ./bundle
@@ -225,7 +226,7 @@ fn inspect_and_branch() -> boxlet::error::Result<()> {
         .with_shell_command("echo scaffold-ok")
         .with_hostname("boxlet-sdk")
         .build(Path::new("./scaffolded-bundle"))?;
-    let audit_logger = JsonlAuditLogger::new("/tmp/boxlet-audit.jsonl");
+    let audit_logger = JsonlAuditLogger::new("/var/log/boxlet/audit.jsonl");
 
     // Portable workspace snapshot + deterministic diff + rollback:
     let snap = WorkspaceSnapshot::create(
