@@ -28,7 +28,7 @@ BUNDLE_DIR="$WORK_DIR/bundle"
 STATE_ROOT="$WORK_DIR/state"
 
 cleanup() {
-  for id in ci-check-1 ci-check-2 ci-check-3 ci-check-4 ci-check-5 ci-check-6 ci-oci-lifecycle-1 ci-check-11 ci-check-12 ci-list-1 ci-list-2; do
+  for id in ci-check-1 ci-check-2 ci-check-3 ci-check-4 ci-check-5 ci-check-6 ci-oci-lifecycle-1 ci-check-11 ci-check-12 ci-list-1 ci-list-2 eval-cand-tamper eval-cand-fail eval-cand-clean; do
     if [[ -d "$CGROUP_PARENT/$id" ]]; then
       echo 1 | sudo tee "$CGROUP_PARENT/$id/cgroup.kill" >/dev/null 2>&1 || true
       sudo rmdir "$CGROUP_PARENT/$id" >/dev/null 2>&1 || true
@@ -601,4 +601,95 @@ print(
 )
 PY
 
-echo "==> All 14 Boxlet V1, V2 & V3 end-to-end checks passed with zero leaked cgroups or state directories!"
+# ------------------------------------------------------------------------------
+# Check 15: Host Environment & Kernel Readiness Diagnostics (boxlet doctor --json)
+# ------------------------------------------------------------------------------
+echo "==> [Check 15] Host Environment & Kernel Readiness Diagnostics (boxlet doctor --json)"
+sudo "$BOXLET_BIN" doctor --root "$STATE_ROOT" --cgroup-parent "$CGROUP_PARENT" --json > "$WORK_DIR/check15-doctor.json"
+python3 - "$WORK_DIR/check15-doctor.json" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+
+assert data["overall_ready"] is True, f"expected overall_ready is True, got {data}"
+assert data["host_os"] == "linux", f"expected host_os=='linux', got {data}"
+expected_checks = ["host_os", "kernel_version", "root_privileges", "cgroup_v2", "seccomp_arch"]
+by_name = {c["name"]: c for c in data.get("checks", [])}
+for name in expected_checks:
+    assert name in by_name, f"missing doctor check {name!r} in {data}"
+    assert by_name[name]["status"] == "pass", f"expected check {name!r} status=='pass', got {by_name[name]}"
+print(
+    f"    doctor verified: overall_ready={data['overall_ready']}, "
+    f"host_os={data['host_os']}, checks={[c['name'] + ':' + c['status'] for c in data['checks']]}"
+)
+PY
+
+# ------------------------------------------------------------------------------
+# Check 16: Declarative Multi-Agent Rubric Evaluation & Guardrails (boxlet eval --spec ... --promote-winner --json)
+# ------------------------------------------------------------------------------
+echo "==> [Check 16] Declarative Multi-Agent Rubric Evaluation & Guardrails (boxlet eval --spec ... --promote-winner --json)"
+cat > "$WORK_DIR/eval-spec.json" <<'EOF'
+{
+  "policy": {
+    "memory_bytes": 67108864,
+    "network": "none"
+  },
+  "rubric": {
+    "require_exit_zero": true,
+    "required_stdout_contains": ["EVAL_PASS"],
+    "required_added_paths": ["tmp/eval_solution.txt"],
+    "forbidden_modified_paths": ["etc/hostname"]
+  },
+  "candidates": [
+    {
+      "id": "eval-cand-tamper",
+      "args": ["/bin/sh", "-c", "echo tampered > /etc/hostname && echo solution > /tmp/eval_solution.txt && echo EVAL_PASS"]
+    },
+    {
+      "id": "eval-cand-fail",
+      "args": ["/bin/sh", "-c", "echo solution > /tmp/eval_solution.txt && exit 1"]
+    },
+    {
+      "id": "eval-cand-clean",
+      "args": ["/bin/sh", "-c", "echo clean-solution > /tmp/eval_solution.txt && echo EVAL_PASS"]
+    }
+  ],
+  "promote_winner": true
+}
+EOF
+
+sudo "$BOXLET_BIN" eval \
+  --root "$STATE_ROOT" \
+  --cgroup-parent "$CGROUP_PARENT" \
+  --spec "$WORK_DIR/eval-spec.json" \
+  --promote-winner \
+  --json \
+  "$WORK_DIR/scaffolded-bundle" > "$WORK_DIR/check16-eval.json"
+
+python3 - "$WORK_DIR/check16-eval.json" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+
+verdicts = data.get("verdicts", [])
+assert len(verdicts) == 3, f"expected 3 candidate verdicts, got {len(verdicts)}: {data}"
+assert verdicts[0]["passed_rubric"] is False, f"expected verdicts[0] (tamper) passed_rubric is False, got {verdicts[0]}"
+assert verdicts[1]["passed_rubric"] is False, f"expected verdicts[1] (fail) passed_rubric is False, got {verdicts[1]}"
+assert verdicts[2]["passed_rubric"] is True, f"expected verdicts[2] (clean) passed_rubric is True, got {verdicts[2]}"
+assert data.get("winning_branch_id") == "eval-cand-clean", f"expected winning_branch_id=='eval-cand-clean', got {data}"
+assert data.get("promoted") is True, f"expected promoted is True, got {data}"
+print(
+    f"    eval verified: winning_branch_id={data['winning_branch_id']}, promoted={data['promoted']}, "
+    f"scores={[(v['branch_id'], v['passed_rubric'], v['score']) for v in verdicts]}"
+)
+PY
+
+test -f "$WORK_DIR/scaffolded-bundle/rootfs/tmp/eval_solution.txt"
+grep -q "boxlet-scaffold" "$WORK_DIR/scaffolded-bundle/rootfs/etc/hostname"
+assert_zero_leaks "eval-cand-tamper"
+assert_zero_leaks "eval-cand-fail"
+assert_zero_leaks "eval-cand-clean"
+
+echo "==> All 16 Boxlet V1–V4 end-to-end checks passed with zero leaked cgroups or state directories!"

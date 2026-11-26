@@ -7,6 +7,7 @@
 - **ADR-004 (Branch Promotion & Workspace Rollback):** [ADR-004: Branch Promotion and Workspace Rollback](docs/adr/004-branch-promotion-and-rollback.md)
 - **ADR-005 (Structured Audit Trail & OCI Bundle Scaffolding):** [ADR-005: Structured Audit Trail and OCI Bundle Scaffolding](docs/adr/005-audit-trail-and-bundle-scaffolding.md)
 - **ADR-006 (Container Inventory, Garbage Collection & Audit Analytics):** [ADR-006: Container Inventory, Garbage Collection, and Audit Analytics](docs/adr/006-container-inventory-prune-and-audit-analytics.md)
+- **ADR-007 (Host Readiness Diagnostics & Declarative Evaluation Rubrics):** [ADR-007: Host Readiness Diagnostics and Declarative Evaluation Rubrics](docs/adr/007-doctor-diagnostics-and-declarative-eval-rubrics.md)
 - **Threat Model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)
 - **Design Doc:** [docs/designs/boxlet-v1-oci-runtime.md](docs/designs/boxlet-v1-oci-runtime.md)
 - **Engineering Standards:** [AGENTS.md](AGENTS.md)
@@ -156,11 +157,26 @@ sudo ./target/release/boxlet --audit-log /var/log/boxlet-audit.jsonl prune --for
 
 # Parse and summarize a JSONL audit trail (portable across Linux and macOS)
 sudo ./target/release/boxlet audit --file /var/log/boxlet-audit.jsonl --json
+
+# Run host environment & kernel readiness diagnostics (Linux 5.15+, root, cgroup v2, seccomp arch)
+sudo ./target/release/boxlet doctor --json
 ```
 
-### Run the End-to-End 14-Check V1, V2 & V3 Demo Script
+### Declarative Multi-Agent Evaluation & Rubric Guardrails (`boxlet eval`)
 
-On a Linux 5.15+ host with `busybox` (`busybox-static`) and `python3` installed, run the self-contained 14-check verification demo covering normal execution, `memory.max` OOM-kill telemetry (`oom_killed: true`), fail-closed seccomp/capability enforcement, zero-leak cleanup, V2 workspace snapshots/diffs, parallel multi-agent branch execution, winner promotion/rollback, OCI bundle scaffolding, container inventory/garbage collection (`list`/`prune`), and JSONL audit log analytics (`audit --file`):
+Evaluate multiple candidate branches against a declarative `EvalSpec` JSON rubric (`require_exit_zero`, `required_stdout_contains`, `forbidden_stderr_contains`, `required_added_paths`, `forbidden_modified_paths`, `max_changed_files`), score and rank passing candidates deterministically, and optionally promote the highest-scoring winner:
+
+```bash
+sudo ./target/release/boxlet eval \
+  --spec ./eval-spec.json \
+  --promote-winner \
+  --json \
+  ./bundle
+```
+
+### Run the End-to-End 16-Check V1–V4 Demo Script
+
+On a Linux 5.15+ host with `busybox` (`busybox-static`) and `python3` installed, run the self-contained 16-check verification demo covering normal execution, `memory.max` OOM-kill telemetry (`oom_killed: true`), fail-closed seccomp/capability enforcement, zero-leak cleanup, V2 workspace snapshots/diffs, parallel multi-agent branch execution, winner promotion/rollback, OCI bundle scaffolding, container inventory/garbage collection (`list`/`prune`), JSONL audit log analytics (`audit --file`), host readiness diagnostics (`doctor`), and declarative rubric evaluation (`eval --spec`):
 
 ```bash
 sudo ./scripts/demo-v1.sh ./target/release/boxlet
@@ -402,3 +418,19 @@ Boxlet V1 enforces defense-in-depth Linux kernel isolation:
 For the full trust-boundary diagram, threat matrix, and residual risk analysis, see:
 - **[Threat Model (`docs/THREAT_MODEL.md`)](docs/THREAT_MODEL.md)**
 - **[ADR-001: V1 Architecture, Runtime Seams, and Linux Isolation Contracts (`docs/adr/001-v1-architecture-and-seams.md`)](docs/adr/001-v1-architecture-and-seams.md)**
+
+---
+
+## Product Engineering Roadmap & Milestones
+
+| Milestone | Scope & Capability | Status |
+| :--- | :--- | :--- |
+| **Milestone 0 & 1** | OCI `1.0.2` state machine (`flock` + atomic `state.json`), `ExecutionPolicy`, bounded output capture (`BoundedBuffer`), and `RuntimeBackend` trait seam ([ADR-001](docs/adr/001-v1-architecture-and-seams.md)) | **Shipped** |
+| **Milestone 2 & 3** | Linux 5.15+ `LinuxBackend` (`CLONE_NEW*` namespaces, `pivot_root`, unified cgroup v2 `memory.max`/`cpu.max`/`pids.max`/`cgroup.kill`, `caps`, pure-Rust `seccompiler` cBPF, 7-step teardown) & `boxlet` CLI | **Shipped** |
+| **Milestone 4 (V2)** | Deterministic filesystem snapshots (`WorkspaceSnapshot`, `TreeManifest`, 64-bit FNV-1a file & symlink digests), `FsDiff`, Linux `overlayfs` CoW driver, and N-way parallel branch execution (`boxlet branch-run`) ([ADR-002](docs/adr/002-filesystem-snapshots-and-diffing.md), [ADR-003](docs/adr/003-parallel-branch-execution.md)) | **Shipped** |
+| **Milestone 5 (V2)** | Candidate winner promotion (`--promote-winner`, `BranchBatchReport`) and deterministic 4-stage workspace rollback (`boxlet restore`) ([ADR-004](docs/adr/004-branch-promotion-and-rollback.md)) | **Shipped** |
+| **Milestone 6 (V3)** | Append-only `0600` JSONL security & execution audit trail (`--audit-log`, `JsonlAuditLogger`) and zero-config OCI bundle scaffolding (`boxlet init-bundle`, `BundleBuilder`) ([ADR-005](docs/adr/005-audit-trail-and-bundle-scaffolding.md)) | **Shipped** |
+| **Milestone 7 (V3)** | Container inventory (`boxlet list`), stale resource garbage collection (`boxlet prune [--force]`), and audit analytics (`boxlet audit --file`) ([ADR-006](docs/adr/006-container-inventory-prune-and-audit-analytics.md)) | **Shipped** |
+| **Milestone 8 (V4)** | Host kernel/environment readiness diagnostics (`boxlet doctor`) and declarative multi-agent evaluation specs with forbidden-path guardrails & rubric scoring (`boxlet eval --spec`) ([ADR-007](docs/adr/007-doctor-diagnostics-and-declarative-eval-rubrics.md)) | **Shipped** |
+| **Milestone 9 (V5)** | Hardware-virtualized MicroVM `RuntimeBackend` adapters (`FirecrackerBackend` / `LibkrunBackend`) for hostile multi-tenant workloads | Planned |
+| **Milestone 10 (V5)** | Content-addressed OCI image registry pull & layer unpacking into `OverlayRootfsProvider` lowerdirs | Planned |

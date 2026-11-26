@@ -16,7 +16,7 @@ use boxlet::oci::state::DEFAULT_STATE_ROOT;
 #[cfg(target_os = "linux")]
 use boxlet::policy::{ExecutionPolicy, NetworkMode};
 use boxlet::snapshot::{TreeManifest, WorkspaceSnapshot};
-use boxlet::{BundleBuilder, JsonlAuditLogger};
+use boxlet::{run_doctor, BundleBuilder, DoctorStatus, JsonlAuditLogger};
 
 const DEFAULT_CGROUP_PARENT: &str = "/sys/fs/cgroup/boxlet.slice";
 
@@ -102,6 +102,26 @@ enum Commands {
         /// Emit the `AuditSummary` as JSON to stdout.
         #[arg(long)]
         json: bool,
+    },
+    /// Run host preflight diagnostics for Linux namespaces, cgroup v2, and state directories.
+    Doctor {
+        /// Emit the `DoctorReport` as JSON to stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Evaluate parallel sandbox candidates against a declarative JSON rubric (`EvalSpec`).
+    Eval {
+        /// Path to the JSON `EvalSpec` file.
+        #[arg(long)]
+        spec: PathBuf,
+        /// Override `promote_winner = true` to promote the winning candidate back to the bundle rootfs.
+        #[arg(long)]
+        promote_winner: bool,
+        /// Emit the full `EvalReport` as JSON to stdout.
+        #[arg(long)]
+        json: bool,
+        /// Path to the base OCI bundle directory containing `config.json`.
+        bundle: PathBuf,
     },
     /// Run a container end-to-end with explicit policy limits and structured observability.
     Run {
@@ -392,6 +412,26 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Doctor { json } => {
+            let report = run_doctor(&cli.root, &cli.cgroup_parent);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                for check in &report.checks {
+                    let status_label = match check.status {
+                        DoctorStatus::Pass => "pass",
+                        DoctorStatus::Warn => "warn",
+                        DoctorStatus::Fail => "fail",
+                    };
+                    println!("[{status_label}] {}: {}", check.name, check.detail);
+                }
+            }
+            if report.overall_ready {
+                Ok(ExitCode::SUCCESS)
+            } else {
+                Ok(ExitCode::FAILURE)
+            }
+        }
         other => dispatch_platform(
             cli.root,
             cli.cgroup_parent,
@@ -594,11 +634,46 @@ fn dispatch_platform(
                 }
             }
         }
+        Commands::Eval {
+            spec,
+            promote_winner,
+            json,
+            bundle,
+        } => {
+            let mut eval_spec = boxlet::EvalSpec::load(&spec)?;
+            if promote_winner {
+                eval_spec.promote_winner = true;
+            }
+            let report = engine.run_eval(&bundle, &eval_spec)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                for verdict in &report.verdicts {
+                    println!(
+                        "candidate={} passed={} score={} violations={}",
+                        verdict.branch_id,
+                        verdict.passed_rubric,
+                        verdict.score,
+                        verdict.rubric_violations.len()
+                    );
+                }
+                println!(
+                    "winning_branch_id={:?} promoted={}",
+                    report.winning_branch_id, report.promoted
+                );
+            }
+            if report.winning_branch_id.is_some() {
+                Ok(ExitCode::SUCCESS)
+            } else {
+                Ok(ExitCode::FAILURE)
+            }
+        }
         Commands::Snapshot { .. }
         | Commands::Diff { .. }
         | Commands::Restore { .. }
         | Commands::InitBundle { .. }
         | Commands::Audit { .. }
+        | Commands::Doctor { .. }
         | Commands::InternalInit { .. } => Ok(ExitCode::SUCCESS),
     }
 }
@@ -889,6 +964,40 @@ mod tests {
         assert_eq!(summary.branch_batches_completed, 1);
         assert_eq!(summary.promoted_winners, vec!["branch-1".to_string()]);
         assert!(summary.chronological_valid);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_doctor_json_parses_and_executes_portably() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|source| BoxletError::StateStore {
+            path: PathBuf::from("tempdir"),
+            source,
+        })?;
+        let state_root = tmp.path().join("state");
+        let cgroup_parent = tmp.path().join("cgroup");
+
+        let doctor_cli = Cli::try_parse_from([
+            "boxlet",
+            "--root",
+            state_root.to_str().unwrap_or_default(),
+            "--cgroup-parent",
+            cgroup_parent.to_str().unwrap_or_default(),
+            "doctor",
+            "--json",
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+
+        let expected_report = run_doctor(&state_root, &cgroup_parent);
+        let expected_code = if expected_report.overall_ready {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+
+        assert_eq!(dispatch(doctor_cli)?, expected_code);
+        assert!(!expected_report.checks.is_empty());
         Ok(())
     }
 }
