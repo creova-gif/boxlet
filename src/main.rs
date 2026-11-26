@@ -65,6 +65,14 @@ enum Commands {
         /// Container identifier.
         id: String,
     },
+    /// Query live or post-run cgroup v2 resource telemetry and OCI status for a container.
+    Stats {
+        /// Emit the `ContainerStats` as JSON to stdout.
+        #[arg(long)]
+        json: bool,
+        /// Container identifier.
+        id: String,
+    },
     /// Send a signal to a running container.
     Kill {
         /// Container identifier.
@@ -136,6 +144,12 @@ enum Commands {
         /// Optional container ID (auto-generated if omitted).
         #[arg(long)]
         id: Option<String>,
+        /// Apply a built-in execution policy preset (`strict`, `balanced`, or `build`) before CLI overrides.
+        #[arg(long, conflicts_with = "policy_file")]
+        preset: Option<String>,
+        /// Load a base `ExecutionPolicy` JSON file before applying CLI flag overrides.
+        #[arg(long, conflicts_with = "preset")]
+        policy_file: Option<PathBuf>,
         /// Hard cgroup v2 memory limit (e.g. 128m, 1g, 65536).
         #[arg(long)]
         memory: Option<String>,
@@ -236,6 +250,12 @@ enum Commands {
         /// Shell command (`sh -c <CMD>`) to execute in each parallel branch (repeatable).
         #[arg(long = "cmd", required = true)]
         cmds: Vec<String>,
+        /// Apply a built-in execution policy preset (`strict`, `balanced`, or `build`) before CLI overrides.
+        #[arg(long, conflicts_with = "policy_file")]
+        preset: Option<String>,
+        /// Load a base `ExecutionPolicy` JSON file before applying CLI flag overrides.
+        #[arg(long, conflicts_with = "preset")]
+        policy_file: Option<PathBuf>,
         /// Hard cgroup v2 memory limit per branch (e.g. 128m, 1g, 65536).
         #[arg(long)]
         memory: Option<String>,
@@ -416,6 +436,15 @@ enum Commands {
     /// Export Boxlet's baseline default-deny OCI seccomp profile as JSON for auditing or customization.
     SeccompExport {
         /// Optional output file path for the JSON seccomp profile (prints to stdout if omitted).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Export a built-in ExecutionPolicy preset (`strict`, `balanced`, or `build`) as JSON.
+    PolicyExport {
+        /// Built-in policy preset (`strict`, `balanced`, or `build`).
+        #[arg(long, default_value = "balanced")]
+        preset: String,
+        /// Optional output file path for the JSON policy (prints to stdout if omitted).
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -757,6 +786,32 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Commands::PolicyExport { preset, out } => {
+            let parsed_preset: boxlet::PolicyPreset = preset.parse()?;
+            let policy = boxlet::policy::ExecutionPolicy::from_preset(parsed_preset);
+            let rendered = serde_json::to_string_pretty(&policy)?;
+            if let Some(out_path) = out {
+                if let Some(parent) = out_path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent).map_err(|source| {
+                            BoxletError::StateStore {
+                                path: parent.to_path_buf(),
+                                source,
+                            }
+                        })?;
+                    }
+                }
+                std::fs::write(&out_path, format!("{rendered}\n")).map_err(|source| {
+                    BoxletError::StateStore {
+                        path: out_path,
+                        source,
+                    }
+                })?;
+            } else {
+                println!("{rendered}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         other => dispatch_platform(
             cli.root,
             cli.cgroup_parent,
@@ -794,6 +849,23 @@ fn dispatch_platform(
             let state = engine.state(&id)?;
             let json = serde_json::to_string_pretty(&state)?;
             println!("{json}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Stats { json, id } => {
+            let stats = engine.stats(&id)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+            } else {
+                println!(
+                    "id={} status={} pid={:?} memory_peak_bytes={:?} cpu_usage_usec={:?} oom_kill_count={}",
+                    stats.id,
+                    stats.status,
+                    stats.pid,
+                    stats.memory_peak_bytes,
+                    stats.cpu_usage_usec,
+                    stats.oom_kill_count
+                );
+            }
             Ok(ExitCode::SUCCESS)
         }
         Commands::Kill { id, signal } => {
@@ -839,6 +911,8 @@ fn dispatch_platform(
         }
         Commands::Run {
             id,
+            preset,
+            policy_file,
             memory,
             cpus,
             pids,
@@ -857,7 +931,7 @@ fn dispatch_platform(
             bundle,
         } => {
             let container_id = id.unwrap_or_else(generate_container_id);
-            let policy = build_execution_policy(
+            let cli_policy = build_execution_policy(
                 memory.as_deref(),
                 cpus,
                 pids,
@@ -873,6 +947,20 @@ fn dispatch_platform(
                 timeout,
                 max_output_bytes,
             )?;
+            let policy = if let Some(preset_name) = preset {
+                let parsed_preset: boxlet::PolicyPreset = preset_name.parse()?;
+                let base = ExecutionPolicy::from_preset(parsed_preset);
+                let merged = base.with_overrides(&cli_policy);
+                merged.validate()?;
+                merged
+            } else if let Some(ref path) = policy_file {
+                let base = ExecutionPolicy::load_from_file(path)?;
+                let merged = base.with_overrides(&cli_policy);
+                merged.validate()?;
+                merged
+            } else {
+                cli_policy
+            };
 
             let result = engine.run(&container_id, &bundle, &policy)?;
             if json {
@@ -893,6 +981,8 @@ fn dispatch_platform(
         }
         Commands::BranchRun {
             cmds,
+            preset,
+            policy_file,
             memory,
             cpus,
             pids,
@@ -911,7 +1001,7 @@ fn dispatch_platform(
             json,
             bundle,
         } => {
-            let mut policy = build_execution_policy(
+            let mut cli_policy = build_execution_policy(
                 memory.as_deref(),
                 cpus,
                 pids,
@@ -927,8 +1017,22 @@ fn dispatch_platform(
                 timeout,
                 max_output_bytes,
             )?;
-            policy.max_concurrency = max_concurrency;
-            policy.validate()?;
+            cli_policy.max_concurrency = max_concurrency;
+            let policy = if let Some(preset_name) = preset {
+                let parsed_preset: boxlet::PolicyPreset = preset_name.parse()?;
+                let base = ExecutionPolicy::from_preset(parsed_preset);
+                let merged = base.with_overrides(&cli_policy);
+                merged.validate()?;
+                merged
+            } else if let Some(ref path) = policy_file {
+                let base = ExecutionPolicy::load_from_file(path)?;
+                let merged = base.with_overrides(&cli_policy);
+                merged.validate()?;
+                merged
+            } else {
+                cli_policy.validate()?;
+                cli_policy
+            };
             let prefix = generate_container_id();
             let specs: Vec<BranchSpec> = cmds
                 .into_iter()
@@ -1072,6 +1176,7 @@ fn dispatch_platform(
         | Commands::ImageUnpack { .. }
         | Commands::MicrovmConfig { .. }
         | Commands::SeccompExport { .. }
+        | Commands::PolicyExport { .. }
         | Commands::Audit { .. }
         | Commands::Doctor { .. }
         | Commands::InternalInit { .. } => Ok(ExitCode::SUCCESS),
@@ -1704,6 +1809,72 @@ mod tests {
                 seccomp_profile: Some(_),
                 ..
             } if mounts.len() == 2
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn cli_policy_export_writes_valid_preset_json_and_reloads() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|source| BoxletError::StateStore {
+            path: PathBuf::from("tempdir"),
+            source,
+        })?;
+        let policy_path = tmp.path().join("nested/strict-policy.json");
+
+        let export_cli = Cli::try_parse_from([
+            "boxlet",
+            "policy-export",
+            "--preset",
+            "strict",
+            "--out",
+            policy_path.to_str().unwrap_or_default(),
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+        assert_eq!(dispatch(export_cli)?, ExitCode::SUCCESS);
+        assert!(policy_path.is_file());
+
+        let loaded = boxlet::policy::ExecutionPolicy::load_from_file(&policy_path)?;
+        assert_eq!(
+            loaded,
+            boxlet::policy::ExecutionPolicy::from_preset(boxlet::PolicyPreset::Strict)
+        );
+
+        let run_preset_cli = Cli::try_parse_from([
+            "boxlet",
+            "run",
+            "--preset",
+            "balanced",
+            "--memory",
+            "512m",
+            tmp.path().to_str().unwrap_or_default(),
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+        assert!(matches!(
+            run_preset_cli.command,
+            Commands::Run {
+                preset: Some(ref p),
+                policy_file: None,
+                ..
+            } if p == "balanced"
+        ));
+
+        let stats_cli =
+            Cli::try_parse_from(["boxlet", "stats", "--json", "box-1"]).map_err(|err| {
+                BoxletError::InvalidPolicy {
+                    reason: err.to_string(),
+                }
+            })?;
+        assert!(matches!(
+            stats_cli.command,
+            Commands::Stats {
+                json: true,
+                ref id,
+            } if id == "box-1"
         ));
 
         Ok(())

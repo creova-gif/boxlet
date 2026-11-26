@@ -117,7 +117,17 @@
 
 ---
 
-## 9. Residual Risks & Explicit Non-Goals (V1)
+## 9. V11 Reusable Policy Presets, GitOps Policy File Validation & Read-Only Live Telemetry
+
+1. **Fail-Closed Policy Presets & GitOps Policy Files (`PolicyPreset`, `--preset`, `--policy-file`, `boxlet policy-export`):**
+   - `PolicyPreset::parse()` rejects unknown preset names with `BoxletError::InvalidPolicy`, and `ExecutionPolicy::load_from_file()` deserializes and immediately invokes `ExecutionPolicy::validate()` on any loaded JSON policy file so invalid memory, CPU, PID, `nofile`, `io.max`, bind-mount, `tmpfs`, or process-override rules fail closed before any container process is spawned ([ADR-014](adr/014-policy-presets-and-live-container-stats.md)).
+   - Deterministic 3-tier policy composition (`--preset <NAME>` -> `--policy-file <PATH>` -> explicit CLI flags via `ExecutionPolicy::merge_overrides()`) ensures operators can enforce audited baseline security tiers (`strict`, `balanced`, `build`) while validating the final merged `ExecutionPolicy` prior to execution.
+2. **Non-Destructive Live Container Resource Telemetry (`boxlet stats`, `Engine::stats`, `ContainerStats`):**
+   - `boxlet stats [--json] <ID>` validates the container ID against path traversal (`validate_container_id`), refreshes live process state under the per-container advisory lock, and performs read-only inspection of `/sys/fs/cgroup/<parent>/<id>` (`memory.peak`, `cpu.stat`, `*.pressure`, `memory.events`) without mutating cgroup limits or signaling the workload.
+
+---
+
+## 10. Residual Risks & Explicit Non-Goals (V1)
 
 1. **Shared host kernel exploits (residual risk):** A Linux kernel vulnerability triggered by an allowed syscall can break out of namespaces and seccomp. V1 accepts this boundary for single-host dev/test environments; hostile multi-tenant isolation is deferred to a future microVM `RuntimeBackend` (Firecracker / `libkrun`).
 2. **Root execution requirement (non-goal in V1):** V1 requires `root` on a dedicated Linux 5.15+ host/VM. Rootless user-namespace containers are explicitly excluded from V1 to avoid premature complexity and false security claims.

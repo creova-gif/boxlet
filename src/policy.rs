@@ -1,5 +1,6 @@
 //! Execution policies, structured results, bounded output capture, and OCI merge logic.
 
+use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
@@ -23,6 +24,45 @@ pub const DEFAULT_TMPFS_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Default ephemeral `tmpfs` directory permission mode (`0o1777`).
 pub const DEFAULT_TMPFS_MODE: u32 = 0o1777;
+
+/// Built-in enterprise execution policy presets (`strict`, `balanced`, `build`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyPreset {
+    /// Tightly constrained untrusted sandbox (`64 MiB` RAM, `0.5` CPUs, `32` PIDs, `64` FDs, `15s` timeout).
+    Strict,
+    /// Standard multi-agent evaluation sandbox (`256 MiB` RAM, `1.0` CPU, `128` PIDs, `256` FDs, `60s` timeout, `64 MiB` `/tmp` `tmpfs`).
+    Balanced,
+    /// Heavy compilation and test runner sandbox (`1 GiB` RAM, `2.0` CPUs, `512` PIDs, `1024` FDs, `300s` timeout, `256 MiB` executable `/tmp` `tmpfs`).
+    Build,
+}
+
+impl fmt::Display for PolicyPreset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Strict => f.write_str("strict"),
+            Self::Balanced => f.write_str("balanced"),
+            Self::Build => f.write_str("build"),
+        }
+    }
+}
+
+impl FromStr for PolicyPreset {
+    type Err = BoxletError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "strict" => Ok(Self::Strict),
+            "balanced" => Ok(Self::Balanced),
+            "build" => Ok(Self::Build),
+            other => Err(BoxletError::InvalidPolicy {
+                reason: format!(
+                    "unknown policy preset '{other}' (expected 'strict', 'balanced', or 'build')"
+                ),
+            }),
+        }
+    }
+}
 
 /// Supported V1 network isolation modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -790,6 +830,132 @@ pub struct ExecutionPolicy {
 }
 
 impl ExecutionPolicy {
+    /// Constructs a pre-validated [`ExecutionPolicy`] for the given [`PolicyPreset`].
+    pub fn from_preset(preset: PolicyPreset) -> Self {
+        match preset {
+            PolicyPreset::Strict => Self {
+                memory_bytes: Some(64 * 1024 * 1024),
+                cpus: Some(0.5),
+                pids_limit: Some(32),
+                io_max: None,
+                network: Some(NetworkMode::None),
+                no_new_privs: Some(true),
+                capabilities: Some(Vec::new()),
+                seccomp: Some(SeccompPolicy::DefaultDeny),
+                timeout: Some(Duration::from_secs(15)),
+                max_output_bytes: Some(256 * 1024),
+                max_concurrency: None,
+                nofile_limit: Some(64),
+                bind_mounts: None,
+                tmpfs_mounts: None,
+                args_override: None,
+                env_overrides: None,
+                cwd_override: None,
+            },
+            PolicyPreset::Balanced => Self {
+                memory_bytes: Some(256 * 1024 * 1024),
+                cpus: Some(1.0),
+                pids_limit: Some(128),
+                io_max: None,
+                network: Some(NetworkMode::None),
+                no_new_privs: Some(true),
+                capabilities: Some(Vec::new()),
+                seccomp: Some(SeccompPolicy::DefaultDeny),
+                timeout: Some(Duration::from_secs(60)),
+                max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
+                max_concurrency: None,
+                nofile_limit: Some(256),
+                bind_mounts: None,
+                tmpfs_mounts: Some(vec![TmpfsMountSpec {
+                    destination: PathBuf::from("/tmp"),
+                    size_bytes: DEFAULT_TMPFS_SIZE_BYTES,
+                    mode: DEFAULT_TMPFS_MODE,
+                    noexec: true,
+                }]),
+                args_override: None,
+                env_overrides: None,
+                cwd_override: None,
+            },
+            PolicyPreset::Build => Self {
+                memory_bytes: Some(1024 * 1024 * 1024),
+                cpus: Some(2.0),
+                pids_limit: Some(512),
+                io_max: None,
+                network: Some(NetworkMode::None),
+                no_new_privs: Some(true),
+                capabilities: Some(Vec::new()),
+                seccomp: Some(SeccompPolicy::DefaultDeny),
+                timeout: Some(Duration::from_secs(300)),
+                max_output_bytes: Some(4 * 1024 * 1024),
+                max_concurrency: None,
+                nofile_limit: Some(1024),
+                bind_mounts: None,
+                tmpfs_mounts: Some(vec![TmpfsMountSpec {
+                    destination: PathBuf::from("/tmp"),
+                    size_bytes: 256 * 1024 * 1024,
+                    mode: DEFAULT_TMPFS_MODE,
+                    noexec: false,
+                }]),
+                args_override: None,
+                env_overrides: None,
+                cwd_override: None,
+            },
+        }
+    }
+
+    /// Loads and validates an [`ExecutionPolicy`] from a JSON file on disk.
+    pub fn load_from_file(path: &Path) -> Result<Self> {
+        let raw = fs::read_to_string(path).map_err(|source| BoxletError::StateStore {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let policy: Self = serde_json::from_str(&raw)?;
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    /// Returns a cloned [`ExecutionPolicy`] where each `Some(...)` field in `overrides`
+    /// replaces the corresponding field in `self`.
+    pub fn with_overrides(&self, overrides: &ExecutionPolicy) -> Self {
+        Self {
+            memory_bytes: overrides.memory_bytes.or(self.memory_bytes),
+            cpus: overrides.cpus.or(self.cpus),
+            pids_limit: overrides.pids_limit.or(self.pids_limit),
+            io_max: overrides.io_max.clone().or_else(|| self.io_max.clone()),
+            network: overrides.network.or(self.network),
+            no_new_privs: overrides.no_new_privs.or(self.no_new_privs),
+            capabilities: overrides
+                .capabilities
+                .clone()
+                .or_else(|| self.capabilities.clone()),
+            seccomp: overrides.seccomp.clone().or_else(|| self.seccomp.clone()),
+            timeout: overrides.timeout.or(self.timeout),
+            max_output_bytes: overrides.max_output_bytes.or(self.max_output_bytes),
+            max_concurrency: overrides.max_concurrency.or(self.max_concurrency),
+            nofile_limit: overrides.nofile_limit.or(self.nofile_limit),
+            bind_mounts: overrides
+                .bind_mounts
+                .clone()
+                .or_else(|| self.bind_mounts.clone()),
+            tmpfs_mounts: overrides
+                .tmpfs_mounts
+                .clone()
+                .or_else(|| self.tmpfs_mounts.clone()),
+            args_override: overrides
+                .args_override
+                .clone()
+                .or_else(|| self.args_override.clone()),
+            env_overrides: overrides
+                .env_overrides
+                .clone()
+                .or_else(|| self.env_overrides.clone()),
+            cwd_override: overrides
+                .cwd_override
+                .clone()
+                .or_else(|| self.cwd_override.clone()),
+        }
+    }
+
     /// Validates all explicitly set bounds in the policy.
     pub fn validate(&self) -> Result<()> {
         if let Some(0) = self.memory_bytes {
@@ -1099,6 +1265,29 @@ pub struct ExecutionResult {
     pub violations: PolicyViolations,
     /// Teardown status.
     pub cleanup: CleanupStatus,
+}
+
+/// Live or post-run cgroup v2 telemetry and lifecycle status for a tracked container (`boxlet stats`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerStats {
+    /// Container identifier.
+    pub id: String,
+    /// Current OCI lifecycle status (`Creating`, `Created`, `Running`, `Stopped`).
+    pub status: crate::oci::state::ContainerStatus,
+    /// Host PID of container PID 1 when active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// Peak cgroup v2 memory consumption in bytes (`memory.peak`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_peak_bytes: Option<u64>,
+    /// Total cgroup v2 CPU usage in microseconds (`cpu.stat` `usage_usec`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_usage_usec: Option<u64>,
+    /// Number of cgroup v2 OOM kills recorded in `memory.events`.
+    pub oom_kill_count: u64,
+    /// Optional cgroup v2 Pressure Stall Information (`*.pressure`) cumulative stall durations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psi: Option<PsiMetrics>,
 }
 
 /// Bounded in-memory byte buffer that discards overflow without allocating past `max_bytes`.
@@ -1452,5 +1641,103 @@ mod tests {
         let (data, truncated) = buf.into_parts();
         assert!(data.is_empty());
         assert!(truncated);
+    }
+
+    #[test]
+    fn policy_presets_parse_validate_load_from_file_and_apply_overrides() -> Result<()> {
+        assert_eq!("STRICT".parse::<PolicyPreset>()?, PolicyPreset::Strict);
+        assert_eq!("balanced".parse::<PolicyPreset>()?, PolicyPreset::Balanced);
+        assert_eq!("Build".parse::<PolicyPreset>()?, PolicyPreset::Build);
+        assert_eq!(PolicyPreset::Strict.to_string(), "strict");
+        assert_eq!(PolicyPreset::Balanced.to_string(), "balanced");
+        assert_eq!(PolicyPreset::Build.to_string(), "build");
+        assert!(matches!(
+            "custom".parse::<PolicyPreset>(),
+            Err(BoxletError::InvalidPolicy { .. })
+        ));
+
+        let strict = ExecutionPolicy::from_preset(PolicyPreset::Strict);
+        strict.validate()?;
+        assert_eq!(strict.memory_bytes, Some(64 * 1024 * 1024));
+        assert_eq!(strict.cpus, Some(0.5));
+        assert_eq!(strict.pids_limit, Some(32));
+        assert_eq!(strict.nofile_limit, Some(64));
+        assert_eq!(strict.timeout, Some(Duration::from_secs(15)));
+        assert_eq!(strict.max_output_bytes, Some(256 * 1024));
+        assert!(strict.tmpfs_mounts.is_none());
+
+        let balanced = ExecutionPolicy::from_preset(PolicyPreset::Balanced);
+        balanced.validate()?;
+        assert_eq!(balanced.memory_bytes, Some(256 * 1024 * 1024));
+        assert_eq!(balanced.cpus, Some(1.0));
+        assert_eq!(balanced.pids_limit, Some(128));
+        assert_eq!(balanced.nofile_limit, Some(256));
+        assert_eq!(balanced.timeout, Some(Duration::from_secs(60)));
+        assert_eq!(balanced.max_output_bytes, Some(DEFAULT_MAX_OUTPUT_BYTES));
+        assert_eq!(
+            balanced.tmpfs_mounts,
+            Some(vec![TmpfsMountSpec {
+                destination: PathBuf::from("/tmp"),
+                size_bytes: DEFAULT_TMPFS_SIZE_BYTES,
+                mode: DEFAULT_TMPFS_MODE,
+                noexec: true,
+            }])
+        );
+
+        let build = ExecutionPolicy::from_preset(PolicyPreset::Build);
+        build.validate()?;
+        assert_eq!(build.memory_bytes, Some(1024 * 1024 * 1024));
+        assert_eq!(build.cpus, Some(2.0));
+        assert_eq!(build.pids_limit, Some(512));
+        assert_eq!(build.nofile_limit, Some(1024));
+        assert_eq!(build.timeout, Some(Duration::from_secs(300)));
+        assert_eq!(build.max_output_bytes, Some(4 * 1024 * 1024));
+        assert_eq!(
+            build.tmpfs_mounts,
+            Some(vec![TmpfsMountSpec {
+                destination: PathBuf::from("/tmp"),
+                size_bytes: 256 * 1024 * 1024,
+                mode: DEFAULT_TMPFS_MODE,
+                noexec: false,
+            }])
+        );
+
+        let overrides = ExecutionPolicy {
+            memory_bytes: Some(512 * 1024 * 1024),
+            network: Some(NetworkMode::Host),
+            ..ExecutionPolicy::default()
+        };
+        let merged = strict.with_overrides(&overrides);
+        assert_eq!(merged.memory_bytes, Some(512 * 1024 * 1024));
+        assert_eq!(merged.network, Some(NetworkMode::Host));
+        assert_eq!(merged.cpus, Some(0.5));
+        assert_eq!(merged.pids_limit, Some(32));
+
+        let tmp = tempfile::tempdir().map_err(|source| BoxletError::StateStore {
+            path: PathBuf::from("tempdir"),
+            source,
+        })?;
+        let policy_path = tmp.path().join("policy.json");
+        let json_bytes = serde_json::to_vec_pretty(&balanced)?;
+        fs::write(&policy_path, &json_bytes).map_err(|source| BoxletError::StateStore {
+            path: policy_path.clone(),
+            source,
+        })?;
+        let loaded = ExecutionPolicy::load_from_file(&policy_path)?;
+        assert_eq!(loaded, balanced);
+
+        let bad_policy_path = tmp.path().join("bad_policy.json");
+        fs::write(&bad_policy_path, br#"{"memory_bytes": 0}"#).map_err(|source| {
+            BoxletError::StateStore {
+                path: bad_policy_path.clone(),
+                source,
+            }
+        })?;
+        assert!(matches!(
+            ExecutionPolicy::load_from_file(&bad_policy_path),
+            Err(BoxletError::InvalidPolicy { .. })
+        ));
+
+        Ok(())
     }
 }

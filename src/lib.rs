@@ -31,8 +31,8 @@ pub use linux::LinuxBackend;
 pub use microvm::{FirecrackerVmSpec, LibkrunVmSpec, MicroVmBackend, MicroVmConfig, VmmDriver};
 pub use oci::BundleBuilder;
 pub use policy::{
-    build_default_seccomp_profile, load_seccomp_profile, BindMountSpec, IoMaxRule, PsiMetrics,
-    TmpfsMountSpec,
+    build_default_seccomp_profile, load_seccomp_profile, BindMountSpec, ContainerStats, IoMaxRule,
+    PolicyPreset, PsiMetrics, TmpfsMountSpec,
 };
 
 /// Executes the internal self-re-exec container init stage (`boxlet __init <config>`).

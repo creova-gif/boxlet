@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Boxlet V1–V10 End-to-End 28-Check Verification & Demo Suite
+# Boxlet V1–V11 End-to-End 30-Check Verification & Demo Suite
 # Runs on any privileged Linux 5.15+ host with unified cgroup v2 and busybox-static.
 set -euo pipefail
 
@@ -31,7 +31,7 @@ AUDIT_LOG="$WORK_DIR/audit.jsonl"
 STATE_ROOT="$WORK_DIR/state"
 
 cleanup() {
-  for id in ci-check-1 ci-check-2 ci-check-3 ci-check-4 ci-check-5 ci-check-6 ci-oci-lifecycle-1 ci-check-11 ci-check-12 ci-list-1 ci-list-2 eval-cand-tamper eval-cand-fail eval-cand-clean; do
+  for id in ci-check-1 ci-check-2 ci-check-3 ci-check-4 ci-check-5 ci-check-6 ci-oci-lifecycle-1 ci-check-11 ci-check-12 ci-list-1 ci-list-2 ci-stats-1 eval-cand-tamper eval-cand-fail eval-cand-clean; do
     if [[ -d "$CGROUP_PARENT/$id" ]]; then
       echo 1 | sudo tee "$CGROUP_PARENT/$id/cgroup.kill" >/dev/null 2>&1 || true
       sudo rmdir "$CGROUP_PARENT/$id" >/dev/null 2>&1 || true
@@ -739,7 +739,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 18: MicroVM Specification Synthesis (boxlet microvm-config for Firecracker & libkrun)
 # ------------------------------------------------------------------------------
-echo "==> [Check 18] [18/28] MicroVM Specification Synthesis (boxlet microvm-config for Firecracker & libkrun)"
+echo "==> [Check 18] [18/30] MicroVM Specification Synthesis (boxlet microvm-config for Firecracker & libkrun)"
 "$BOXLET_BIN" microvm-config \
   --driver firecracker \
   --id vm-fc-1 \
@@ -777,7 +777,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 19: Bounded Worker-Pool Concurrency & Rootless Bundle Scaffolding
 # ------------------------------------------------------------------------------
-echo "==> [Check 19] [19/28] Bounded Worker-Pool Concurrency (--max-concurrency 1) & Rootless Bundle Scaffolding (init-bundle --rootless)"
+echo "==> [Check 19] [19/30] Bounded Worker-Pool Concurrency (--max-concurrency 1) & Rootless Bundle Scaffolding (init-bundle --rootless)"
 sudo "$BOXLET_BIN" branch-run \
   --root "$STATE_ROOT" \
   --cgroup-parent "$CGROUP_PARENT" \
@@ -822,7 +822,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 20: Tamper-Evident Hash-Chained Audit Ledger & Prometheus Metrics
 # ------------------------------------------------------------------------------
-echo "==> [Check 20] [20/28] Tamper-Evident Hash-Chained Audit Ledger & Prometheus Metrics (boxlet audit --file ... --json / --prometheus)"
+echo "==> [Check 20] [20/30] Tamper-Evident Hash-Chained Audit Ledger & Prometheus Metrics (boxlet audit --file ... --json / --prometheus)"
 sudo "$BOXLET_BIN" audit --file "$AUDIT_LOG" --json > "$WORK_DIR/check20-audit.json"
 sudo "$BOXLET_BIN" audit --file "$AUDIT_LOG" --prometheus > "$WORK_DIR/check20-audit.prom"
 
@@ -846,7 +846,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 21: Multi-Layer OCI Image Layout Packing & Unpacking with Whiteout (.wh.) Support
 # ------------------------------------------------------------------------------
-echo "==> [Check 21] [21/28] Multi-Layer OCI Image Layout Packing & Unpacking with Whiteout (.wh.) Support (boxlet image-pack + boxlet image-unpack)"
+echo "==> [Check 21] [21/30] Multi-Layer OCI Image Layout Packing & Unpacking with Whiteout (.wh.) Support (boxlet image-pack + boxlet image-unpack)"
 mkdir -p "$WORK_DIR/oci-layer-base/etc" "$WORK_DIR/oci-layer-upper/etc"
 cp -a "$BUNDLE_DIR/rootfs/bin" "$WORK_DIR/oci-layer-base/bin"
 echo "keep-base-v1" > "$WORK_DIR/oci-layer-base/etc/keep.txt"
@@ -890,7 +890,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 22: Cgroup v2 io.max Block I/O Policy Validation
 # ------------------------------------------------------------------------------
-echo "==> [Check 22] [22/28] Cgroup v2 io.max Block I/O Policy Validation (boxlet run --io-max)"
+echo "==> [Check 22] [22/30] Cgroup v2 io.max Block I/O Policy Validation (boxlet run --io-max)"
 "$BOXLET_BIN" run --help | grep -q -- "--io-max"
 IO_ERR_OUT="$WORK_DIR/check22-iomax-err.txt"
 if "$BOXLET_BIN" run --io-max "8:0 rbps=0" "$BUNDLE_DIR" >"$IO_ERR_OUT" 2>&1; then
@@ -903,7 +903,7 @@ echo "    cgroup v2 io.max validation verified: $(tr '\n' ' ' < "$IO_ERR_OUT")"
 # ------------------------------------------------------------------------------
 # Check 23: POSIX RLIMIT_NOFILE Enforcement (--nofile)
 # ------------------------------------------------------------------------------
-echo "==> [Check 23] [23/28] POSIX RLIMIT_NOFILE Enforcement (boxlet run --nofile 128)"
+echo "==> [Check 23] [23/30] POSIX RLIMIT_NOFILE Enforcement (boxlet run --nofile 128)"
 "$BOXLET_BIN" init-bundle \
   --busybox "$BUSYBOX_BIN" \
   --cmd "ulimit -n" \
@@ -928,7 +928,7 @@ echo "    POSIX RLIMIT_NOFILE verified: ulimit -n = $NOFILE_TRIMMED"
 # ------------------------------------------------------------------------------
 # Check 24: Built-In Deterministic Benchmark Suite (boxlet bench)
 # ------------------------------------------------------------------------------
-echo "==> [Check 24] [24/28] Built-In Deterministic Benchmark Suite (boxlet bench --json / --markdown)"
+echo "==> [Check 24] [24/30] Built-In Deterministic Benchmark Suite (boxlet bench --json / --markdown)"
 write_bundle_config "true"
 sudo "$BOXLET_BIN" \
   --root "$STATE_ROOT" \
@@ -973,7 +973,7 @@ echo "    bench Markdown verified: $(grep 'sandbox_run' "$WORK_DIR/check24-bench
 # ------------------------------------------------------------------------------
 # Check 25: Declarative Bind Mounts (--mount <src>:<dst>:ro with MS_NOSUID | MS_NODEV)
 # ------------------------------------------------------------------------------
-echo "==> [Check 25] [25/28] Declarative Bind Mounts (boxlet run --mount <src>:<dst>:ro)"
+echo "==> [Check 25] [25/30] Declarative Bind Mounts (boxlet run --mount <src>:<dst>:ro)"
 mkdir -p "$WORK_DIR/host-data"
 printf 'mounted-dataset-v9\n' > "$WORK_DIR/host-data/dataset.txt"
 write_bundle_config "cat /mnt/data/dataset.txt && ! sh -c 'echo mutate > /mnt/data/dataset.txt' 2>/dev/null"
@@ -1001,7 +1001,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 26: Baseline Seccomp Profile Export & Custom Profile Execution (boxlet seccomp-export + run --seccomp-profile)
 # ------------------------------------------------------------------------------
-echo "==> [Check 26] [26/28] Baseline Seccomp Profile Export & Custom Profile Execution (boxlet seccomp-export + boxlet run --seccomp-profile)"
+echo "==> [Check 26] [26/30] Baseline Seccomp Profile Export & Custom Profile Execution (boxlet seccomp-export + boxlet run --seccomp-profile)"
 "$BOXLET_BIN" seccomp-export --out "$WORK_DIR/exported-seccomp.json"
 write_bundle_config "echo seccomp-custom-ok"
 sudo "$BOXLET_BIN" \
@@ -1028,7 +1028,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 27: Ephemeral Size-Bounded tmpfs Scratch Mount inside a Read-Only Rootfs (--tmpfs /tmp:size=16m)
 # ------------------------------------------------------------------------------
-echo "==> [Check 27] [27/28] Ephemeral Size-Bounded tmpfs Scratch Mount inside a Read-Only Rootfs (boxlet run --tmpfs /tmp:size=16m)"
+echo "==> [Check 27] [27/30] Ephemeral Size-Bounded tmpfs Scratch Mount inside a Read-Only Rootfs (boxlet run --tmpfs /tmp:size=16m)"
 "$BOXLET_BIN" init-bundle \
   --busybox "$BUSYBOX_BIN" \
   --readonly \
@@ -1062,7 +1062,7 @@ PY
 # ------------------------------------------------------------------------------
 # Check 28: Per-Run Process Overrides (--cmd, -e / --env, --cwd)
 # ------------------------------------------------------------------------------
-echo "==> [Check 28] [28/28] Per-Run Process Overrides (boxlet run --cmd / -e / --cwd)"
+echo "==> [Check 28] [28/30] Per-Run Process Overrides (boxlet run --cmd / -e / --cwd)"
 sudo "$BOXLET_BIN" \
   --root "$STATE_ROOT" \
   --cgroup-parent "$CGROUP_PARENT" \
@@ -1088,4 +1088,71 @@ assert data["cleanup"]["status"] == "clean", f"expected clean status, got {data[
 print(f"    per-run process overrides verified: exit_code={data['exit_code']}, stdout={stdout.strip().replace(chr(10), ' | ')!r}")
 PY
 
-echo "==> ALL 28/28 BOXLET V1+V2+V3+V4+V5+V6+V7+V8+V9+V10 CHECKS PASSED"
+# ------------------------------------------------------------------------------
+# Check 29: Reusable Enterprise Policy Presets & --policy-file (boxlet policy-export + boxlet run --policy-file)
+# ------------------------------------------------------------------------------
+echo "==> [Check 29] [29/30] Reusable Enterprise Policy Presets & --policy-file (boxlet policy-export + boxlet run --policy-file)"
+"$BOXLET_BIN" policy-export --preset strict --out "$WORK_DIR/strict-policy.json"
+sudo "$BOXLET_BIN" \
+  --root "$STATE_ROOT" \
+  --cgroup-parent "$CGROUP_PARENT" \
+  run \
+  --policy-file "$WORK_DIR/strict-policy.json" \
+  --cmd "echo policy-file-ok" \
+  --json \
+  "$BUNDLE_DIR" > "$WORK_DIR/check29-policy.json"
+
+python3 - "$WORK_DIR/check29-policy.json" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+
+stdout = bytes(data["stdout"]).decode("utf-8", errors="replace")
+assert data["exit_code"] == 0, f"expected exit_code 0, got {data['exit_code']}"
+assert stdout == "policy-file-ok\n", f"expected stdout=='policy-file-ok\\n', got {stdout!r}"
+assert data["cleanup"]["status"] == "clean", f"expected clean status, got {data['cleanup']}"
+print(f"    policy-export & --policy-file verified: exit_code={data['exit_code']}, stdout={stdout.strip()!r}")
+PY
+
+# ------------------------------------------------------------------------------
+# Check 30: Live Container Resource Telemetry Inspection (boxlet stats --json)
+# ------------------------------------------------------------------------------
+echo "==> [Check 30] [30/30] Live Container Resource Telemetry Inspection (boxlet stats --json)"
+write_bundle_config "sleep 30"
+sudo "$BOXLET_BIN" \
+  --root "$STATE_ROOT" \
+  --cgroup-parent "$CGROUP_PARENT" \
+  create \
+  --bundle "$BUNDLE_DIR" \
+  ci-stats-1
+
+sudo "$BOXLET_BIN" \
+  --root "$STATE_ROOT" \
+  --cgroup-parent "$CGROUP_PARENT" \
+  stats \
+  --json \
+  ci-stats-1 > "$WORK_DIR/check30-stats.json"
+
+python3 - "$WORK_DIR/check30-stats.json" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+
+assert data.get("id") == "ci-stats-1", f"expected id=='ci-stats-1', got {data}"
+assert data.get("status") == "created", f"expected status=='created', got {data}"
+pid = data.get("pid")
+assert isinstance(pid, int) and pid > 0, f"expected positive integer pid, got {pid!r} in {data}"
+print(f"    live container stats verified: id={data['id']}, status={data['status']}, pid={pid}")
+PY
+
+sudo "$BOXLET_BIN" \
+  --root "$STATE_ROOT" \
+  --cgroup-parent "$CGROUP_PARENT" \
+  delete \
+  --force \
+  ci-stats-1
+assert_zero_leaks "ci-stats-1"
+
+echo "==> ALL 30/30 BOXLET V1+V2+V3+V4+V5+V6+V7+V8+V9+V10+V11 CHECKS PASSED"
