@@ -6,7 +6,7 @@ use oci_spec::runtime::Spec;
 
 use crate::error::Result;
 use crate::oci::state::ContainerState;
-use crate::policy::{ExecutionResult, PsiMetrics, ResolvedRunSpec, ResourceLimits};
+use crate::policy::{ContainerStats, ExecutionResult, PsiMetrics, ResolvedRunSpec, ResourceLimits};
 
 /// Deep execution backend interface consumed by `Engine`.
 ///
@@ -32,6 +32,20 @@ pub trait RuntimeBackend: Send + Sync {
     /// Lists all tracked containers in deterministic `id` order, refreshing liveness where supported.
     fn list(&self) -> Result<Vec<ContainerState>> {
         Ok(Vec::new())
+    }
+
+    /// Queries live or post-run resource telemetry for container `id`.
+    fn stats(&self, id: &str) -> Result<ContainerStats> {
+        let st = self.state(id)?;
+        Ok(ContainerStats {
+            id: st.id,
+            status: st.status,
+            pid: st.pid,
+            memory_peak_bytes: None,
+            cpu_usage_usec: None,
+            oom_kill_count: 0,
+            psi: None,
+        })
     }
 
     /// Runs a container end-to-end with a merged [`ResolvedRunSpec`] and returns structured results.

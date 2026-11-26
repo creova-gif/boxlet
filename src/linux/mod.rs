@@ -204,6 +204,20 @@ impl RuntimeBackend for LinuxBackend {
         Ok(states)
     }
 
+    fn stats(&self, id: &str) -> Result<crate::policy::ContainerStats> {
+        let st = self.state(id)?;
+        let cg = self.cgroup.read_stats(id).unwrap_or_default();
+        Ok(crate::policy::ContainerStats {
+            id: st.id,
+            status: st.status,
+            pid: st.pid,
+            memory_peak_bytes: cg.memory_peak_bytes,
+            cpu_usage_usec: cg.cpu_usage_usec,
+            oom_kill_count: cg.oom_kill_count,
+            psi: cg.psi,
+        })
+    }
+
     fn run(&self, id: &str, bundle: &Path, resolved: &ResolvedRunSpec) -> Result<ExecutionResult> {
         let start_time = Instant::now();
         // Become a child subreaper so when intermediate `boxlet __init` exits after forking

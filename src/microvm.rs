@@ -492,6 +492,19 @@ impl RuntimeBackend for MicroVmBackend {
         self.state_store.list()
     }
 
+    fn stats(&self, id: &str) -> Result<crate::policy::ContainerStats> {
+        let st = self.state(id)?;
+        Ok(crate::policy::ContainerStats {
+            id: st.id,
+            status: st.status,
+            pid: st.pid,
+            memory_peak_bytes: Some(self.vm_config.mem_size_mib * BYTES_PER_MIB),
+            cpu_usage_usec: None,
+            oom_kill_count: 0,
+            psi: None,
+        })
+    }
+
     fn run(&self, id: &str, bundle: &Path, resolved: &ResolvedRunSpec) -> Result<ExecutionResult> {
         validate_container_id(id)?;
         self.vm_config.validate()?;
@@ -692,6 +705,12 @@ mod tests {
 
         let queried = engine.state("vm-box-1")?;
         assert_eq!(queried.status, ContainerStatus::Running);
+
+        let stats = backend.stats("vm-box-1")?;
+        assert_eq!(stats.id, "vm-box-1");
+        assert_eq!(stats.status, ContainerStatus::Running);
+        assert_eq!(stats.memory_peak_bytes, Some(128 * BYTES_PER_MIB));
+        assert_eq!(stats.oom_kill_count, 0);
 
         let listed = engine.list()?;
         assert_eq!(listed.len(), 1);

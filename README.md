@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust: 1.80+](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![OCI Runtime Spec: v1.0.2](https://img.shields.io/badge/OCI%20Runtime-v1.0.2-2ea44f.svg)](https://github.com/opencontainers/runtime-spec)
-[![Live Linux Demo: 28/28 Checks](https://img.shields.io/badge/Live%20Linux%20Demo-28%2F28%20Checks-brightgreen.svg)](scripts/demo-v1.sh)
+[![Live Linux Demo: 30/30 Checks](https://img.shields.io/badge/Live%20Linux%20Demo-30%2F30%20Checks-brightgreen.svg)](scripts/demo-v1.sh)
 
 - **Spec Doc:** [Boxlet: Minimal OCI-Compatible Container Runtime](https://docs.google.com/document/d/1XDaWCxQUGEH9LMqC95nJ4WZy_ut_YOQJ5_yChSJrlvA/edit?usp=drivesdk&ouid=110227624285917376281)
 - **ADR-001 (V1 Architecture & Isolation Seams):** [docs/adr/001-v1-architecture-and-seams.md](docs/adr/001-v1-architecture-and-seams.md)
@@ -21,6 +21,7 @@
 - **ADR-011 (Cgroup v2 PSI Telemetry, POSIX Rlimits & Deterministic Benchmark Suite):** [ADR-011: Cgroup v2 PSI Telemetry, POSIX Rlimits, and Deterministic Benchmark Suite](docs/adr/011-psi-telemetry-rlimits-and-benchmark-suite.md)
 - **ADR-012 (Declarative Bind Mounts & Seccomp Profile Management):** [ADR-012: Declarative Bind Mounts and Seccomp Profile Management](docs/adr/012-bind-mounts-and-seccomp-profile-management.md)
 - **ADR-013 (Ephemeral `tmpfs` Scratch Mounts & Per-Run Process Overrides):** [ADR-013: Ephemeral Size-Bounded tmpfs Mounts and Per-Run Process Overrides](docs/adr/013-ephemeral-tmpfs-mounts-and-process-overrides.md)
+- **ADR-014 (Reusable Policy Presets & Live Container Resource Telemetry):** [ADR-014: Reusable Policy Presets and Live Container Resource Telemetry](docs/adr/014-policy-presets-and-live-container-stats.md)
 - **Threat Model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)
 - **Design Doc:** [docs/designs/boxlet-v1-oci-runtime.md](docs/designs/boxlet-v1-oci-runtime.md)
 - **Engineering Standards:** [AGENTS.md](AGENTS.md)
@@ -181,6 +182,39 @@ sudo ./target/release/boxlet run \
   --timeout 30 \
   --json \
   ./bundle
+```
+
+### Reusable Policy Presets & GitOps Policy Files (`boxlet policy-export`, `--preset`, `--policy-file`)
+
+Standardize sandbox resource and isolation guardrails across agent fleets using built-in `PolicyPreset` profiles (`strict`, `balanced`, `build`), export presets as GitOps-versioned JSON files via `boxlet policy-export`, and layer `--preset <NAME>` -> `--policy-file <PATH>` -> explicit CLI flags (`ExecutionPolicy::merge_overrides`) on `boxlet run` and `boxlet branch-run`:
+
+```bash
+# Export the hardened "strict" policy preset (64 MiB RAM, 0.5 CPUs, 32 PIDs, 128 FDs, 16 MiB /tmp tmpfs)
+./target/release/boxlet policy-export --preset strict --out ./strict-policy.json
+
+# Run a workload using a GitOps policy file and override the entrypoint command
+sudo ./target/release/boxlet run \
+  --policy-file ./strict-policy.json \
+  --cmd "echo policy-file-ok" \
+  --json \
+  ./bundle
+
+# Or apply a built-in preset directly and override individual fields via CLI flags
+sudo ./target/release/boxlet run \
+  --preset balanced \
+  --memory 512m \
+  --json \
+  ./bundle
+```
+
+### Live Container Resource Telemetry Inspection (`boxlet stats`)
+
+Inspect point-in-time container state, live PID, unified cgroup v2 resource usage (`memory_peak_bytes`, `cpu_usage_usec`, `cpu_user_usec`, `cpu_system_usec`, and PSI stall metrics `PsiMetrics`), and OOM-kill status for any tracked OCI container (`Created`, `Running`, or `Stopped`) via `boxlet stats [--json] <ID>` (`Engine::stats` -> `ContainerStats`):
+
+```bash
+sudo ./target/release/boxlet create --bundle ./bundle demo-stats-1
+sudo ./target/release/boxlet stats --json demo-stats-1
+sudo ./target/release/boxlet delete --force demo-stats-1
 ```
 
 ### Ephemeral Size-Bounded `tmpfs` Scratch Mounts & Per-Run Process Overrides (`--tmpfs`, `--cmd`, `-e`/`--env`, `--cwd`)
@@ -345,9 +379,9 @@ Synthesize deterministic **AWS Firecracker** (`FirecrackerVmSpec`) or **`libkrun
   ./bundle
 ```
 
-### Run the End-to-End 28-Check V1–V10 Demo Script
+### Run the End-to-End 30-Check V1–V11 Demo Script
 
-On a Linux 5.15+ host with `busybox` (`busybox-static`) and `python3` installed, run the self-contained 28/28 check verification demo covering normal execution, `memory.max` OOM-kill telemetry (`oom_killed: true`), fail-closed seccomp/capability enforcement, zero-leak cleanup, V2 workspace snapshots/diffs, parallel multi-agent branch execution, winner promotion/rollback, OCI bundle scaffolding, container inventory/garbage collection (`list`/`prune`), JSONL audit log analytics (`audit --file`), host readiness diagnostics (`doctor`), declarative rubric evaluation (`eval --spec`), OCI rootfs tar archive export/import round-trip (`image-export`/`image-import`), Firecracker/`libkrun` MicroVM specification synthesis (`microvm-config`), bounded worker-pool concurrency (`branch-run --max-concurrency`) + rootless user-namespace bundle scaffolding (`init-bundle --rootless`), tamper-evident hash-chained audit verification + Prometheus metrics export (`audit --file ... --prometheus`), multi-layer OCI Image Layout packing/unpacking with `.wh.` whiteouts (`image-pack`/`image-unpack`), fail-closed cgroup v2 `io.max` block I/O policy validation (`run --io-max`), POSIX `RLIMIT_NOFILE` file-descriptor enforcement (`run --nofile 128`), the built-in deterministic latency/throughput benchmark suite (`bench --json` / `bench --markdown`), declarative read-only host bind mounts with `MS_NOSUID | MS_NODEV` hardening (`run --mount <src>:<dst>:ro`), baseline OCI seccomp profile export + custom seccomp profile execution (`seccomp-export --out` + `run --seccomp-profile`), ephemeral size-bounded `tmpfs` scratch mounts inside a read-only rootfs (`run --tmpfs /tmp:size=16m`), and per-run process overrides (`run --cmd ... -e ... --cwd /tmp`):
+On a Linux 5.15+ host with `busybox` (`busybox-static`) and `python3` installed, run the self-contained 30/30 check verification demo covering normal execution, `memory.max` OOM-kill telemetry (`oom_killed: true`), fail-closed seccomp/capability enforcement, zero-leak cleanup, V2 workspace snapshots/diffs, parallel multi-agent branch execution, winner promotion/rollback, OCI bundle scaffolding, container inventory/garbage collection (`list`/`prune`), JSONL audit log analytics (`audit --file`), host readiness diagnostics (`doctor`), declarative rubric evaluation (`eval --spec`), OCI rootfs tar archive export/import round-trip (`image-export`/`image-import`), Firecracker/`libkrun` MicroVM specification synthesis (`microvm-config`), bounded worker-pool concurrency (`branch-run --max-concurrency`) + rootless user-namespace bundle scaffolding (`init-bundle --rootless`), tamper-evident hash-chained audit verification + Prometheus metrics export (`audit --file ... --prometheus`), multi-layer OCI Image Layout packing/unpacking with `.wh.` whiteouts (`image-pack`/`image-unpack`), fail-closed cgroup v2 `io.max` block I/O policy validation (`run --io-max`), POSIX `RLIMIT_NOFILE` file-descriptor enforcement (`run --nofile 128`), the built-in deterministic latency/throughput benchmark suite (`bench --json` / `bench --markdown`), declarative read-only host bind mounts with `MS_NOSUID | MS_NODEV` hardening (`run --mount <src>:<dst>:ro`), baseline OCI seccomp profile export + custom seccomp profile execution (`seccomp-export --out` + `run --seccomp-profile`), ephemeral size-bounded `tmpfs` scratch mounts inside a read-only rootfs (`run --tmpfs /tmp:size=16m`), per-run process overrides (`run --cmd ... -e ... --cwd /tmp`), reusable enterprise policy presets & GitOps policy files (`policy-export --preset strict` + `run --policy-file`), and live container resource telemetry inspection (`stats --json <id>`):
 
 ```bash
 sudo ./scripts/demo-v1.sh ./target/release/boxlet
@@ -615,6 +649,8 @@ For the full trust-boundary diagram, threat matrix, and residual risk analysis, 
 | **Milestone 18 (V9)** | Baseline OCI seccomp profile export (`boxlet seccomp-export [--out <PATH>]`, `build_default_seccomp_profile`) and custom seccomp profile loading & enforcement (`--seccomp-profile <PATH>`, `ExecutionPolicy::seccomp_profile_path`, `load_seccomp_profile`) ([ADR-012](docs/adr/012-bind-mounts-and-seccomp-profile-management.md)) | **Shipped** |
 | **Milestone 19 (V10)** | Ephemeral size-bounded `tmpfs` scratch mounts (`--tmpfs <DST>[:size=<BYTES>,mode=<OCTAL>,noexec\|exec]`, `TmpfsMountSpec`, `ExecutionPolicy::tmpfs_mounts`) with `MS_NOSUID \| MS_NODEV \| MS_NOEXEC` default hardening inside read-only rootfs sandboxes ([ADR-013](docs/adr/013-ephemeral-tmpfs-mounts-and-process-overrides.md)) | **Shipped** |
 | **Milestone 20 (V10)** | Per-run process overrides (`--cmd <SHELL_CMD>`, `-e` / `--env <KEY=VALUE>`, `--cwd <DIR>`, `ExecutionPolicy::args_override`, `env_overrides`, `cwd_override`) for reusable immutable base bundles ([ADR-013](docs/adr/013-ephemeral-tmpfs-mounts-and-process-overrides.md)) | **Shipped** |
+| **Milestone 21 (V11)** | Reusable enterprise policy presets (`PolicyPreset`: `strict`, `balanced`, `build`, `boxlet policy-export --preset <NAME> [--out <PATH>]`) and declarative GitOps policy files (`--preset <NAME>`, `--policy-file <PATH>`, `ExecutionPolicy::load_from_file`, `ExecutionPolicy::merge_overrides`) ([ADR-014](docs/adr/014-policy-presets-and-live-container-stats.md)) | **Shipped** |
+| **Milestone 22 (V11)** | Live container resource telemetry inspection (`boxlet stats [--json] <ID>`, `Engine::stats`, `RuntimeBackend::stats`, `ContainerStats`) reading point-in-time cgroup v2 usage (`ResourceUsage`, `PsiMetrics`) and `oom_killed` status ([ADR-014](docs/adr/014-policy-presets-and-live-container-stats.md)) | **Shipped** |
 
 ---
 
@@ -632,6 +668,8 @@ For the full trust-boundary diagram, threat matrix, and residual risk analysis, 
 
 | Field | CLI Flag | Default | Description |
 | :--- | :--- | :--- | :--- |
+| *(preset base)* | `--preset <strict\|balanced\|build>` | `None` | Initialize policy from a built-in `PolicyPreset` profile before layering `--policy-file` and explicit CLI flags |
+| *(policy file)* | `--policy-file <PATH>` | `None` | Load and validate a declarative `ExecutionPolicy` JSON file (`ExecutionPolicy::load_from_file`) merged on top of `--preset` |
 | `memory_bytes` | `--memory <BYTES\|k\|m\|g>` | `None` (bundle default) | Cgroup v2 `memory.max` hard limit in bytes |
 | `cpus` | `--cpus <FLOAT>` | `None` (bundle default) | Cgroup v2 `cpu.max` quota in cores (`0.5` = 50% of 1 core) |
 | `pids_limit` | `--pids <COUNT>` | `None` (bundle default) | Cgroup v2 `pids.max` process/thread cap |

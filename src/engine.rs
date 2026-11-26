@@ -248,6 +248,12 @@ impl<B: RuntimeBackend> Engine<B> {
         self.backend.state(id)
     }
 
+    /// Queries live or post-run cgroup v2 resource telemetry and OCI status for container `id`.
+    pub fn stats(&self, id: &str) -> Result<crate::policy::ContainerStats> {
+        validate_container_id(id)?;
+        self.backend.stats(id)
+    }
+
     /// Sends OS signal `signal` to container `id`.
     pub fn kill(&self, id: &str, signal: i32) -> Result<()> {
         validate_container_id(id)?;
@@ -1499,6 +1505,23 @@ mod tests {
         assert!(md.contains("sandbox_run"));
         assert!(md.contains("snapshot_diff"));
         assert!(md.contains("parallel_branch_batch"));
+        Ok(())
+    }
+
+    #[test]
+    fn engine_stats_returns_container_telemetry_and_validates_id() -> Result<()> {
+        let backend = MockBackend::default();
+        backend.insert_container("box-1", ContainerStatus::Running, Some(4242));
+        let engine = Engine::new(backend);
+
+        let stats = engine.stats("box-1")?;
+        assert_eq!(stats.id, "box-1");
+        assert_eq!(stats.status, ContainerStatus::Running);
+        assert_eq!(stats.pid, Some(4242));
+        assert_eq!(stats.oom_kill_count, 0);
+
+        let err = engine.stats("../bad").unwrap_err();
+        assert!(matches!(err, BoxletError::InvalidContainerId { .. }));
         Ok(())
     }
 }
