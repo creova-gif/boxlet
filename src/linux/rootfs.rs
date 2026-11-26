@@ -1,13 +1,14 @@
 //! Linux root filesystem isolation via `MS_PRIVATE`, bind-mount, `pivot_root`, `/proc`, and masked paths.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::unistd::{chdir, pivot_root};
 use oci_spec::runtime::Spec;
 
 use crate::error::{BoxletError, Result};
+use crate::policy::BindMountSpec;
 use crate::traits::RootfsProvider;
 
 /// V1 root filesystem provider using direct bind-mount + `pivot_root`.
@@ -39,7 +40,11 @@ impl RootfsProvider for BindPivotRootfs {
 }
 
 /// Switches the current process's root filesystem to `new_root` using `pivot_root(2)`.
-pub(crate) fn setup_and_pivot_root(new_root: &Path, spec: &Spec) -> Result<()> {
+pub(crate) fn setup_and_pivot_root(
+    new_root: &Path,
+    spec: &Spec,
+    bind_mounts: &[BindMountSpec],
+) -> Result<()> {
     // 1. Prevent mount events from propagating back to the host mount namespace.
     mount(
         None::<&str>,
@@ -86,6 +91,9 @@ pub(crate) fn setup_and_pivot_root(new_root: &Path, spec: &Spec) -> Result<()> {
 
     // 4. Mount minimal /dev tmpfs and bind essential character device nodes.
     setup_minimal_dev(new_root)?;
+
+    // 4b. Apply declarative host-to-container bind mounts before pivot_root detaches the host root.
+    apply_bind_mounts(new_root, bind_mounts)?;
 
     // 5. Pivot root and detach old host root.
     let put_old = new_root.join(".boxlet_old_root");
@@ -134,6 +142,108 @@ pub(crate) fn setup_and_pivot_root(new_root: &Path, spec: &Spec) -> Result<()> {
         })?;
     }
 
+    Ok(())
+}
+
+fn apply_bind_mounts(new_root: &Path, bind_mounts: &[BindMountSpec]) -> Result<()> {
+    for bm in bind_mounts {
+        bm.validate()?;
+        if !bm.source.exists() {
+            return Err(BoxletError::Runtime {
+                subsystem: "rootfs",
+                message: format!("bind mount source '{}' does not exist", bm.source.display()),
+            });
+        }
+        let rel_dst = bm
+            .destination
+            .strip_prefix("/")
+            .unwrap_or(bm.destination.as_path());
+        let mut cursor = new_root.to_path_buf();
+        for comp in rel_dst.components() {
+            if let Component::Normal(seg) = comp {
+                cursor.push(seg);
+                if let Ok(meta) = fs::symlink_metadata(&cursor) {
+                    if meta.file_type().is_symlink() {
+                        return Err(BoxletError::Runtime {
+                            subsystem: "rootfs",
+                            message: format!(
+                                "bind mount destination component '{}' must not be a symlink",
+                                cursor.display()
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        if bm.source.is_dir() {
+            fs::create_dir_all(&cursor).map_err(|err| BoxletError::Runtime {
+                subsystem: "rootfs",
+                message: format!(
+                    "failed to create bind mount target '{}': {err}",
+                    cursor.display()
+                ),
+            })?;
+        } else {
+            if let Some(parent) = cursor.parent() {
+                fs::create_dir_all(parent).map_err(|err| BoxletError::Runtime {
+                    subsystem: "rootfs",
+                    message: format!(
+                        "failed to create bind mount parent '{}': {err}",
+                        parent.display()
+                    ),
+                })?;
+            }
+            let _ = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&cursor)
+                .map_err(|err| BoxletError::Runtime {
+                    subsystem: "rootfs",
+                    message: format!(
+                        "failed to create bind mount file target '{}': {err}",
+                        cursor.display()
+                    ),
+                })?;
+        }
+
+        mount(
+            Some(&bm.source),
+            &cursor,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .map_err(|err| BoxletError::Runtime {
+            subsystem: "rootfs",
+            message: format!(
+                "bind mount '{}' -> '{}' failed: {err}",
+                bm.source.display(),
+                bm.destination.display()
+            ),
+        })?;
+
+        let mut remount_flags =
+            MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
+        if bm.readonly {
+            remount_flags |= MsFlags::MS_RDONLY;
+        }
+        mount(
+            None::<&str>,
+            &cursor,
+            None::<&str>,
+            remount_flags,
+            None::<&str>,
+        )
+        .map_err(|err| BoxletError::Runtime {
+            subsystem: "rootfs",
+            message: format!(
+                "remount bind mount '{}' failed: {err}",
+                bm.destination.display()
+            ),
+        })?;
+    }
     Ok(())
 }
 

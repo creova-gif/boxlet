@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust: 1.80+](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![OCI Runtime Spec: v1.0.2](https://img.shields.io/badge/OCI%20Runtime-v1.0.2-2ea44f.svg)](https://github.com/opencontainers/runtime-spec)
-[![Live Linux Demo: 24/24 Checks](https://img.shields.io/badge/Live%20Linux%20Demo-24%2F24%20Checks-brightgreen.svg)](scripts/demo-v1.sh)
+[![Live Linux Demo: 26/26 Checks](https://img.shields.io/badge/Live%20Linux%20Demo-26%2F26%20Checks-brightgreen.svg)](scripts/demo-v1.sh)
 
 - **Spec Doc:** [Boxlet: Minimal OCI-Compatible Container Runtime](https://docs.google.com/document/d/1XDaWCxQUGEH9LMqC95nJ4WZy_ut_YOQJ5_yChSJrlvA/edit?usp=drivesdk&ouid=110227624285917376281)
 - **ADR-001 (V1 Architecture & Isolation Seams):** [docs/adr/001-v1-architecture-and-seams.md](docs/adr/001-v1-architecture-and-seams.md)
@@ -19,6 +19,7 @@
 - **ADR-009 (Enterprise Hardening, Tamper-Evident Audit & Rootless Support):** [ADR-009: Enterprise Audit Hash Chaining, Worker Pool, and Rootless User Namespaces](docs/adr/009-enterprise-audit-hash-chaining-worker-pool-and-rootless.md)
 - **ADR-010 (Cgroup v2 Block I/O Throttling & Multi-Layer OCI Image Layout):** [ADR-010: Cgroup v2 Block I/O Throttling and Multi-Layer OCI Image Layout](docs/adr/010-cgroup-io-max-and-oci-image-layout.md)
 - **ADR-011 (Cgroup v2 PSI Telemetry, POSIX Rlimits & Deterministic Benchmark Suite):** [ADR-011: Cgroup v2 PSI Telemetry, POSIX Rlimits, and Deterministic Benchmark Suite](docs/adr/011-psi-telemetry-rlimits-and-benchmark-suite.md)
+- **ADR-012 (Declarative Bind Mounts & Seccomp Profile Management):** [ADR-012: Declarative Bind Mounts and Seccomp Profile Management](docs/adr/012-bind-mounts-and-seccomp-profile-management.md)
 - **Threat Model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)
 - **Design Doc:** [docs/designs/boxlet-v1-oci-runtime.md](docs/designs/boxlet-v1-oci-runtime.md)
 - **Engineering Standards:** [AGENTS.md](AGENTS.md)
@@ -160,7 +161,7 @@ sudo ./target/release/boxlet branch-run \
 
 ### High-Level Policy Execution (`boxlet run`)
 
-`boxlet run` overlays explicit resource and isolation limits (including cgroup v2 `io.max` block I/O bandwidth and IOPS throttling via `--io-max` / `IoMaxRule`, POSIX `setrlimit(2)` file-descriptor caps via `--nofile <N>` / `RLIMIT_NOFILE`, and unconditional `RLIMIT_CORE = 0` core-dump suppression) onto an OCI bundle and emits structured execution telemetry (including cgroup v2 Pressure Stall Information `PsiMetrics` in `ResourceUsage` and `boxlet_psi_*_microseconds_total` counters in `boxlet audit --prometheus`):
+`boxlet run` overlays explicit resource and isolation limits (including cgroup v2 `io.max` block I/O bandwidth and IOPS throttling via `--io-max` / `IoMaxRule`, POSIX `setrlimit(2)` file-descriptor caps via `--nofile <N>` / `RLIMIT_NOFILE`, unconditional `RLIMIT_CORE = 0` core-dump suppression, declarative host bind mounts via `--mount <SRC>:<DST>[:ro|rw]` / `BindMountSpec` with read-only default and `MS_NOSUID | MS_NODEV` remount hardening, and custom OCI seccomp profile overrides via `--seccomp-profile <PATH>`) onto an OCI bundle and emits structured execution telemetry (including cgroup v2 Pressure Stall Information `PsiMetrics` in `ResourceUsage` and `boxlet_psi_*_microseconds_total` counters in `boxlet audit --prometheus`):
 
 ```bash
 sudo ./target/release/boxlet run \
@@ -169,8 +170,27 @@ sudo ./target/release/boxlet run \
   --pids 64 \
   --io-max "8:0 rbps=10485760 wbps=5242880 riops=1000 wiops=500" \
   --nofile 256 \
+  --mount /var/lib/datasets:/mnt/data:ro \
+  --seccomp-profile ./custom-seccomp.json \
   --network none \
   --timeout 30 \
+  --json \
+  ./bundle
+```
+
+### Declarative Host Bind Mounts & Seccomp Profile Management (`--mount`, `boxlet seccomp-export`, `--seccomp-profile`)
+
+Mount host directories or files into the container prior to `pivot_root` (`--mount <SRC>:<DST>[:ro|rw]` / `BindMountSpec`, defaulting to read-only `ro` and enforcing `MS_NOSUID | MS_NODEV` remount hardening while rejecting relative paths, `..` traversal, or reserved destinations `/`, `/proc`, `/sys`, `/dev`), export Boxlet's baseline OCI `LinuxSeccomp` policy (`build_default_seccomp_profile`), and enforce custom OCI seccomp profiles (`load_seccomp_profile` / `--seccomp-profile <PATH>`):
+
+```bash
+# Export Boxlet's default baseline OCI seccomp profile as pretty-printed JSON
+./target/release/boxlet seccomp-export --out ./baseline-seccomp.json
+
+# Execute a sandbox with a read-only host dataset bind mount and a custom seccomp profile
+sudo ./target/release/boxlet run \
+  --mount /srv/agent-corpus:/mnt/corpus:ro \
+  --seccomp-profile ./baseline-seccomp.json \
+  --network none \
   --json \
   ./bundle
 ```
@@ -295,9 +315,9 @@ Synthesize deterministic **AWS Firecracker** (`FirecrackerVmSpec`) or **`libkrun
   ./bundle
 ```
 
-### Run the End-to-End 24-Check V1–V8 Demo Script
+### Run the End-to-End 26-Check V1–V9 Demo Script
 
-On a Linux 5.15+ host with `busybox` (`busybox-static`) and `python3` installed, run the self-contained 24/24 check verification demo covering normal execution, `memory.max` OOM-kill telemetry (`oom_killed: true`), fail-closed seccomp/capability enforcement, zero-leak cleanup, V2 workspace snapshots/diffs, parallel multi-agent branch execution, winner promotion/rollback, OCI bundle scaffolding, container inventory/garbage collection (`list`/`prune`), JSONL audit log analytics (`audit --file`), host readiness diagnostics (`doctor`), declarative rubric evaluation (`eval --spec`), OCI rootfs tar archive export/import round-trip (`image-export`/`image-import`), Firecracker/`libkrun` MicroVM specification synthesis (`microvm-config`), bounded worker-pool concurrency (`branch-run --max-concurrency`) + rootless user-namespace bundle scaffolding (`init-bundle --rootless`), tamper-evident hash-chained audit verification + Prometheus metrics export (`audit --file ... --prometheus`), multi-layer OCI Image Layout packing/unpacking with `.wh.` whiteouts (`image-pack`/`image-unpack`), fail-closed cgroup v2 `io.max` block I/O policy validation (`run --io-max`), POSIX `RLIMIT_NOFILE` file-descriptor enforcement (`run --nofile 128`), and the built-in deterministic latency/throughput benchmark suite (`bench --json` / `bench --markdown`):
+On a Linux 5.15+ host with `busybox` (`busybox-static`) and `python3` installed, run the self-contained 26/26 check verification demo covering normal execution, `memory.max` OOM-kill telemetry (`oom_killed: true`), fail-closed seccomp/capability enforcement, zero-leak cleanup, V2 workspace snapshots/diffs, parallel multi-agent branch execution, winner promotion/rollback, OCI bundle scaffolding, container inventory/garbage collection (`list`/`prune`), JSONL audit log analytics (`audit --file`), host readiness diagnostics (`doctor`), declarative rubric evaluation (`eval --spec`), OCI rootfs tar archive export/import round-trip (`image-export`/`image-import`), Firecracker/`libkrun` MicroVM specification synthesis (`microvm-config`), bounded worker-pool concurrency (`branch-run --max-concurrency`) + rootless user-namespace bundle scaffolding (`init-bundle --rootless`), tamper-evident hash-chained audit verification + Prometheus metrics export (`audit --file ... --prometheus`), multi-layer OCI Image Layout packing/unpacking with `.wh.` whiteouts (`image-pack`/`image-unpack`), fail-closed cgroup v2 `io.max` block I/O policy validation (`run --io-max`), POSIX `RLIMIT_NOFILE` file-descriptor enforcement (`run --nofile 128`), the built-in deterministic latency/throughput benchmark suite (`bench --json` / `bench --markdown`), declarative read-only host bind mounts with `MS_NOSUID | MS_NODEV` hardening (`run --mount <src>:<dst>:ro`), and baseline OCI seccomp profile export + custom seccomp profile execution (`seccomp-export --out` + `run --seccomp-profile`):
 
 ```bash
 sudo ./scripts/demo-v1.sh ./target/release/boxlet
@@ -561,6 +581,8 @@ For the full trust-boundary diagram, threat matrix, and residual risk analysis, 
 | **Milestone 14 (V7)** | Multi-layer OCI Image Layout v1.0 packing & unpacking with whiteout markers (`boxlet image-pack`, `boxlet image-unpack`, `OciImageLayoutReport`, `OciLayerDescriptor`, `.wh.<name>`, `.wh..wh..opq`) ([ADR-010](docs/adr/010-cgroup-io-max-and-oci-image-layout.md)) | **Shipped** |
 | **Milestone 15 (V8)** | Cgroup v2 Pressure Stall Information (`*.pressure` PSI) telemetry (`PsiMetrics` in `ResourceUsage`, `boxlet_psi_*_microseconds_total` in `boxlet audit --prometheus`) and POSIX `setrlimit(2)` enforcement (`--nofile <N>` / `RLIMIT_NOFILE` & default `RLIMIT_CORE = 0`) ([ADR-011](docs/adr/011-psi-telemetry-rlimits-and-benchmark-suite.md)) | **Shipped** |
 | **Milestone 16 (V8)** | Built-in deterministic latency & throughput benchmark suite (`boxlet bench --iterations <N> --markdown \| --json`, `Engine::run_benchmark`, `BenchmarkConfig`, `BenchmarkReport`, `LatencySummary`) ([ADR-011](docs/adr/011-psi-telemetry-rlimits-and-benchmark-suite.md)) | **Shipped** |
+| **Milestone 17 (V9)** | Declarative host bind mounts (`--mount <SRC>:<DST>[:ro\|rw]`, `BindMountSpec`, `ExecutionPolicy::bind_mounts`, `OciMount`) with read-only default, path-traversal & reserved-destination rejection, and `MS_NOSUID \| MS_NODEV` remount hardening ([ADR-012](docs/adr/012-bind-mounts-and-seccomp-profile-management.md)) | **Shipped** |
+| **Milestone 18 (V9)** | Baseline OCI seccomp profile export (`boxlet seccomp-export [--out <PATH>]`, `build_default_seccomp_profile`) and custom seccomp profile loading & enforcement (`--seccomp-profile <PATH>`, `ExecutionPolicy::seccomp_profile_path`, `load_seccomp_profile`) ([ADR-012](docs/adr/012-bind-mounts-and-seccomp-profile-management.md)) | **Shipped** |
 
 ---
 
@@ -583,6 +605,8 @@ For the full trust-boundary diagram, threat matrix, and residual risk analysis, 
 | `pids_limit` | `--pids <COUNT>` | `None` (bundle default) | Cgroup v2 `pids.max` process/thread cap |
 | `io_max` | `--io-max "<MAJ>:<MIN> rbps=... wbps=... riops=... wiops=..."` | `[]` (bundle default) | Cgroup v2 `io.max` per-device bandwidth (`rbps`/`wbps`) and IOPS (`riops`/`wiops`) limits (`IoMaxRule`) |
 | `nofile_limit` | `--nofile <N>` | `None` (bundle default) | POSIX `RLIMIT_NOFILE` soft/hard open file-descriptor limit applied before `execve` (plus unconditional `RLIMIT_CORE = 0`) |
+| `bind_mounts` | `--mount <SRC>:<DST>[:ro\|rw]` | `[]` (bundle default) | Declarative host-to-container bind mounts (`BindMountSpec`) applied prior to `pivot_root` with `ro` default and `MS_NOSUID \| MS_NODEV` hardening |
+| `seccomp_profile_path` | `--seccomp-profile <PATH>` | `None` (default allowlist) | Path to a custom OCI `LinuxSeccomp` JSON profile loaded via `load_seccomp_profile` |
 | `network` | `--network <none\|isolated\|host>` | `isolated` (`run`) | Network namespace isolation mode (fails closed on unknown modes) |
 | `timeout` | `--timeout <SECONDS>` | `None` | Wall-clock execution timeout before `cgroup.kill` teardown |
 | `max_output_bytes` | `--max-output-bytes <BYTES>` | `1048576` (1 MiB) | Maximum captured bytes per stream (`stdout` / `stderr`) |

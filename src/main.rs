@@ -2,6 +2,8 @@
 
 #[cfg(target_os = "linux")]
 use std::io::Write;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 #[cfg(target_os = "linux")]
@@ -149,6 +151,12 @@ enum Commands {
         /// Maximum open file descriptors (`RLIMIT_NOFILE`) inside the container.
         #[arg(long)]
         nofile: Option<u64>,
+        /// Bind-mount a host path into the container (`<src>:<dst>[:ro|rw]`, repeatable; defaults to `:ro`).
+        #[arg(long = "mount")]
+        mounts: Vec<String>,
+        /// Path to a custom OCI LinuxSeccomp JSON profile file.
+        #[arg(long)]
+        seccomp_profile: Option<PathBuf>,
         /// Network isolation mode (`none` or `host`).
         #[arg(long)]
         network: Option<String>,
@@ -231,6 +239,12 @@ enum Commands {
         /// Maximum open file descriptors (`RLIMIT_NOFILE`) inside the container.
         #[arg(long)]
         nofile: Option<u64>,
+        /// Bind-mount a host path into the container (`<src>:<dst>[:ro|rw]`, repeatable; defaults to `:ro`).
+        #[arg(long = "mount")]
+        mounts: Vec<String>,
+        /// Path to a custom OCI LinuxSeccomp JSON profile file.
+        #[arg(long)]
+        seccomp_profile: Option<PathBuf>,
         /// Network isolation mode (`none` or `host`).
         #[arg(long)]
         network: Option<String>,
@@ -377,6 +391,12 @@ enum Commands {
         out: Option<PathBuf>,
         /// Path to the OCI bundle directory containing `config.json`.
         bundle: PathBuf,
+    },
+    /// Export Boxlet's baseline default-deny OCI seccomp profile as JSON for auditing or customization.
+    SeccompExport {
+        /// Optional output file path for the JSON seccomp profile (prints to stdout if omitted).
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Hidden internal self-re-exec container init stage.
     #[command(name = "__init", hide = true)]
@@ -691,6 +711,31 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Commands::SeccompExport { out } => {
+            let profile = boxlet::build_default_seccomp_profile()?;
+            let rendered = serde_json::to_string_pretty(&profile)?;
+            if let Some(out_path) = out {
+                if let Some(parent) = out_path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent).map_err(|source| {
+                            BoxletError::StateStore {
+                                path: parent.to_path_buf(),
+                                source,
+                            }
+                        })?;
+                    }
+                }
+                std::fs::write(&out_path, format!("{rendered}\n")).map_err(|source| {
+                    BoxletError::StateStore {
+                        path: out_path,
+                        source,
+                    }
+                })?;
+            } else {
+                println!("{rendered}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         other => dispatch_platform(
             cli.root,
             cli.cgroup_parent,
@@ -778,6 +823,8 @@ fn dispatch_platform(
             pids,
             io_max,
             nofile,
+            mounts,
+            seccomp_profile,
             network,
             timeout,
             max_output_bytes,
@@ -791,6 +838,8 @@ fn dispatch_platform(
                 pids,
                 &io_max,
                 nofile,
+                &mounts,
+                seccomp_profile.as_deref(),
                 network.as_deref(),
                 timeout,
                 max_output_bytes,
@@ -820,6 +869,8 @@ fn dispatch_platform(
             pids,
             io_max,
             nofile,
+            mounts,
+            seccomp_profile,
             network,
             timeout,
             max_output_bytes,
@@ -834,6 +885,8 @@ fn dispatch_platform(
                 pids,
                 &io_max,
                 nofile,
+                &mounts,
+                seccomp_profile.as_deref(),
                 network.as_deref(),
                 timeout,
                 max_output_bytes,
@@ -981,6 +1034,7 @@ fn dispatch_platform(
         | Commands::ImagePack { .. }
         | Commands::ImageUnpack { .. }
         | Commands::MicrovmConfig { .. }
+        | Commands::SeccompExport { .. }
         | Commands::Audit { .. }
         | Commands::Doctor { .. }
         | Commands::InternalInit { .. } => Ok(ExitCode::SUCCESS),
@@ -1007,6 +1061,8 @@ fn build_execution_policy(
     pids: Option<i64>,
     io_max_raw: &[String],
     nofile: Option<u64>,
+    mounts_raw: &[String],
+    seccomp_profile: Option<&Path>,
     network: Option<&str>,
     timeout: Option<u64>,
     max_output_bytes: Option<usize>,
@@ -1017,17 +1073,31 @@ fn build_execution_policy(
     for raw in io_max_raw {
         rules.push(raw.parse::<IoMaxRule>()?);
     }
-    Ok(ExecutionPolicy {
+    let mut parsed_mounts = Vec::with_capacity(mounts_raw.len());
+    for raw in mounts_raw {
+        parsed_mounts.push(raw.parse::<boxlet::BindMountSpec>()?);
+    }
+    let mut policy = ExecutionPolicy {
         memory_bytes,
         cpus,
         pids_limit: pids,
         io_max: if rules.is_empty() { None } else { Some(rules) },
         nofile_limit: nofile,
+        bind_mounts: if parsed_mounts.is_empty() {
+            None
+        } else {
+            Some(parsed_mounts)
+        },
         network: network_mode,
         timeout: timeout.map(Duration::from_secs),
         max_output_bytes,
         ..ExecutionPolicy::default()
-    })
+    };
+    if let Some(path) = seccomp_profile {
+        let prof = boxlet::load_seccomp_profile(path)?;
+        policy.seccomp = Some(boxlet::policy::SeccompPolicy::Custom(Box::new(prof)));
+    }
+    Ok(policy)
 }
 
 /// Parses human-readable byte sizes (`128m`, `1g`, `512k`, or raw bytes).
@@ -1530,6 +1600,55 @@ mod tests {
                 json: false,
                 ..
             }
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn cli_seccomp_export_writes_valid_oci_seccomp_profile() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|source| BoxletError::StateStore {
+            path: PathBuf::from("tempdir"),
+            source,
+        })?;
+        let seccomp_path = tmp.path().join("nested/seccomp.json");
+
+        let export_cli = Cli::try_parse_from([
+            "boxlet",
+            "seccomp-export",
+            "--out",
+            seccomp_path.to_str().unwrap_or_default(),
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+        assert_eq!(dispatch(export_cli)?, ExitCode::SUCCESS);
+        assert!(seccomp_path.is_file());
+
+        let loaded = boxlet::load_seccomp_profile(&seccomp_path)?;
+        assert!(loaded.syscalls().as_ref().is_some_and(|s| !s.is_empty()));
+
+        let run_cli = Cli::try_parse_from([
+            "boxlet",
+            "run",
+            "--mount",
+            "/host/data:/workspace/data:ro",
+            "--mount",
+            "/host/cache:/workspace/cache:rw",
+            "--seccomp-profile",
+            seccomp_path.to_str().unwrap_or_default(),
+            tmp.path().to_str().unwrap_or_default(),
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+        assert!(matches!(
+            run_cli.command,
+            Commands::Run {
+                mounts,
+                seccomp_profile: Some(_),
+                ..
+            } if mounts.len() == 2
         ));
 
         Ok(())
