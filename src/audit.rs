@@ -72,6 +72,44 @@ pub enum AuditEvent {
         /// Total filesystem changes (`added + modified + deleted`) in the promoted diff, if any.
         promoted_changes: Option<usize>,
     },
+    /// Stopped (or forced) containers were garbage-collected (`boxlet prune`).
+    ContainersPruned {
+        /// Number of containers removed.
+        removed_count: usize,
+        /// Number of active (`Creating`, `Created`, `Running`) containers skipped.
+        skipped_active_count: usize,
+        /// Whether `--force` was set.
+        force: bool,
+    },
+}
+
+/// Aggregated telemetry and integrity summary computed across a `.jsonl` audit log.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditSummary {
+    /// Total number of valid [`AuditRecord`] lines parsed.
+    pub total_records: usize,
+    /// Total `container_run_completed` events.
+    pub runs_completed: usize,
+    /// Number of `container_run_completed` events with `exit_code == Some(0)` and no violations.
+    pub runs_succeeded: usize,
+    /// Number of `container_run_completed` events that exited non-zero or had violations.
+    pub runs_failed: usize,
+    /// Number of runs where `violations.timed_out` was true.
+    pub timed_out_count: usize,
+    /// Number of runs where `violations.oom_killed` was true.
+    pub oom_killed_count: usize,
+    /// Total `branch_batch_completed` events.
+    pub branch_batches_completed: usize,
+    /// Total candidate branches evaluated across all `branch_batch_completed` events.
+    pub total_branches_evaluated: usize,
+    /// Winning branch IDs promoted across `branch_batch_completed` events.
+    pub promoted_winners: Vec<String>,
+    /// Sum of `duration_ms` across all `container_run_completed` events.
+    pub total_duration_ms: u64,
+    /// Maximum `memory_peak_bytes` observed across all `container_run_completed` events.
+    pub max_memory_peak_bytes: Option<u64>,
+    /// True when all `timestamp_unix_ms` values are non-decreasing in file order.
+    pub chronological_valid: bool,
 }
 
 /// Timestamped envelope written as a single JSON Line in an audit log file.
@@ -162,7 +200,11 @@ impl JsonlAuditLogger {
         options.create(true).append(true);
         #[cfg(unix)]
         {
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            options.mode(0o600);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            options.custom_flags(libc::O_NOFOLLOW);
         }
 
         let file = options
@@ -205,6 +247,81 @@ impl JsonlAuditLogger {
             records.push(record);
         }
         Ok(records)
+    }
+
+    /// Aggregates all records in the `.jsonl` audit log into an [`AuditSummary`] and verifies chronological integrity.
+    pub fn summarize(&self) -> Result<AuditSummary> {
+        let records = self.read_all()?;
+        let mut summary = AuditSummary {
+            chronological_valid: true,
+            ..AuditSummary::default()
+        };
+        let mut prev_ts: Option<u64> = None;
+
+        for rec in records {
+            summary.total_records += 1;
+            if let Some(prev) = prev_ts {
+                if rec.timestamp_unix_ms < prev {
+                    summary.chronological_valid = false;
+                }
+            }
+            prev_ts = Some(rec.timestamp_unix_ms);
+
+            match rec.event {
+                AuditEvent::ContainerRunCompleted {
+                    exit_code,
+                    duration_ms,
+                    memory_peak_bytes,
+                    violations,
+                    ..
+                } => {
+                    summary.runs_completed += 1;
+                    let has_violation = violations.timed_out
+                        || violations.oom_killed
+                        || violations.termination_signal.is_some();
+                    if exit_code == Some(0) && !has_violation {
+                        summary.runs_succeeded += 1;
+                    } else {
+                        summary.runs_failed += 1;
+                    }
+                    if violations.timed_out {
+                        summary.timed_out_count += 1;
+                    }
+                    if violations.oom_killed {
+                        summary.oom_killed_count += 1;
+                    }
+                    summary.total_duration_ms =
+                        summary.total_duration_ms.saturating_add(duration_ms);
+                    if let Some(peak) = memory_peak_bytes {
+                        summary.max_memory_peak_bytes = Some(
+                            summary
+                                .max_memory_peak_bytes
+                                .map_or(peak, |cur| cur.max(peak)),
+                        );
+                    }
+                }
+                AuditEvent::BranchBatchCompleted {
+                    branch_count,
+                    promoted_branch_id,
+                    ..
+                } => {
+                    summary.branch_batches_completed += 1;
+                    summary.total_branches_evaluated = summary
+                        .total_branches_evaluated
+                        .saturating_add(branch_count);
+                    if let Some(winner) = promoted_branch_id {
+                        summary.promoted_winners.push(winner);
+                    }
+                }
+                AuditEvent::ContainerCreated { .. }
+                | AuditEvent::ContainerStarted { .. }
+                | AuditEvent::ContainerKilled { .. }
+                | AuditEvent::ContainerDeleted { .. }
+                | AuditEvent::ContainersPruned { .. } => {}
+            }
+        }
+
+        Ok(summary)
     }
 }
 
@@ -264,6 +381,69 @@ mod tests {
             })?;
             assert_eq!(meta.permissions().mode() & 0o777, 0o600);
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn audit_logger_summarize_computes_metrics_and_verifies_chronological_order() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|source| BoxletError::StateStore {
+            path: PathBuf::from("tempdir"),
+            source,
+        })?;
+        let log_path = dir.path().join("audit.jsonl");
+        let logger = JsonlAuditLogger::new(&log_path);
+
+        logger.record(AuditEvent::ContainerRunCompleted {
+            container_id: "run-ok".to_string(),
+            exit_code: Some(0),
+            duration_ms: 30,
+            memory_peak_bytes: Some(2_000_000),
+            cpu_usage_usec: Some(10_000),
+            violations: PolicyViolations::default(),
+            cleanup: CleanupStatus::Clean,
+        })?;
+
+        logger.record(AuditEvent::ContainerRunCompleted {
+            container_id: "run-oom-timeout".to_string(),
+            exit_code: None,
+            duration_ms: 120,
+            memory_peak_bytes: Some(8_000_000),
+            cpu_usage_usec: Some(50_000),
+            violations: PolicyViolations {
+                timed_out: true,
+                oom_killed: true,
+                termination_signal: Some(9),
+            },
+            cleanup: CleanupStatus::Clean,
+        })?;
+
+        logger.record(AuditEvent::BranchBatchCompleted {
+            branch_count: 3,
+            succeeded_count: 2,
+            promoted_branch_id: Some("candidate-a".to_string()),
+            promoted_changes: Some(2),
+        })?;
+
+        logger.record(AuditEvent::ContainersPruned {
+            removed_count: 2,
+            skipped_active_count: 1,
+            force: false,
+        })?;
+
+        let summary = logger.summarize()?;
+        assert_eq!(summary.total_records, 4);
+        assert_eq!(summary.runs_completed, 2);
+        assert_eq!(summary.runs_succeeded, 1);
+        assert_eq!(summary.runs_failed, 1);
+        assert_eq!(summary.timed_out_count, 1);
+        assert_eq!(summary.oom_killed_count, 1);
+        assert_eq!(summary.branch_batches_completed, 1);
+        assert_eq!(summary.total_branches_evaluated, 3);
+        assert_eq!(summary.promoted_winners, vec!["candidate-a".to_string()]);
+        assert_eq!(summary.total_duration_ms, 150);
+        assert_eq!(summary.max_memory_peak_bytes, Some(8_000_000));
+        assert!(summary.chronological_valid);
 
         Ok(())
     }

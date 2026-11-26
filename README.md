@@ -6,6 +6,7 @@
 - **ADR-003 (Parallel Multi-Agent Branch Execution):** [docs/adr/003-parallel-branch-execution.md](docs/adr/003-parallel-branch-execution.md)
 - **ADR-004 (Branch Promotion & Workspace Rollback):** [ADR-004: Branch Promotion and Workspace Rollback](docs/adr/004-branch-promotion-and-rollback.md)
 - **ADR-005 (Structured Audit Trail & OCI Bundle Scaffolding):** [ADR-005: Structured Audit Trail and OCI Bundle Scaffolding](docs/adr/005-audit-trail-and-bundle-scaffolding.md)
+- **ADR-006 (Container Inventory, Garbage Collection & Audit Analytics):** [ADR-006: Container Inventory, Garbage Collection, and Audit Analytics](docs/adr/006-container-inventory-prune-and-audit-analytics.md)
 - **Threat Model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)
 - **Design Doc:** [docs/designs/boxlet-v1-oci-runtime.md](docs/designs/boxlet-v1-oci-runtime.md)
 - **Engineering Standards:** [AGENTS.md](AGENTS.md)
@@ -129,7 +130,7 @@ sudo ./target/release/boxlet run \
   ./bundle
 ```
 
-### Standard OCI Runtime Lifecycle (`create` / `start` / `state` / `kill` / `delete`)
+### Standard OCI Runtime Lifecycle (`create` / `start` / `state` / `kill` / `delete` / `list` / `prune`)
 
 `boxlet create` consumes the bundle's `config.json` verbatim with zero opinionated defaults injected, preserving strict OCI runtime compliance:
 
@@ -141,9 +142,25 @@ sudo ./target/release/boxlet kill demo-1 SIGTERM
 sudo ./target/release/boxlet delete --force demo-1
 ```
 
-### Run the End-to-End V1 & V2 Demo Script
+### Container Inventory, Garbage Collection & Audit Telemetry (`list` / `prune` / `audit`)
 
-On a Linux 5.15+ host with `busybox` (`busybox-static`) and `python3` installed, run the self-contained verification demo covering normal execution, `memory.max` OOM-kill telemetry (`oom_killed: true`), fail-closed seccomp/capability enforcement, zero-leak cleanup, V2 workspace snapshots/diffs, and parallel multi-agent branch execution:
+List all containers under `--root` in deterministic `id` order (refreshing live PID status), garbage-collect stopped or active containers, and compute an aggregate `AuditSummary` with monotonic timestamp verification (`chronological_valid`) from a JSONL audit trail:
+
+```bash
+# List all containers under the state root as JSON
+sudo ./target/release/boxlet list --json
+
+# Garbage-collect all Stopped containers (or pass --force to also terminate and remove Created/Running containers)
+sudo ./target/release/boxlet --audit-log /var/log/boxlet-audit.jsonl prune --json
+sudo ./target/release/boxlet --audit-log /var/log/boxlet-audit.jsonl prune --force --json
+
+# Parse and summarize a JSONL audit trail (portable across Linux and macOS)
+./target/release/boxlet audit --file /var/log/boxlet-audit.jsonl --json
+```
+
+### Run the End-to-End 14-Check V1, V2 & V3 Demo Script
+
+On a Linux 5.15+ host with `busybox` (`busybox-static`) and `python3` installed, run the self-contained 14-check verification demo covering normal execution, `memory.max` OOM-kill telemetry (`oom_killed: true`), fail-closed seccomp/capability enforcement, zero-leak cleanup, V2 workspace snapshots/diffs, parallel multi-agent branch execution, winner promotion/rollback, OCI bundle scaffolding, container inventory/garbage collection (`list`/`prune`), and JSONL audit log analytics (`audit --file`):
 
 ```bash
 sudo ./scripts/demo-v1.sh ./target/release/boxlet
@@ -210,12 +227,12 @@ sudo ./target/release/boxlet restore \
   --json
 ```
 
-### Rust SDK Usage (`BundleBuilder`, `JsonlAuditLogger`, `WorkspaceSnapshot`, `TreeManifest::diff`, `Engine::run_branches_with_promotion`)
+### Rust SDK Usage (`BundleBuilder`, `JsonlAuditLogger`, `AuditSummary`, `PruneReport`, `WorkspaceSnapshot`, `TreeManifest::diff`, `Engine::run_branches_with_promotion`)
 
 ```rust
 use std::path::Path;
-use boxlet::audit::JsonlAuditLogger;
-use boxlet::engine::{BranchBatchReport, BranchSpec};
+use boxlet::audit::{AuditSummary, JsonlAuditLogger};
+use boxlet::engine::{BranchBatchReport, BranchSpec, PruneReport};
 use boxlet::oci::BundleBuilder;
 use boxlet::policy::{ExecutionPolicy, NetworkMode};
 use boxlet::snapshot::{TreeManifest, WorkspaceSnapshot};
@@ -246,7 +263,7 @@ fn inspect_and_branch() -> boxlet::error::Result<()> {
     #[cfg(target_os = "linux")]
     {
         let engine = boxlet::Engine::new(boxlet::LinuxBackend::with_defaults())
-            .with_audit_logger(audit_logger);
+            .with_audit_logger(audit_logger.clone());
         let branches = vec![
             BranchSpec::new("branch-a").with_args(vec![
                 "/bin/sh".into(),
@@ -286,7 +303,28 @@ fn inspect_and_branch() -> boxlet::error::Result<()> {
                 item.fs_diff.deleted,
             );
         }
+
+        // Container inventory and garbage collection:
+        let inventory = engine.list()?;
+        let prune_report: PruneReport = engine.prune(false)?;
+        println!(
+            "active={} pruned={:?} skipped={:?}",
+            inventory.len(),
+            prune_report.removed_containers,
+            prune_report.skipped_active_containers,
+        );
     }
+
+    // Aggregate telemetry & chronological integrity verification from JSONL audit logs:
+    let summary: AuditSummary = audit_logger.summarize()?;
+    println!(
+        "records={} runs={}/{} branches={} valid={}",
+        summary.total_records,
+        summary.runs_succeeded,
+        summary.runs_completed,
+        summary.total_branches_evaluated,
+        summary.chronological_valid,
+    );
     Ok(())
 }
 ```

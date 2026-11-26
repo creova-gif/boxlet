@@ -193,6 +193,19 @@ impl RuntimeBackend for LinuxBackend {
         self.state_store.delete(id, force)
     }
 
+    fn list(&self) -> Result<Vec<ContainerState>> {
+        let ids = self.state_store.list_ids()?;
+        let mut states = Vec::with_capacity(ids.len());
+        for id in ids {
+            match self.state(&id) {
+                Ok(st) => states.push(st),
+                Err(BoxletError::ContainerNotFound { .. }) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(states)
+    }
+
     fn run(&self, id: &str, bundle: &Path, resolved: &ResolvedRunSpec) -> Result<ExecutionResult> {
         let start_time = Instant::now();
         // Become a child subreaper so when intermediate `boxlet __init` exits after forking

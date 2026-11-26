@@ -79,6 +79,30 @@ enum Commands {
         /// Container identifier.
         id: String,
     },
+    /// List all tracked containers in the state root.
+    List {
+        /// Emit the container states as a JSON array to stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove stopped containers (or force-remove all containers when `--force` is set).
+    Prune {
+        /// Force-kill and remove active (`Creating`, `Created`, `Running`) containers as well.
+        #[arg(short = 'f', long)]
+        force: bool,
+        /// Emit the `PruneReport` as JSON to stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect and summarize an append-only JSON Lines (`.jsonl`) audit log file.
+    Audit {
+        /// Path to the `.jsonl` audit log file to inspect.
+        #[arg(long)]
+        file: PathBuf,
+        /// Emit the `AuditSummary` as JSON to stdout.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run a container end-to-end with explicit policy limits and structured observability.
     Run {
         /// Optional container ID (auto-generated if omitted).
@@ -353,6 +377,21 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Audit { file, json } => {
+            let summary = JsonlAuditLogger::new(&file).summarize()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                println!(
+                    "records={} runs={} batches={} chronological_valid={}",
+                    summary.total_records,
+                    summary.runs_completed,
+                    summary.branch_batches_completed,
+                    summary.chronological_valid
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         other => dispatch_platform(
             cli.root,
             cli.cgroup_parent,
@@ -399,6 +438,38 @@ fn dispatch_platform(
         }
         Commands::Delete { force, id } => {
             engine.delete(&id, force)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::List { json } => {
+            let states = engine.list()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&states)?);
+            } else if states.is_empty() {
+                println!("(no containers)");
+            } else {
+                for st in &states {
+                    println!(
+                        "id={} status={} pid={:?} bundle={}",
+                        st.id,
+                        st.status,
+                        st.pid,
+                        st.bundle.display()
+                    );
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Prune { force, json } => {
+            let report = engine.prune(force)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "pruned removed={} skipped={}",
+                    report.removed_containers.len(),
+                    report.skipped_active_containers.len()
+                );
+            }
             Ok(ExitCode::SUCCESS)
         }
         Commands::Run {
@@ -527,6 +598,7 @@ fn dispatch_platform(
         | Commands::Diff { .. }
         | Commands::Restore { .. }
         | Commands::InitBundle { .. }
+        | Commands::Audit { .. }
         | Commands::InternalInit { .. } => Ok(ExitCode::SUCCESS),
     }
 }
@@ -777,6 +849,46 @@ mod tests {
         assert_eq!(dispatch(init_cli)?, ExitCode::SUCCESS);
         assert!(bundle_dir.join("config.json").exists());
         assert!(bundle_dir.join("rootfs").is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn cli_audit_parses_and_executes_portably() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|source| BoxletError::StateStore {
+            path: PathBuf::from("tempdir"),
+            source,
+        })?;
+        let audit_path = tmp.path().join("audit.jsonl");
+        let logger = JsonlAuditLogger::new(&audit_path);
+
+        logger.record(boxlet::AuditEvent::ContainerCreated {
+            container_id: "box-audit-1".to_string(),
+            bundle: PathBuf::from("/tmp/bundle"),
+        })?;
+        logger.record(boxlet::AuditEvent::BranchBatchCompleted {
+            branch_count: 2,
+            succeeded_count: 1,
+            promoted_branch_id: Some("branch-1".to_string()),
+            promoted_changes: Some(3),
+        })?;
+
+        let audit_cli = Cli::try_parse_from([
+            "boxlet",
+            "audit",
+            "--file",
+            audit_path.to_str().unwrap_or_default(),
+            "--json",
+        ])
+        .map_err(|err| BoxletError::InvalidPolicy {
+            reason: err.to_string(),
+        })?;
+
+        assert_eq!(dispatch(audit_cli)?, ExitCode::SUCCESS);
+        let summary = logger.summarize()?;
+        assert_eq!(summary.total_records, 2);
+        assert_eq!(summary.branch_batches_completed, 1);
+        assert_eq!(summary.promoted_winners, vec!["branch-1".to_string()]);
+        assert!(summary.chronological_valid);
         Ok(())
     }
 }
